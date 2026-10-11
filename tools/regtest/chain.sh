@@ -18,7 +18,9 @@
 # RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, PEER_RPC_PORT, PEER_P2P_PORT, PRUNED_RPC_PORT,
 # PRUNED_P2P_PORT, ELECTRUM_PORTS (two, comma-separated), ESPLORA (binary), ESPLORA_PORT (3002;
 # it also takes the next two). Ports avoid the regtest defaults, so another regtest node is left
-# alone.
+# alone. LISTEN (127.0.0.1) is where the P2P and Electrum ports listen, 0.0.0.0 for a wallet on
+# another machine of the LAN; HOST is the address `peers` and `electrum` print; WHITELIST adds
+# peers (a subnet) the nodes give download,noban, as loopback has. RPC stays on loopback.
 set -u
 C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
 BITCOIND="${BITCOIND:-bitcoind}"; ELECTRS="${ELECTRS:-electrs}"
@@ -28,6 +30,9 @@ PEER_RPC_PORT="${PEER_RPC_PORT:-18563}"; PEER_P2P_PORT="${PEER_P2P_PORT:-18564}"
 PRUNED_RPC_PORT="${PRUNED_RPC_PORT:-18573}"; PRUNED_P2P_PORT="${PRUNED_P2P_PORT:-18574}"
 ESPLORA="${ESPLORA:-esplora-electrs}"; ESPLORA_PORT="${ESPLORA_PORT:-3002}"
 IFS=, read -r -a EPORTS <<< "${ELECTRUM_PORTS:-60601,60611}"
+LISTEN="${LISTEN:-127.0.0.1}"; HOST="${HOST:-127.0.0.1}"
+WL=(-whitelist=download,noban@127.0.0.1)
+[ -n "${WHITELIST:-}" ] && WL+=("-whitelist=download,noban@$WHITELIST")
 DATA="$C/bitcoind"; COOKIE="$DATA/regtest/.cookie"
 FDATA="$C/bitcoind-fork"; FCOOKIE="$FDATA/regtest/.cookie"
 PDATA="$C/bitcoind-peer"; PCOOKIE="$PDATA/regtest/.cookie"
@@ -88,7 +93,7 @@ start_electrs() {
   mkdir -p "$C/electrs$i"
   "${DETACH[@]}" "$ELECTRS" --skip-default-conf-files --network regtest --db-dir "$C/electrs$i" \
     --daemon-dir "$DATA" --cookie-file "$COOKIE" --daemon-rpc-addr "127.0.0.1:$RPC_PORT" \
-    --daemon-p2p-addr "127.0.0.1:$P2P_PORT" --electrum-rpc-addr "127.0.0.1:$port" \
+    --daemon-p2p-addr "127.0.0.1:$P2P_PORT" --electrum-rpc-addr "$LISTEN:$port" \
     --monitoring-addr "127.0.0.1:$(( port + 1 ))" --wait-duration-secs 1 < /dev/null >> "$C/electrs$i.log" 2>&1 &
   echo $! > "$C/electrs$i.pid"
 }
@@ -96,10 +101,10 @@ case "${1:-}" in
 start)
   stop_pid electrs0; stop_pid electrs1; stop_pid peer; stop_pid fork; stop_pid bitcoind
   mkdir -p "$DATA"
-  "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$DATA" -server=1 -listen=1 -bind="127.0.0.1:$P2P_PORT" \
+  "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$DATA" -server=1 -listen=1 -bind="$LISTEN:$P2P_PORT" \
     -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 -rpcport="$RPC_PORT" -port="$P2P_PORT" -txindex=1 \
     -blockfilterindex=1 -peerblockfilters=1 -fallbackfee=0.0001 -dnsseed=0 -fixedseeds=0 \
-    -whitelist=download,noban@127.0.0.1 \
+    "${WL[@]}" \
     -printtoconsole=0 < /dev/null >> "$C/bitcoind.out" 2>&1 &
   echo $! > "$C/bitcoind.pid"
   # Warming up, bitcoind answers with an error whose result is null: wait for a height.
@@ -112,8 +117,8 @@ start)
   # The fork node dials the main node only, and is never seen by electrs; Kyoto may dial it.
   mkdir -p "$FDATA"
   "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$FDATA" -server=1 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
-    -rpcport="$FORK_RPC_PORT" -port="$FORK_P2P_PORT" -bind="127.0.0.1:$FORK_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
-    -listen=1 "${FILTERS[@]}" -whitelist=download,noban@127.0.0.1 \
+    -rpcport="$FORK_RPC_PORT" -port="$FORK_P2P_PORT" -bind="$LISTEN:$FORK_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
+    -listen=1 "${FILTERS[@]}" "${WL[@]}" \
     -fallbackfee=0.0001 -dnsseed=0 -fixedseeds=0 -printtoconsole=0 < /dev/null >> "$C/fork.out" 2>&1 &
   echo $! > "$C/fork.pid"
   until [ -n "$(frpc getblockcount | json_num result)" ]; do
@@ -123,8 +128,8 @@ start)
   # The follower: a third filter-serving peer for Kyoto's quorum.
   mkdir -p "$PDATA"
   "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$PDATA" -server=1 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
-    -rpcport="$PEER_RPC_PORT" -port="$PEER_P2P_PORT" -bind="127.0.0.1:$PEER_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
-    -listen=1 "${FILTERS[@]}" -whitelist=download,noban@127.0.0.1 \
+    -rpcport="$PEER_RPC_PORT" -port="$PEER_P2P_PORT" -bind="$LISTEN:$PEER_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
+    -listen=1 "${FILTERS[@]}" "${WL[@]}" \
     -fallbackfee=0.0001 -dnsseed=0 -fixedseeds=0 -printtoconsole=0 < /dev/null >> "$C/peer.out" 2>&1 &
   echo $! > "$C/peer.pid"
   until [ -n "$(prpc getblockcount | json_num result)" ]; do
@@ -173,7 +178,7 @@ pruned)
   mkdir -p "$RDATA"
   "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$RDATA" -server=1 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
     -rpcport="$PRUNED_RPC_PORT" -port="$PRUNED_P2P_PORT" -bind="127.0.0.1:$PRUNED_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
-    -listen=1 -prune=550 -fastprune -blockfilterindex=1 -disablewallet -whitelist=download,noban@127.0.0.1 \
+    -listen=1 -prune=550 -fastprune -blockfilterindex=1 -disablewallet "${WL[@]}" \
     -dnsseed=0 -fixedseeds=0 -printtoconsole=0 < /dev/null >> "$C/pruned.out" 2>&1 &
   echo $! > "$C/pruned.pid"
   until [ -n "$(rrpc getblockcount | json_num result)" ]; do
@@ -208,8 +213,8 @@ esplora)
   [ "$(curl -s --max-time 2 "http://127.0.0.1:$ESPLORA_PORT/blocks/tip/height")" = "$(height)" ] || { echo "esplora did not catch up"; exit 1; }
   echo "esplora: http://127.0.0.1:$ESPLORA_PORT";;
 rpc) rpc "$2" "${3:-[]}" "${4:-}";;
-electrum) echo "electrum: tcp://127.0.0.1:${EPORTS[0]},tcp://127.0.0.1:${EPORTS[1]}";;
-peers) echo "127.0.0.1:$P2P_PORT,127.0.0.1:$FORK_P2P_PORT,127.0.0.1:$PEER_P2P_PORT";;
+electrum) echo "electrum: tcp://$HOST:${EPORTS[0]},tcp://$HOST:${EPORTS[1]}";;
+peers) echo "$HOST:$P2P_PORT,$HOST:$FORK_P2P_PORT,$HOST:$PEER_P2P_PORT";;
 stop) stop_pid esplora; stop_pid electrs0; stop_pid electrs1; stop_pid pruned; stop_pid peer; stop_pid fork; stop_pid bitcoind;;
 *) sed -n '2,15p' "$0"; exit 2;;
 esac

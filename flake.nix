@@ -51,6 +51,60 @@
             --set-default ELECTRS ${pkgs.electrs}/bin/electrs \
             --prefix PATH : ${nixpkgs.lib.makeBinPath [ pkgs.curl pkgs.perl pkgs.python3 ]}
         '';
+      # Test programs for Windows, with the module's toolchain and the builder's MinGW wiring:
+      # bin/storage.exe is tests/storage.rs (spike 4; run it with --ignored --nocapture) and
+      # bin/p2p_proxy.exe the Kyoto tests' P2P proxy.
+      testBinWindows =
+        let
+          common = logos-module-builder.lib.common;
+          wpkgs = common.mkPkgs "x86_64-windows";
+          bpkgs = common.mkPkgsWith [ (import logos-module-builder.inputs.rust-overlay) ] "x86_64-linux";
+          triple = "x86_64-pc-windows-gnu";
+          toolchain = bpkgs.rust-bin.stable."1.96.0".default.override { targets = [ triple ]; };
+          rustPlatform = bpkgs.makeRustPlatform { cargo = toolchain; rustc = toolchain; };
+          cc = wpkgs.stdenv.cc;
+          src = bpkgs.runCommand "bitcoin-wallet-core-test-src" { } ''
+            mkdir -p $out
+            cp -r ${./rust-lib} $out/rust-lib
+            cp -r ${logos-module-builder.packages.x86_64-linux.rust-sdk-src} $out/logos-rust-sdk-src
+          '';
+        in
+        rustPlatform.buildRustPackage {
+          pname = "bitcoin-wallet-core-test-bin";
+          version = "0.1.0";
+          inherit src;
+          sourceRoot = "bitcoin-wallet-core-test-src/rust-lib";
+          cargoLock = { lockFile = ./rust-lib/Cargo.lock; allowBuiltinFetchGit = true; };
+          nativeBuildInputs = [ bpkgs.perl bpkgs.pkg-config cc ];
+          env = {
+            BIP157_PATCHES_CHECKED = "${bip157Check "x86_64-linux"}";
+            CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${cc}/bin/${cc.targetPrefix}cc";
+            CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${wpkgs.windows.pthreads}/lib";
+            CC_x86_64_pc_windows_gnu = "${cc}/bin/${cc.targetPrefix}cc";
+            CXX_x86_64_pc_windows_gnu = "${cc}/bin/${cc.targetPrefix}c++";
+            AR_x86_64_pc_windows_gnu = "${cc.bintools}/bin/${cc.targetPrefix}ar";
+            CFLAGS_x86_64_pc_windows_gnu = "-I${wpkgs.windows.pthreads}/include";
+            CXXFLAGS_x86_64_pc_windows_gnu = "-I${wpkgs.windows.pthreads}/include";
+          };
+          buildPhase = ''
+            runHook preBuild
+            export CARGO_HOME=$TMPDIR/cargo
+            cargo test --release --offline --locked --no-default-features --no-run --test storage --target ${triple}
+            cargo build --release --offline --locked --no-default-features --example p2p_proxy --target ${triple}
+            runHook postBuild
+          '';
+          doCheck = false;
+          # The MinGW runtime DLLs beside it, so bin/ runs on a bare Windows.
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/bin
+            cp target/${triple}/release/deps/storage-*.exe $out/bin/storage.exe
+            cp target/${triple}/release/examples/p2p_proxy.exe $out/bin/
+            cp ${wpkgs.windows.pthreads}/bin/libwinpthread-1.dll ${wpkgs.windows.mcfgthreads}/bin/libmcfgthread-2.dll \
+              ${cc.cc.lib}/${wpkgs.stdenv.hostPlatform.config}/lib/libgcc_s_seh-1.dll $out/bin/
+            runHook postInstall
+          '';
+        };
       # Blockstream's electrs, the esplora flavour, for the regtest test of the Esplora path.
       esploraElectrs = system:
         let pkgs = nixpkgs.legacyPackages.${system}; in
@@ -85,6 +139,7 @@
           rustEnv = { BIP157_PATCHES_CHECKED = "${bip157Check (buildSystem system)}"; };
         }).packages.${system}
         // { bip157-check = bip157Check (buildSystem system); }
-        // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; esplora-electrs = esploraElectrs system; });
+        // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; esplora-electrs = esploraElectrs system; }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-windows") { test-bin = testBinWindows; });
     };
 }
