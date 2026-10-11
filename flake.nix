@@ -17,6 +17,27 @@
       # x86_64-windows is a cross build from x86_64-linux.
       targets = systems ++ [ "x86_64-windows" ];
       forAllSystems = f: nixpkgs.lib.genAttrs targets f;
+      # x86_64-windows is built on x86_64-linux; checks run on the build machine.
+      buildSystem = system: if system == "x86_64-windows" then "x86_64-linux" else system;
+      # bip157 0.7.0 as published plus patches/bip157, held to the allowlist in
+      # tools/kyoto/patch-bip157.sh, must equal rust-lib/vendor/bip157 byte for byte. The Rust
+      # build depends on this check, so a patch outside the allowlist fails the module build.
+      bip157Check = system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in
+        pkgs.runCommand "bip157-0.7.0-patches-check" {
+          crate = pkgs.fetchurl {
+            url = "https://static.crates.io/crates/bip157/bip157-0.7.0.crate";
+            sha256 = "b85126354e1cb28d64faa26f762dd32feba6051c31b5e4b27ac732afaa905ab1";
+          };
+          nativeBuildInputs = [ pkgs.git pkgs.gnutar pkgs.gzip pkgs.diffutils ];
+        } ''
+          export HOME=$TMPDIR
+          mkdir pristine
+          tar xzf $crate -C pristine --strip-components=1
+          bash ${./tools/kyoto/patch-bip157.sh} pristine patched ${./patches/bip157}
+          diff -r patched ${./rust-lib/vendor/bip157}
+          echo "bip157 0.7.0 + $(ls ${./patches/bip157} | wc -l) patches" > $out
+        '';
       # tools/regtest/chain.sh with bitcoind and electrs, for harnesses outside this repository.
       regtestChain = system:
         let pkgs = nixpkgs.legacyPackages.${system}; in
@@ -37,7 +58,9 @@
           src = ./.;
           configFile = ./metadata.json;
           flakeInputs = inputs;
+          rustEnv = { BIP157_PATCHES_CHECKED = "${bip157Check (buildSystem system)}"; };
         }).packages.${system}
+        // { bip157-check = bip157Check (buildSystem system); }
         // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; });
     };
 }

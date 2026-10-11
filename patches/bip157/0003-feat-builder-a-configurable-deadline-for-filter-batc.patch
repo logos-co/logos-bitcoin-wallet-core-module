@@ -1,0 +1,121 @@
+From 807dd4f6931d8e29f6736546e122946f55aba781 Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Sat, 10 Oct 2026 22:32:57 -0300
+Subject: [PATCH 3/4] feat(builder): a configurable deadline for filter batches
+
+A peer had 20 seconds, hard-coded, to send a whole batch of up to 999
+filters, about 20 MB on mainnet, which rarely arrives in time over Tor.
+Builder::filter_batch_timeout sets the deadline; the default stays 20 s.
+---
+ src/builder.rs      |  9 +++++++++
+ src/network/mod.rs  | 21 ++++++++++++++-------
+ src/network/peer.rs |  6 +++++-
+ 3 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/src/builder.rs b/src/builder.rs
+index f1dc654..631893b 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -123,6 +123,15 @@ impl Builder {
+         self
+     }
+ 
++    /// Set the time a peer has to send a whole batch of block filters, up to 999 of them.
++    /// Over Tor a batch of mainnet filters can take well over the default.
++    ///
++    /// If none is provided, a deadline of 20 seconds will be used.
++    pub fn filter_batch_timeout(mut self, filter_batch_timeout: impl Into<Duration>) -> Self {
++        self.config.peer_timeout_config.filter_batch_timeout = filter_batch_timeout.into();
++        self
++    }
++
+     /// Skip filter header and filter downloads during the initial sync. Once the node is
+     /// believed to be at the current chain tip, filters will be downloaded for newly mined
+     /// blocks. This feature is intended for new wallets that have never received a payment.
+diff --git a/src/network/mod.rs b/src/network/mod.rs
+index 8f02c27..217f797 100644
+--- a/src/network/mod.rs
++++ b/src/network/mod.rs
+@@ -52,7 +52,7 @@ const TWO_HOUR: Duration = Duration::from_secs(60 * 60 * 2);
+ const TCP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+ // Ping the peer if we have not exchanged messages for two minutes
+ const SEND_PING: Duration = Duration::from_secs(60 * 2);
+-// An absolute maximum timeout to respond to a batch filter request
++// The default deadline to respond to a batch filter request
+ const MAX_FILTER_RESPONSE_TIME_SEC: Duration = Duration::from_secs(20);
+ 
+ // These are the parameters of the "tried" and "new" tables
+@@ -101,6 +101,8 @@ pub(crate) struct PeerTimeoutConfig {
+     pub(crate) max_connection_time: Duration,
+     // How much time does the peer have to make the initial TCP handshake
+     pub(crate) handshake_timeout: Duration,
++    // How much time does the peer have to send a whole batch of filters
++    pub(crate) filter_batch_timeout: Duration,
+ }
+ 
+ impl Default for PeerTimeoutConfig {
+@@ -109,6 +111,7 @@ impl Default for PeerTimeoutConfig {
+             response_timeout: MESSAGE_TIMEOUT_SECS,
+             max_connection_time: TWO_HOUR,
+             handshake_timeout: TCP_CONNECTION_TIMEOUT,
++            filter_batch_timeout: MAX_FILTER_RESPONSE_TIME_SEC,
+         }
+     }
+ }
+@@ -378,10 +381,10 @@ impl FilterRate {
+         }
+     }
+ 
+-    fn slow_peer(&self) -> bool {
++    fn slow_peer(&self, deadline: Duration) -> bool {
+         if let Some((_, then)) = self.waiting_for {
+             let elapsed = then.elapsed();
+-            if elapsed > MAX_FILTER_RESPONSE_TIME_SEC {
++            if elapsed > deadline {
+                 return true;
+             }
+         }
+@@ -576,7 +579,7 @@ mod tests {
+ 
+     use crate::network::{LastBlockMonitor, MessageState, PingState};
+ 
+-    use super::FilterRate;
++    use super::{FilterRate, MAX_FILTER_RESPONSE_TIME_SEC};
+ 
+     #[tokio::test(start_paused = true)]
+     async fn test_version_message_state() {
+@@ -677,10 +680,14 @@ mod tests {
+         let block_hash_bytes = [1; 32];
+         let block_hash = BlockHash::from_byte_array(block_hash_bytes);
+         filter_rate.batch_requested(block_hash);
+-        assert!(!filter_rate.slow_peer());
++        assert!(!filter_rate.slow_peer(MAX_FILTER_RESPONSE_TIME_SEC));
+         tokio::time::sleep(Duration::from_secs(15)).await;
+-        assert!(!filter_rate.slow_peer());
++        assert!(!filter_rate.slow_peer(MAX_FILTER_RESPONSE_TIME_SEC));
+         tokio::time::sleep(Duration::from_secs(21)).await;
+-        assert!(filter_rate.slow_peer());
++        assert!(filter_rate.slow_peer(MAX_FILTER_RESPONSE_TIME_SEC));
++        // A longer deadline, as over Tor, waits it out.
++        assert!(!filter_rate.slow_peer(Duration::from_secs(120)));
++        tokio::time::sleep(Duration::from_secs(90)).await;
++        assert!(filter_rate.slow_peer(Duration::from_secs(120)));
+     }
+ }
+diff --git a/src/network/peer.rs b/src/network/peer.rs
+index 551211f..606566e 100644
+--- a/src/network/peer.rs
++++ b/src/network/peer.rs
+@@ -165,7 +165,11 @@ impl Peer {
+                 self.dialog.send_warning(Warning::PeerTimedOut);
+                 return Ok(());
+             }
+-            if self.message_state.filter_rate.slow_peer() {
++            if self
++                .message_state
++                .filter_rate
++                .slow_peer(self.timeout_config.filter_batch_timeout)
++            {
+                 self.dialog.send_warning(Warning::PeerTimedOut);
+                 return Ok(());
+             }

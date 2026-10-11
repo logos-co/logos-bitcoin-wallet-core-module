@@ -1,0 +1,66 @@
+From 3744addf1ad179de31867694d6f2c583af33527b Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Sat, 10 Oct 2026 22:32:33 -0300
+Subject: [PATCH 2/4] fix(chain): no filter-header conflict when the tip moves
+ between answers
+
+A block arriving between two peers' answers moved the request to the new
+tip, so the second answer covered one more header than the pending batch
+and read as a conflict, which disconnects every peer. A pending batch for
+an earlier stop hash is now dropped and the vote starts over.
+---
+ src/chain/chain.rs | 36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/chain/chain.rs b/src/chain/chain.rs
+index 1436236..2231231 100644
+--- a/src/chain/chain.rs
++++ b/src/chain/chain.rs
+@@ -210,7 +210,15 @@ impl Chain {
+             return Err(CFHeaderSyncError::StartHeightMisalignment);
+         }
+ 
+-        match self.request_state.pending_batch.take() {
++        let pending_batch = match self.request_state.pending_batch.take() {
++            // The pending batch answered an earlier request, before the tip moved: start over.
++            Some((_, pending)) if pending.stop_hash().ne(&batch.stop_hash()) => {
++                self.request_state.agreement_state.reset_agreements();
++                None
++            }
++            other => other,
++        };
++        match pending_batch {
+             Some((id, pending)) => {
+                 if peer_id.eq(&id) {
+                     // A repeat from the same peer adds no vote; the batch stays pending.
+@@ -1133,4 +1141,30 @@ mod tests {
+         assert_eq!(changes, CFHeaderChanges::Extended);
+         assert!(chain.is_cf_headers_synced());
+     }
++
++    #[tokio::test]
++    async fn a_block_between_two_answers_is_no_conflict() {
++        let mut chain = new_regtest(base_block(), 2);
++        let scenario = load_scenario();
++        let headers = scenario.most_work_headers();
++        assert!(chain.sync_chain(headers[..4].to_vec()).is_ok());
++        chain.next_cf_header_message();
++        let first = CFHeaders {
++            filter_type: 0x00,
++            stop_hash: headers[3].block_hash(),
++            previous_filter_header: scenario.prev_header(),
++            filter_hashes: scenario.n_most_work_filter_hashes(4),
++        };
++        let changes = chain.sync_cf_headers(0.into(), first).unwrap();
++        assert_eq!(changes, CFHeaderChanges::AddedToQueue);
++        // A block arrives, and the request moves to the new tip.
++        assert!(chain.sync_chain(vec![headers[4]]).is_ok());
++        chain.next_cf_header_message();
++        let second = cf_headers(&scenario, scenario.n_most_work_filter_hashes(5));
++        let changes = chain.sync_cf_headers(1.into(), second.clone()).unwrap();
++        assert_eq!(changes, CFHeaderChanges::AddedToQueue);
++        let changes = chain.sync_cf_headers(0.into(), second).unwrap();
++        assert_eq!(changes, CFHeaderChanges::Extended);
++        assert!(chain.is_cf_headers_synced());
++    }
+ }

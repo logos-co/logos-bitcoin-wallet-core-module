@@ -44,5 +44,8 @@ jobs:
         with:
           workspaces: rust-lib
 
+      - name: The vendored bip157 is 0.7.0 plus patches/bip157, within the allowlist
+        run: tools/kyoto/check-bip157.sh
+
       - name: cargo test --no-default-features
         run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked

@@ -1,0 +1,391 @@
+//! Structures and checkpoints related to the blockchain.
+//!
+//! Notably, [`checkpoints`] contains known Bitcoin block hashes and heights with significant work, so Kyoto nodes do not have to sync from genesis.
+pub(crate) mod block_queue;
+#[allow(clippy::module_inception)]
+pub(crate) mod chain;
+/// Expected block header checkpoints and corresponding structure.
+pub mod checkpoints;
+/// Errors associated with the blockchain representation.
+#[allow(dead_code)]
+pub(crate) mod error;
+pub(crate) mod graph;
+
+use std::collections::VecDeque;
+
+use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
+use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::Amount;
+use bitcoin::{
+    bip158::BlockFilter, block::Header, p2p::message_filter::CFHeaders, params::Params, BlockHash,
+    FilterHash, FilterHeader, ScriptBuf, Target, Work,
+};
+
+use crate::network::PeerId;
+use crate::HashCheckpoint;
+
+const MAX_PREV_STOP_HASHES: usize = 3;
+
+/// A block header with associated height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedHeader {
+    /// The height in the blockchain for this header.
+    pub height: u32,
+    /// The block header.
+    pub header: Header,
+}
+
+impl std::cmp::PartialOrd for IndexedHeader {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for IndexedHeader {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.height.cmp(&other.height)
+    }
+}
+
+impl IndexedHeader {
+    pub(crate) fn new(height: u32, header: Header) -> Self {
+        Self { height, header }
+    }
+}
+
+impl IndexedHeader {
+    /// The block hash associated with this header.
+    pub fn block_hash(&self) -> BlockHash {
+        self.header.block_hash()
+    }
+
+    /// The previous block hash.
+    pub fn prev_blockhash(&self) -> BlockHash {
+        self.header.prev_blockhash
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum HeaderSyncEffect {
+    Added,
+    Empty,
+    Reorg(Vec<BlockHash>),
+}
+
+/// Changes applied to the chain of block headers.
+#[derive(Debug, Clone)]
+pub enum BlockHeaderChanges {
+    /// A block was connected to the tip of the chain.
+    Connected(IndexedHeader),
+    /// Blocks were reorganized and a new chain of most work was selected.
+    Reorganized {
+        /// Newly accepted blocks from the chain of most work.
+        accepted: Vec<IndexedHeader>,
+        /// Blocks that were removed from the chain.
+        reorganized: Vec<IndexedHeader>,
+    },
+    /// A peer proposed a block that is not on the chain of most work.
+    ForkAdded(IndexedHeader),
+}
+
+/// A previous chain state to start the sync from.
+#[derive(Debug, Clone)]
+pub enum ChainState {
+    /// A summary of the chain state. The vector of headers should ideally be contiguous.
+    Snapshot(Vec<IndexedHeader>),
+    /// A single checkpoint to start the sync _strictly after_.
+    ///
+    /// Note that no reorganizations can be reported.
+    Checkpoint(HashCheckpoint),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FilterCommitment {
+    pub header: FilterHeader,
+    pub filter_hash: FilterHash,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilterRequestState {
+    pub last_filter_request: Option<FilterRequest>,
+    pub last_filter_header_request: Option<FilterHeaderRequest>,
+    pub pending_batch: Option<(PeerId, CFHeaderBatch)>,
+    pub agreement_state: FilterHeaderAgreements,
+    prev_cf_header_stop_hashes: VecDeque<BlockHash>,
+}
+
+impl FilterRequestState {
+    pub(crate) fn new(required: u8) -> Self {
+        Self {
+            last_filter_request: None,
+            last_filter_header_request: None,
+            pending_batch: None,
+            agreement_state: FilterHeaderAgreements::new(required),
+            prev_cf_header_stop_hashes: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn push_stop_hash(&mut self, hash: BlockHash) {
+        if self.prev_cf_header_stop_hashes.contains(&hash) {
+            return;
+        }
+        if self.prev_cf_header_stop_hashes.len() >= MAX_PREV_STOP_HASHES {
+            self.prev_cf_header_stop_hashes.pop_front();
+        }
+        self.prev_cf_header_stop_hashes.push_back(hash);
+    }
+
+    pub(crate) fn was_recently_requested(&self, hash: &BlockHash) -> bool {
+        self.prev_cf_header_stop_hashes.contains(hash)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FilterRequest {
+    #[allow(unused)]
+    pub start_height: u32,
+    pub stop_hash: BlockHash,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FilterHeaderRequest {
+    pub start_height: u32,
+    pub stop_hash: BlockHash,
+    pub expected_prev_filter_header: Option<FilterHeader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilterHeaderAgreements {
+    // The distinct peers that sent the pending batch: a peer repeating itself is one vote.
+    agreed: Vec<PeerId>,
+    required: u8,
+}
+
+impl FilterHeaderAgreements {
+    pub(crate) fn new(required: u8) -> Self {
+        Self {
+            agreed: Vec::new(),
+            required,
+        }
+    }
+
+    pub(crate) fn got_agreement(&mut self, peer_id: PeerId) {
+        if !self.agreed.contains(&peer_id) {
+            self.agreed.push(peer_id);
+        }
+    }
+
+    pub(crate) fn enough_agree(&self) -> bool {
+        self.agreed.len() >= usize::from(self.required)
+    }
+
+    pub(crate) fn reset_agreements(&mut self) {
+        self.agreed.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CFHeaderChanges {
+    AddedToQueue,
+    Extended,
+    // Unfortunately, auditing each peer by reconstruction the filter would be costly in network
+    // and compute. Instead it is easier to disconnect from all peers and try again.
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CFHeaderBatch {
+    inner: Vec<FilterCommitment>,
+    prev_filter_header: FilterHeader,
+    stop_hash: BlockHash,
+}
+
+impl CFHeaderBatch {
+    pub(crate) fn new(batch: CFHeaders) -> Self {
+        let mut headers: Vec<FilterCommitment> = vec![];
+        let mut prev_header = batch.previous_filter_header;
+        for hash in batch.filter_hashes {
+            let next_header = hash.filter_header(&prev_header);
+            headers.push(FilterCommitment {
+                header: next_header,
+                filter_hash: hash,
+            });
+            prev_header = next_header;
+        }
+        Self {
+            inner: headers,
+            prev_filter_header: batch.previous_filter_header,
+            stop_hash: batch.stop_hash,
+        }
+    }
+
+    fn prev_header(&self) -> &FilterHeader {
+        &self.prev_filter_header
+    }
+
+    fn stop_hash(&self) -> BlockHash {
+        self.stop_hash
+    }
+
+    fn len(&self) -> u32 {
+        self.inner.len() as u32
+    }
+
+    fn take_inner(&mut self) -> Vec<FilterCommitment> {
+        core::mem::take(&mut self.inner)
+    }
+}
+
+impl From<CFHeaders> for CFHeaderBatch {
+    fn from(val: CFHeaders) -> Self {
+        CFHeaderBatch::new(val)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FilterCheck {
+    // This filter was for the `stop_hash`
+    pub(crate) was_last_in_batch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Filter {
+    filter_hash: FilterHash,
+    block_hash: BlockHash,
+    block_filter: BlockFilter,
+}
+
+#[allow(dead_code)]
+impl Filter {
+    pub fn new(contents: Vec<u8>, block_hash: BlockHash) -> Self {
+        let hash = sha256d::Hash::hash(&contents);
+        let filter_hash = FilterHash::from_raw_hash(hash);
+        let block_filter = BlockFilter::new(&contents);
+        Self {
+            filter_hash,
+            block_hash,
+            block_filter,
+        }
+    }
+
+    pub fn filter_hash(&self) -> &FilterHash {
+        &self.filter_hash
+    }
+
+    pub fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    pub fn contains_any<'a>(&'a self, scripts: impl Iterator<Item = &'a ScriptBuf>) -> bool {
+        self.block_filter
+            .match_any(&self.block_hash, scripts.map(|script| script.to_bytes()))
+            .expect("vec reader is infallible")
+    }
+
+    pub fn into_filter(self) -> BlockFilter {
+        self.block_filter
+    }
+
+    pub fn contents(self) -> Vec<u8> {
+        self.block_filter.content
+    }
+}
+
+// Attributes of a height in the Bitcoin blockchain.
+trait HeightExt: Clone + Copy + std::hash::Hash + PartialEq + Eq + PartialOrd + Ord {
+    fn increment(&self) -> Self;
+
+    fn from_u64_checked(height: u64) -> Option<Self>;
+
+    fn is_adjustment_multiple(&self, params: impl AsRef<Params>) -> bool;
+}
+
+impl HeightExt for u32 {
+    fn increment(&self) -> Self {
+        self + 1
+    }
+
+    fn is_adjustment_multiple(&self, params: impl AsRef<Params>) -> bool {
+        *self as u64 % params.as_ref().difficulty_adjustment_interval() == 0
+    }
+
+    fn from_u64_checked(height: u64) -> Option<Self> {
+        height.try_into().ok()
+    }
+}
+
+trait ZerolikeExt {
+    fn zero() -> Self;
+}
+
+impl ZerolikeExt for Work {
+    fn zero() -> Self {
+        Self::from_be_bytes([0; 32])
+    }
+}
+
+trait HeaderValidationExt {
+    // Headers are logically connected.
+    fn connected(&self) -> bool;
+    // Each header passes its own work target.
+    fn passes_own_pow(&self) -> bool;
+    // Targets do not change out of the acceptable range.
+    fn bits_adhere_transition_threshold(&self, params: impl AsRef<Params>) -> bool;
+}
+
+impl HeaderValidationExt for &[Header] {
+    fn connected(&self) -> bool {
+        self.iter()
+            .zip(self.iter().skip(1))
+            .all(|(first, second)| first.block_hash().eq(&second.prev_blockhash))
+    }
+
+    fn passes_own_pow(&self) -> bool {
+        !self.iter().any(|header| {
+            let target = header.target();
+            let valid_pow = header.validate_pow(target);
+            valid_pow.is_err()
+        })
+    }
+
+    fn bits_adhere_transition_threshold(&self, params: impl AsRef<Params>) -> bool {
+        let params = params.as_ref();
+        if params.allow_min_difficulty_blocks {
+            return true;
+        }
+        self.iter().zip(self.iter().skip(1)).all(|(first, second)| {
+            let transition = Target::from_compact(first.bits).max_transition_threshold(params);
+            Target::from_compact(second.bits).le(&transition)
+        })
+    }
+}
+
+// Emulation of `GetBlockSubsidy` in Bitcoin Core: https://github.com/bitcoin/bitcoin/blob/master/src/validation.cpp#L1944
+pub(crate) fn block_subsidy(height: u32) -> Amount {
+    let halvings = height / SUBSIDY_HALVING_INTERVAL;
+    if halvings >= 64 {
+        return Amount::ZERO;
+    }
+    let base = Amount::ONE_BTC.to_sat() * 50;
+    let subsidy = base >> halvings;
+    Amount::from_sat(subsidy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subsidy_calculation() {
+        let first_subsidy = block_subsidy(2);
+        assert_eq!(first_subsidy, Amount::from_btc(50.0).unwrap());
+        let first_subsidy = block_subsidy(209_999);
+        assert_eq!(first_subsidy, Amount::from_btc(50.0).unwrap());
+        let second_subsidy = block_subsidy(210_000);
+        assert_eq!(second_subsidy, Amount::from_btc(25.0).unwrap());
+        let fourth_subsidy = block_subsidy(630_000);
+        assert_eq!(fourth_subsidy, Amount::from_btc(6.25).unwrap());
+        let now = block_subsidy(902_000);
+        assert_eq!(now, Amount::from_btc(3.125).unwrap());
+    }
+}

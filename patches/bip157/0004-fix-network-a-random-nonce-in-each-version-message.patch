@@ -1,0 +1,51 @@
+From c5170e7fe9d2dd463b9e20aa1952c1b724081074 Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Sat, 10 Oct 2026 22:33:18 -0300
+Subject: [PATCH 4/4] fix(network): a random nonce in each version message
+
+Every version message carried nonce 1, so a peer could recognise a Kyoto
+client from it. Each version message now carries a random nonce, as Core's
+do.
+---
+ src/network/outbound.rs | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/network/outbound.rs b/src/network/outbound.rs
+index 1014848..79febdf 100644
+--- a/src/network/outbound.rs
++++ b/src/network/outbound.rs
+@@ -6,6 +6,7 @@ use std::{
+ use bip324::{OutboundCipher, PacketType};
+ use bitcoin::{
+     consensus::serialize,
++    key::rand,
+     p2p::{
+         message::{NetworkMessage, RawNetworkMessage},
+         message_blockdata::Inventory,
+@@ -98,9 +99,25 @@ pub(in crate::network) fn make_version(relay_policy: &RelayPolicy) -> VersionMes
+         timestamp: now as i64,
+         receiver: from_and_recv.clone(),
+         sender: from_and_recv,
+-        nonce: 1,
++        // A fresh nonce per connection, as Core sends; a fixed one marks every Kyoto client.
++        nonce: rand::random(),
+         user_agent: format!("/Rust BIP-157:{KYOTO_VERSION}/rust-bitcoin:{RUST_BITCOIN_VERSION}/"),
+         start_height: 0,
+         relay,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use crate::network::RelayPolicy;
++
++    use super::make_version;
++
++    #[test]
++    fn each_version_message_has_its_own_nonce() {
++        let nonces: std::collections::HashSet<u64> = (0..8)
++            .map(|_| make_version(&RelayPolicy::BlocksOnly).nonce)
++            .collect();
++        assert_eq!(nonces.len(), 8);
++    }
++}
