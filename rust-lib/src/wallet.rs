@@ -408,7 +408,9 @@ impl Cell {
         let tip = self.tip_height();
         let sends = self.sends()?;
         let reporters = self.reporters()?;
-        let replaced: BTreeMap<Txid, Txid> = sends.iter().filter_map(|s| s.replaces.map(|r| (r, s.txid))).collect();
+        // A replacement that lost to a confirmed conflict, or never went out, replaces nothing.
+        let replaced: BTreeMap<Txid, Txid> =
+            sends.iter().filter(|s| !matches!(s.state.as_str(), "conflicted" | "failed")).filter_map(|s| s.replaces.map(|r| (r, s.txid))).collect();
         let bumps: BTreeSet<Txid> = sends.iter().filter(|s| s.replaces.is_some()).map(|s| s.txid).collect();
         let ours: BTreeSet<Txid> = sends.iter().map(|s| s.txid).collect();
         let mut rows: Vec<(u8, u32, u64, Value)> = vec![];
@@ -521,6 +523,61 @@ pub fn height_for_day(day: &str, net: BNetwork, family: Family, chain: &HeaderCh
 mod tests {
     use super::*;
     use crate::headers::tests::regtest_branch;
+
+    /// The original of a fee bump confirms first: it reads confirmed, with no replacement, and the
+    /// conflicted bump has no row.
+    #[test]
+    fn a_bump_that_lost_to_its_original_replaces_nothing() {
+        use bdk_wallet::chain::{CheckPoint, TxUpdate};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, Sequence, TxIn, TxOut};
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[3; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (mut w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let to_us = w.reveal_next_address(KeychainKind::External).script_pubkey();
+        let funding = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([9; 32]), vout: 0 }, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(100_000), script_pubkey: to_us }],
+        };
+        let coin = OutPoint { txid: funding.compute_txid(), vout: 0 };
+        let payee = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20]));
+        let spend = |fee: u64| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: coin, sequence: Sequence::ENABLE_RBF_NO_LOCKTIME, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(100_000 - fee), script_pubkey: payee.clone() }],
+        };
+        let (original, bump) = (spend(300), spend(1_500));
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let (b1, b2) = (BlockId { height: 1, hash: BlockHash::from_byte_array([1; 32]) }, BlockId { height: 2, hash: BlockHash::from_byte_array([2; 32]) });
+        let mut u = TxUpdate::default();
+        u.txs.push(std::sync::Arc::new(funding.clone()));
+        u.txs.push(std::sync::Arc::new(original.clone()));
+        u.anchors.insert((ConfirmationBlockTime { block_id: b1, confirmation_time: 1 }, funding.compute_txid()));
+        u.anchors.insert((ConfirmationBlockTime { block_id: b2, confirmation_time: 2 }, original.compute_txid()));
+        let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1, b2]).unwrap();
+        w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let record = |tx: &Transaction, state: &str, replaces: Option<Txid>| SendRecord {
+            txid: tx.compute_txid(), tx: tx.clone(), inputs: vec![coin], state: state.into(), created: 0, replaces, via: None, broadcast: None,
+        };
+        cell.store_send(&record(&original, "replaced", None)).unwrap();
+        cell.store_send(&record(&bump, "sent", Some(original.compute_txid()))).unwrap();
+        cell.settle_sends().unwrap();
+        let states: BTreeMap<Txid, String> = cell.sends().unwrap().into_iter().map(|s| (s.txid, s.state)).collect();
+        assert_eq!((states[&original.compute_txid()].as_str(), states[&bump.compute_txid()].as_str()), ("confirmed", "conflicted"));
+        let h = cell.history(0, 50, &[]).unwrap();
+        let rows = h["rows"].as_array().unwrap();
+        let row = |t: &Transaction| rows.iter().find(|r| r["txid"] == t.compute_txid().to_string()).cloned();
+        let o = row(&original).expect("the original's row");
+        assert_eq!((o["state"].as_str(), o["replacedBy"].is_null()), (Some("confirmed"), true), "{o}");
+        assert!(row(&bump).is_none(), "the conflicted bump has no row");
+    }
 
     #[test]
     fn days_to_unix() {
