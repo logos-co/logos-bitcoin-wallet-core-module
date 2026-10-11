@@ -206,11 +206,51 @@ pub fn esplora(src: &Source, proxy: Option<&Proxy>, iso: &Isolation, credentials
         let token = zeroize::Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
         b = b.header("Authorization", &format!("Basic {}", token.as_str()));
     }
+    let mut socks = None;
     if matches!(src.route, Route::Tor | Route::Onion) {
         let p = proxy.ok_or_else(|| format!("{}: routed through Tor, and no proxy is set", src.id))?;
-        b = b.proxy(&format!("socks5h://{}:{}@{}", iso.user, iso.pass, p.addr()));
+        socks = Some(format!("socks5h://{}:{}@{}", iso.user, iso.pass, p.addr()));
     }
-    b.header("User-Agent", "bitcoin-wallet").build_async().map_err(|e| format!("{}: {e}", src.id))
+    let Some(pin) = src.pin else {
+        if let Some(s) = &socks {
+            b = b.proxy(s);
+        }
+        return b.header("User-Agent", "bitcoin-wallet").build_async().map_err(|e| format!("{}: {e}", src.id));
+    };
+    // Pinned: esplora-client over a reqwest client of ours, whose TLS accepts only the pin.
+    let fail = |e: String| format!("{}: {e}", src.id);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::USER_AGENT, reqwest::header::HeaderValue::from_static("bitcoin-wallet"));
+    for (k, v) in &b.headers {
+        let name = reqwest::header::HeaderName::from_bytes(k.to_ascii_lowercase().as_bytes()).map_err(|e| fail(e.to_string()))?;
+        let mut value = reqwest::header::HeaderValue::from_str(v).map_err(|e| fail(e.to_string()))?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    let mut c = reqwest::Client::builder().use_preconfigured_tls(crate::pin::client_config(pin).map_err(fail)?).timeout(timeout_for(src)).default_headers(headers);
+    if let Some(s) = &socks {
+        c = c.proxy(reqwest::Proxy::all(s.as_str()).map_err(|e| fail(e.to_string()))?);
+    }
+    let client = c.build().map_err(|e| fail(e.to_string()))?;
+    Ok(esplora_client::AsyncClient::from_client(src.url.trim_end_matches('/').to_string(), client))
+}
+
+/// An error as status and the log show it: script hashes and txids in a failed request's URL
+/// would name the wallet's addresses and payments, so runs of 40 or more hex digits are elided.
+pub fn redact(e: &str) -> String {
+    let mut out = String::with_capacity(e.len());
+    let mut run = String::new();
+    for c in e.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_hexdigit() {
+            run.push(c);
+            continue;
+        }
+        out.push_str(if run.len() >= 40 { "…" } else { &run });
+        run.clear();
+        out.push(c);
+    }
+    out.pop();
+    out
 }
 
 #[derive(Default, Debug)]
@@ -412,8 +452,15 @@ mod tests {
     use super::*;
     use crate::routes::{Kind, Route};
 
+    #[test]
+    fn errors_name_no_script_hash_or_txid() {
+        let e = "esplora-0: Reqwest(reqwest::Error { url: \"https://h:1/scripthash/90954fa8865a517697fd98bc4248654082a383c1ed6722c1dadeb803b13dd571/txs\" })";
+        assert_eq!(redact(e), "esplora-0: Reqwest(reqwest::Error { url: \"https://h:1/scripthash/…/txs\" })");
+        assert_eq!(redact("timed out after 15 s at deadbeef"), "timed out after 15 s at deadbeef", "short hex stays");
+    }
+
     fn src(url: &str, route: Route, down: Option<&str>) -> Source {
-        Source { id: "s".into(), url: url.into(), operator: "op".into(), route, kind: Kind::Electrum, down: down.map(str::to_string), credentials: false, pin: None }
+        Source { id: "s".into(), url: url.into(), operator: "op".into(), route, kind: Kind::Electrum, down: down.map(str::to_string), credentials: false, pin: None, encrypted: true }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 #!/bin/bash
 # The local node as the chain authority, under a logosctl daemon: the real bitcoind_module running
-# Bitcoin Core in-process (libbitcoind_c) on regtest, the core following it over Logos IPC with
-# bdk_bitcoind_rpc's Emitter, and broadcasting through its sendrawtransaction.
+# Bitcoin Core in-process (libbitcoind_c) on regtest, the core following it over Logos IPC (a
+# backlog by its block filters, then bdk_bitcoind_rpc's Emitter), and broadcasting through its
+# sendrawtransaction.
 #   WORK=<dir> BITCOIND_MODULE=<logos-bitcoind-module checkout> tools/e2e/local-node.sh
 # Env: WORK, SKIP_BUILD (as for logosctl.sh), BITCOIND_MODULE (default ~/repos/logos-bitcoind-module).
 set -euo pipefail
@@ -67,6 +68,11 @@ node_rpc getmempoolentry "[\"$TXID\"]" | js '{"inMempool": v["error"] is None}'
 mine 1 "$PAYEE"
 until_true 'any(r["txid"] == "'"$TXID"'" and r["state"] == "confirmed" for r in v["rows"])' "$CORE" history 0 | js '[r for r in v["rows"] if r["txid"] == "'"$TXID"'"][0]'
 call "$CORE" sources_status | js '{"chainBy": v["chainBy"], "local": v["local"]}'
+
+step "A birthday: the node's block filters are read again from it, only matching blocks fetched"
+job set_birthday '{"height":2}' | js 'v["result"]'
+until_true 'v["rescanFrom"] is None and v["synced"] is True and v["node"]["filters"] is True and v["node"]["matched"] >= 2' "$CORE" status | js '{"birthdaySource": v["birthdaySource"], "node": v["node"]}'
+until_true 'v.get("confirmed") is not None and int(v["confirmed"]) > 0' "$CORE" balance | js '{"confirmed": v["confirmed"]}'
 
 step "Close, unload the core, stop the node"
 job close_wallet '{}' > /dev/null

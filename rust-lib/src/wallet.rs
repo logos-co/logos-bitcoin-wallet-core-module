@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 
-use bdk_wallet::chain::{ChainPosition, ConfirmationBlockTime};
+use bdk_wallet::chain::{BlockId, ChainPosition, ConfirmationBlockTime};
 use bdk_wallet::{KeychainKind, PersistedWallet, Wallet};
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -413,13 +413,14 @@ impl Cell {
         let ours: BTreeSet<Txid> = sends.iter().map(|s| s.txid).collect();
         let mut rows: Vec<(u8, u32, u64, Value)> = vec![];
         let mut seen = BTreeSet::new();
-        let row = |tx: &Transaction, txid: Txid, state: &str, height: Option<u32>, time: u64| -> Value {
+        let row = |tx: &Transaction, txid: Txid, state: &str, block: Option<BlockId>, time: u64| -> Value {
+            let height = block.map(|b| b.height);
             let c = intent::classify(&self.shape(tx, bumps.contains(&txid)));
             let fee = self.wallet.calculate_fee(tx).ok().map(|f| f.to_sat().to_string());
             json!({
                 "txid": txid.to_string(), "intent": c.intent, "amountSat": c.amount.to_string(), "feeSat": fee,
                 "coins": if c.intent == Intent::Combine { Some(c.coins) } else { None },
-                "counterparties": c.counterparties, "height": height,
+                "counterparties": c.counterparties, "height": height, "blockHash": block.map(|b| b.hash.to_string()),
                 "confirmations": height.map(|h| tip.saturating_sub(h) + 1).unwrap_or(0),
                 "time": time, "state": state,
                 "replaces": sends.iter().find(|s| s.txid == txid).and_then(|s| s.replaces).map(|t| t.to_string()),
@@ -434,7 +435,7 @@ impl Cell {
             let tx = wtx.tx_node.tx.clone();
             match wtx.chain_position {
                 ChainPosition::Confirmed { anchor, .. } => {
-                    rows.push((2, anchor.block_id.height, anchor.confirmation_time, row(&tx, txid, "confirmed", Some(anchor.block_id.height), anchor.confirmation_time)));
+                    rows.push((2, anchor.block_id.height, anchor.confirmation_time, row(&tx, txid, "confirmed", Some(anchor.block_id), anchor.confirmation_time)));
                 }
                 ChainPosition::Unconfirmed { last_seen, first_seen } => {
                     let state = if ours.contains(&txid) { "sent" } else { "pending" };
@@ -446,7 +447,7 @@ impl Cell {
         for h in held {
             if seen.insert(h.txid) {
                 if let Some(tx) = self.wallet.tx_graph().get_tx(h.txid) {
-                    rows.push((1, h.anchor.block_id.height, h.anchor.confirmation_time, row(&tx, h.txid, "waiting", Some(h.anchor.block_id.height), h.anchor.confirmation_time)));
+                    rows.push((1, h.anchor.block_id.height, h.anchor.confirmation_time, row(&tx, h.txid, "waiting", Some(h.anchor.block_id), h.anchor.confirmation_time)));
                 }
             }
         }

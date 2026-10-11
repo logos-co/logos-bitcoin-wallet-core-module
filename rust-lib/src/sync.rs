@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,7 @@ use crate::kyoto::{self, Feed, PeerBook, Start};
 use crate::ledger::Ledger;
 use crate::net::{self, Checked};
 use crate::network::{BNetwork, Family};
-use crate::node::{self, Follower, NodeClient, NodeRpc};
+use crate::node::{self, Follower, NodeClient, NodeRpc, PrunedGap};
 use crate::routes::{Isolation, Kind, Routes, Source};
 use crate::storage::{meta_get, meta_set};
 use crate::wallet::{Cell, Held};
@@ -103,12 +103,26 @@ pub struct Progress {
     pub full_scan_done: bool,
     pub kyoto: Option<KyotoStatus>,
     pub node: Option<node::NodeStatus>,
+    pub last_reorg: Option<Reorg>,
+    /// Set by `set_birthday` until the authority, or a history server's full scan, reaches the tip.
+    pub rescan_from: Option<u32>,
+}
+
+/// A reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Reorg {
+    pub height: u32,
+    pub depth: u32,
+    pub moved: Vec<String>,
+    pub at: u64,
 }
 
 pub struct Ctx {
     pub net: BNetwork,
     pub family: Family,
-    pub birthday: u32,
+    /// Where scans start; `rescan` has them start again from it.
+    pub birthday: Arc<AtomicU32>,
+    pub rescan: Arc<AtomicBool>,
     pub cell: Arc<Mutex<Option<Cell>>>,
     pub netstate: Arc<Mutex<NetState>>,
     pub progress: Arc<Mutex<Progress>>,
@@ -146,6 +160,9 @@ struct Found {
 
 const KYOTO_SCANNED: &str = "kyoto_scanned";
 const NODE_SCANNED: &str = "node_scanned";
+const NODE_GAP: &str = "node_gap";
+/// One round of the node's scan stops after this, so its finds are applied as it goes.
+const NODE_ROUND: Duration = Duration::from_secs(3);
 const KYOTO_PEERS: &str = "kyoto_peers";
 /// The local node is asked whether it is synced this often while it isn't the authority.
 const NODE_PROBE_EVERY: Duration = Duration::from_secs(30);
@@ -168,6 +185,8 @@ struct Loop {
     node: Option<Follower>,
     node_ok: bool,
     node_probe: Option<Instant>,
+    /// Blocks a pruned node couldn't give, until a history server or Kyoto has scanned them.
+    node_gap: Option<PrunedGap>,
     clients: HashMap<String, Electrum>,
     esplora: HashMap<String, esplora_client_alias::AsyncClient>,
     depths: HashMap<BlockHash, usize>,
@@ -205,6 +224,47 @@ impl Loop {
         self.ctx.stop.load(Ordering::SeqCst)
     }
 
+    fn birthday(&self) -> u32 {
+        self.ctx.birthday.load(Ordering::SeqCst)
+    }
+
+    /// A new birthday: Kyoto and the node scan again from it, and the history server runs a full scan.
+    fn restart_scan(&mut self) {
+        tracing::info!(target: "bitcoin", "scanning again from {}", self.birthday());
+        self.stop_kyoto(None);
+        self.kyoto_retry_at = Instant::now();
+        self.node = None;
+        if let Some(c) = self.ctx.cell.lock().as_ref() {
+            for key in [KYOTO_SCANNED, NODE_SCANNED, NODE_GAP] {
+                let _ = meta_set(&c.conn, key, "");
+            }
+        }
+        self.node_gap = None;
+        let mut p = self.ctx.progress.lock();
+        p.full_scan_done = false;
+        p.synced_tip = None;
+        // Again here: a pass from before the restart may have cleared it.
+        p.rescan_from = Some(self.birthday());
+        self.last_history = None;
+    }
+
+    /// The wallet's confirmed transactions whose blocks, from `from` up, left the authority's chain.
+    fn moved_by_reorg(&self, from: u32) -> Vec<String> {
+        let guard = self.ctx.cell.lock();
+        let Some(cell) = guard.as_ref() else { return vec![] };
+        cell.wallet
+            .transactions()
+            .filter_map(|t| match t.chain_position {
+                bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. }
+                    if anchor.block_id.height >= from && self.authority.hash_at(anchor.block_id.height) != Some(anchor.block_id.hash) =>
+                {
+                    Some(t.tx_node.txid.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn alert(&self, source: &str, kind: &'static str, detail: String) {
         tracing::warn!(target: "bitcoin", "source {source}: {kind}: {detail}");
         (self.ctx.notify)(Note::Alert { source: source.into(), kind, detail });
@@ -236,6 +296,8 @@ impl Loop {
                     self.clients.clear();
                     self.esplora.clear();
                     ns.routes = r;
+                    drop(ns);
+                    self.route_gap();
                 }
             }
             Err(e) => tracing::warn!(target: "bitcoin", "route_table: {e}"),
@@ -272,6 +334,7 @@ impl Loop {
     }
 
     fn failed(&mut self, id: &str, e: &str) {
+        let e = &net::redact(e);
         self.clients.remove(id);
         self.esplora.remove(id);
         self.ctx.netstate.lock().ledger.failed(id, e, now_secs());
@@ -301,6 +364,10 @@ impl Loop {
                 }
             }
             if self.node_ok {
+                // Blocks the pruned node couldn't give: Kyoto holds the chain until it has scanned them.
+                if kyoto && self.gap_pending(KYOTO) {
+                    return Feeder::Kyoto;
+                }
                 return Feeder::Node;
             }
         } else {
@@ -353,11 +420,19 @@ impl Loop {
                 }
             },
         };
+        let mut reorged = false;
         if let Some(from) = change.changed_from {
             if change.reorg_depth > 0 {
                 tracing::info!(target: "bitcoin", "authority reorg of {} from {from}", change.reorg_depth);
                 // bdk_electrum caches headers by height, and anchors by them: start them afresh.
                 self.clients.clear();
+                // BDK's chain still holds the old blocks here: what they confirmed has moved.
+                let moved = self.moved_by_reorg(from);
+                if !moved.is_empty() {
+                    tracing::info!(target: "bitcoin", "the reorg moved {} confirmed transaction(s)", moved.len());
+                    self.ctx.progress.lock().last_reorg = Some(Reorg { height: from, depth: change.reorg_depth, moved, at: now_secs() });
+                    reorged = true;
+                }
             }
             let mut guard = self.ctx.cell.lock();
             if let Some(cell) = guard.as_mut() {
@@ -383,6 +458,10 @@ impl Loop {
             }
         }
         self.ctx.progress.lock().authority = self.authority.summary(now_secs());
+        if reorged {
+            // The app hears of it now, not after this round's history sync.
+            (self.ctx.notify)(Note::State);
+        }
         moved
     }
 
@@ -441,6 +520,13 @@ impl Loop {
     fn kyoto_start(&self) -> Start {
         let a = &self.authority;
         let base = a.base_height();
+        // Covering a pruned node's gap: from its first block, whatever Kyoto scanned before.
+        if let Some(g) = self.node_gap.as_ref().filter(|_| self.gap_pending(KYOTO)) {
+            let s = g.heights.iter().copied().min().unwrap_or(g.from).min(g.from).saturating_sub(1).max(base);
+            if let Some(hash) = a.hash_at(s) {
+                return Start { from: (s, hash), headers_only: false, rescan_from: None };
+            }
+        }
         if let Some((h, hash)) = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned) {
             if a.hash_at(h) == Some(hash) {
                 let s = h.saturating_sub(kyoto::RESTART_DEPTH).max(base);
@@ -449,7 +535,7 @@ impl Loop {
                 }
             }
         }
-        let want = self.ctx.birthday.saturating_sub(1);
+        let want = self.birthday().saturating_sub(1);
         if want >= base {
             if let Some(hash) = a.hash_at(want) {
                 return Start { from: (want, hash), headers_only: false, rescan_from: None };
@@ -690,17 +776,99 @@ impl Loop {
             let expected: Vec<Arc<bitcoin::Transaction>> = cell.wallet.transactions().filter(|t| !t.chain_position.is_confirmed()).map(|t| t.tx_node.tx.clone()).collect();
             (cell.wallet.spk_index().clone(), expected)
         };
-        let birthday = self.ctx.birthday;
+        let birthday = self.birthday();
+        let stop = self.ctx.stop.clone();
+        let round = Instant::now();
         let mut found = vec![];
         loop {
-            let f = self.node.as_mut().expect("set").scan(&self.authority, &index, expected.clone(), birthday)?;
+            let f = self.node.as_mut().expect("set").scan(&self.authority, &index, expected.clone(), birthday, st.prune_height, &stop)?;
             let done = f.at_tip || f.scanned.is_none();
+            if !f.missing.is_empty() || f.unscanned.is_some() {
+                self.note_gap(&f.missing, f.unscanned, st.prune_height.unwrap_or(0));
+            }
+            let hit = !f.tx_update.txs.is_empty();
             found.push(Found { source: LOCAL_NODE, tx_update: f.tx_update, last_active: f.last_active, evicted: f.evicted, scanned: f.scanned.map(|s| (NODE_SCANNED, s)) });
             if done || self.stopped() {
                 break;
             }
+            // Finds are applied before the scan goes on, so addresses they reveal are watched.
+            if hit || round.elapsed() >= NODE_ROUND {
+                self.ctx.wake.store(true, Ordering::SeqCst);
+                break;
+            }
         }
+        let f = self.node.as_ref().expect("set");
+        let mut st = st;
+        (st.filters, st.matched, st.from_peers, st.pruned_gap) = (f.filters, f.matched, f.from_peers, self.node_gap.clone());
+        self.ctx.progress.lock().node = Some(st);
         Ok((change, found))
+    }
+
+    /// Whether a pruned node's gap waits on `via` to scan it.
+    fn gap_pending(&self, via: &str) -> bool {
+        self.node_gap.as_ref().is_some_and(|g| !g.resolved && g.via.as_deref() == Some(via))
+    }
+
+    /// Records blocks the pruned node couldn't give, and who scans them instead: the history
+    /// server, whose full scan covers every height, else Kyoto, else nobody (`via` stays null).
+    fn note_gap(&mut self, missing: &[u32], unscanned: Option<(u32, u32)>, below: u32) {
+        let from = missing.iter().copied().min().into_iter().chain(unscanned.map(|(f, _)| f)).min().unwrap_or(below);
+        let g = self.node_gap.get_or_insert_with(|| PrunedGap { from, below, ..Default::default() });
+        g.from = g.from.min(from);
+        g.below = g.below.max(below).max(unscanned.map_or(0, |(_, b)| b));
+        g.heights.extend_from_slice(missing);
+        g.heights.sort_unstable();
+        g.heights.dedup();
+        (g.via, g.resolved) = (None, false);
+        self.route_gap();
+        if let Some(g) = &self.node_gap {
+            tracing::warn!(target: "bitcoin", "the node pruned {} matched block(s) from {} up to {} and no peer sent them; via {:?}", g.heights.len(), g.from, g.below, g.via);
+        }
+    }
+
+    /// Hands an open gap nobody scans yet to the history server, else Kyoto, as the routes allow.
+    fn route_gap(&mut self) {
+        let Some(g) = self.node_gap.as_mut().filter(|g| !g.resolved && g.via.is_none()) else { return };
+        g.via = {
+            let ns = self.ctx.netstate.lock();
+            match ns.ledger.history(&ns.routes) {
+                Some(s) => Some(s.id.clone()),
+                None => ns.routes.kyoto.as_ref().filter(|k| k.down.is_none()).map(|_| KYOTO.to_string()),
+            }
+        };
+        if g.via.as_deref().is_some_and(|v| v != KYOTO) {
+            // The history server's next full scan covers them.
+            self.ctx.progress.lock().full_scan_done = false;
+            self.last_history = None;
+        }
+        self.save_gap();
+    }
+
+    /// The gap is covered once Kyoto, or any history server for a server's gap, scanned past it.
+    fn resolve_gap(&mut self, by: &str, scanned_to: Option<u32>) {
+        let Some(g) = self.node_gap.as_mut().filter(|g| !g.resolved) else { return };
+        let ours = match g.via.as_deref() {
+            Some(KYOTO) => by == KYOTO,
+            Some(_) => by != KYOTO,
+            None => false,
+        };
+        let last = g.heights.iter().copied().max().unwrap_or(0).max(g.below.saturating_sub(1));
+        if !ours || scanned_to.is_some_and(|h| h < last) {
+            return;
+        }
+        (g.resolved, g.via) = (true, Some(by.to_string()));
+        tracing::info!(target: "bitcoin", "{by} scanned the blocks the node pruned, from {} up to {}", g.from, g.below);
+        self.save_gap();
+    }
+
+    fn save_gap(&self) {
+        let text = self.node_gap.as_ref().map(|g| serde_json::to_string(g).unwrap_or_default()).unwrap_or_default();
+        if let Some(c) = self.ctx.cell.lock().as_ref() {
+            let _ = meta_set(&c.conn, NODE_GAP, &text);
+        }
+        if let Some(n) = self.ctx.progress.lock().node.as_mut() {
+            n.pruned_gap = self.node_gap.clone();
+        }
     }
 
     /// Applies what the authority found: checked against its chain all the same, anchors held
@@ -742,6 +910,13 @@ impl Loop {
         p.last_history_sync = Some(now);
         p.history_server = Some(f.source.to_string());
         p.last_error = None;
+        if f.scanned.is_some_and(|(_, (h, _))| Some(h) >= self.authority.tip_height()) {
+            p.rescan_from = None;
+        }
+        drop(p);
+        if f.source == KYOTO {
+            self.resolve_gap(KYOTO, f.scanned.map(|(_, (h, _))| h));
+        }
         Ok(())
     }
 
@@ -820,7 +995,7 @@ impl Loop {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.failed(&src.id, &e);
-                Err(format!("{}: {e}", src.id))
+                Err(format!("{}: {}", src.id, net::redact(&e)))
             }
         }
     }
@@ -1006,7 +1181,13 @@ impl Loop {
             }
             ns.ledger.current_history = Some(src.id.clone());
         }
+        if full {
+            self.resolve_gap(&src.id, None);
+        }
         let mut p = self.ctx.progress.lock();
+        if full && self.feeder == Feeder::Servers {
+            p.rescan_from = None;
+        }
         p.full_scan_done = true;
         p.synced_tip = self.authority.tip_height();
         p.last_history_sync = Some(now);
@@ -1026,7 +1207,7 @@ impl Loop {
             Some(c) => c.wallet.tx_graph().all_anchors().iter().flat_map(|(_, a)| a.iter().map(|x| x.block_id.height)).collect(),
             None => HashSet::new(),
         };
-        let birthday = self.ctx.birthday.max(self.authority.base_height());
+        let birthday = self.birthday().max(self.authority.base_height());
         for s in sources {
             let lower_of = |tip: u32| tip.min(auth_tip);
             let random = crosscheck::random_height(birthday, auth_tip.saturating_sub(1), &|h| anchor_heights.contains(&h));
@@ -1158,9 +1339,14 @@ impl Loop {
     }
 
     fn run(&mut self) {
+        // A gap kept from an earlier open, maybe with new routes to cover it.
+        self.route_gap();
         let poll = Duration::from_secs(self.ctx.netstate.lock().routes.poll_secs.max(1));
         let history_every = poll.max(Duration::from_secs(if poll <= Duration::from_secs(5) { 1 } else { 60 }));
         while !self.stopped() {
+            if self.ctx.rescan.swap(false, Ordering::SeqCst) {
+                self.restart_scan();
+            }
             // Without routes, as when the node module wasn't up at open, ask again soon.
             let none = self.ctx.routes_src.is_some() && self.ctx.netstate.lock().routes.every().is_empty();
             let due = if none { Duration::from_secs(15) } else { ROUTES_EVERY };
@@ -1243,7 +1429,9 @@ fn cap(cell: &Cell, claimed: &BTreeMap<KeychainKind, u32>, update: &TxUpdate<Con
 /// Starts the sync thread for an open wallet.
 pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name("bitcoin-sync".into()).spawn(move || {
-        let book = ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, KYOTO_PEERS).ok().flatten()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let meta = |key: &str| ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, key).ok().flatten());
+        let book = meta(KYOTO_PEERS).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let node_gap = meta(NODE_GAP).and_then(|t| serde_json::from_str(&t).ok());
         let mut l = Loop {
             ctx,
             authority,
@@ -1258,6 +1446,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             node: None,
             node_ok: false,
             node_probe: None,
+            node_gap,
             clients: HashMap::new(),
             esplora: HashMap::new(),
             depths: HashMap::new(),

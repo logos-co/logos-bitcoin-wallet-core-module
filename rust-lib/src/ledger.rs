@@ -153,7 +153,7 @@ impl Ledger {
                     "id": s.id, "url": s.url, "operator": s.operator, "kind": s.kind, "route": s.route,
                     "roles": routes.roles_of(&s.id), "state": state, "suspect": h.suspect.is_some(),
                     "suspectReason": h.suspect, "lastSync": h.last_sync, "lastOk": h.last_ok,
-                    "error": s.down.clone().or(h.last_error.clone()), "tip": h.tip,
+                    "error": s.down.clone().or(h.last_error.clone()), "tip": h.tip, "encrypted": s.encrypted,
                     "verdict": h.track.verdict, "history": history.as_deref() == Some(s.id.as_str()),
                 })
             })

@@ -209,10 +209,15 @@ pub struct T {
 impl T {
     pub fn rpc_at(&self, path: &str, method: &str, params: Value) -> Value {
         let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
-        let out = Command::new("curl")
-            .args(["-s", "--max-time", "120", "--user", self.cookie.trim(), "-H", "content-type: application/json", "--data-binary", &body, &format!("{}{path}", self.rpc)])
-            .output()
+        // The body goes on stdin: Linux caps one argument at 128 KiB.
+        let mut child = Command::new("curl")
+            .args(["-s", "--max-time", "120", "--user", self.cookie.trim(), "-H", "content-type: application/json", "--data-binary", "@-", &format!("{}{path}", self.rpc)])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
             .expect("curl");
+        std::io::Write::write_all(&mut child.stdin.take().expect("stdin"), body.as_bytes()).expect("curl stdin");
+        let out = child.wait_with_output().expect("curl");
         let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("rpc {method}: {}", String::from_utf8_lossy(&out.stdout)));
         assert!(v["error"].is_null(), "rpc {method}: {v}");
         v["result"].clone()

@@ -41,6 +41,9 @@ pub struct Entry {
     /// SHA-256 of an Electrum server's end-entity certificate, pinned in place of the CAs.
     #[serde(default)]
     pub cert_sha256: Option<String>,
+    /// The person added this server; only such a server on their own network may be plain text.
+    #[serde(default)]
+    pub user_added: bool,
 }
 
 /// One reachable source with how to reach it.
@@ -56,6 +59,8 @@ pub struct Source {
     pub credentials: bool,
     /// The pinned certificate's SHA-256, for an `ssl://` Electrum server.
     pub pin: Option<[u8; 32]>,
+    /// False for plain text outside Tor: the app marks such a server as not encrypted.
+    pub encrypted: bool,
 }
 
 /// Kyoto's peers and the one connection type its client uses for all of them.
@@ -176,6 +181,11 @@ fn kind_of(url: &str) -> Option<Kind> {
     }
 }
 
+/// TLS servers take a pin: `ssl://` Electrum, `https://` Esplora.
+fn pinnable(kind: Kind, url: &str) -> bool {
+    matches!((kind, url.split_once("://").map(|(s, _)| s)), (Kind::Electrum, Some("ssl")) | (Kind::Esplora, Some("https")))
+}
+
 fn plaintext(url: &str) -> bool {
     url.starts_with("tcp://") || url.starts_with("http://")
 }
@@ -209,15 +219,17 @@ pub fn resolve(e: &Entry, proxy: Option<&Proxy>) -> Option<Source> {
         Route::Direct if plaintext(&e.url) && !is_loopback_or_lan(&host) => {
             Some("a server reached directly must use TLS unless it is on your own network".to_string())
         }
+        Route::Direct if plaintext(&e.url) && !e.user_added => Some("plain text only to a server you added on your own network".to_string()),
         _ if host.is_empty() => Some("no host in the URL".to_string()),
         _ => match &pin {
             Some(Err(why)) => Some(why.clone()),
-            Some(Ok(_)) if kind != Kind::Electrum || !e.url.starts_with("ssl://") => Some("a pinned certificate is for an ssl:// Electrum server".to_string()),
+            Some(Ok(_)) if !pinnable(kind, &e.url) => Some("a pinned certificate is for an ssl:// Electrum or https:// Esplora server".to_string()),
             _ => None,
         },
     };
     let pin = pin.and_then(Result::ok);
-    Some(Source { id: e.id.clone(), url: e.url.clone(), operator: e.operator.clone(), route: e.route, kind, down, credentials: e.credentials, pin })
+    let encrypted = !plaintext(&e.url) || onion;
+    Some(Source { id: e.id.clone(), url: e.url.clone(), operator: e.operator.clone(), route: e.route, kind, down, credentials: e.credentials, pin, encrypted })
 }
 
 /// Kyoto's route: peers dialled directly, or all through Tor, never a mix (one connection type per client).
@@ -287,7 +299,8 @@ impl Routes {
     /// and Kyoto's peers, when configured, are the authorities.
     pub fn regtest(cfg: &RegtestConfig) -> Self {
         let mut all = vec![];
-        let entry = |id: String, url: &str, operator: String| Entry { id, url: url.to_string(), operator, route: Route::Direct, kind: None, credentials: false, cert_sha256: None };
+        // A test chain's servers are the harness's own.
+        let entry = |id: String, url: &str, operator: String| Entry { id, url: url.to_string(), operator, route: Route::Direct, kind: None, credentials: false, cert_sha256: None, user_added: true };
         for (i, url) in cfg.electrum.iter().enumerate() {
             all.push(entry(format!("electrum-{i}"), url, format!("regtest-{i}")));
         }
@@ -361,7 +374,8 @@ mod tests {
             "history": [e("a", "ssl://electrum.example:50002".into(), "tor"), e("o", format!("tcp://{}:50001", onion()), "onion")],
             "fees": [e("f", "https://esplora.example/api".into(), "tor")],
             "broadcast": [e("a", "ssl://electrum.example:50002".into(), "tor")],
-            "check": [e("l", "tcp://192.168.1.20:50001".into(), "direct")],
+            "check": [{"id": "l", "url": "tcp://192.168.1.20:50001", "operator": "op", "route": "direct", "userAdded": true},
+                      e("d", "tcp://192.168.1.21:50001".into(), "direct")],
             "crossCheck": true,
         })
         .to_string()
@@ -379,7 +393,7 @@ mod tests {
         assert_eq!(r.fees[0].kind, Kind::Esplora);
         assert!(r.cross_check);
         assert_eq!(r.roles_of("a"), vec!["history", "broadcast"]);
-        assert_eq!(r.every().len(), 4);
+        assert_eq!(r.every().len(), 5);
     }
 
     #[test]
@@ -387,6 +401,7 @@ mod tests {
         let r = Routes::from_table(&table(None)).unwrap();
         assert!(r.history.iter().all(|s| s.down.as_deref() == Some("routed through Tor, and no proxy is set")));
         assert!(r.check[0].down.is_none(), "the user's own network needs no proxy");
+        assert!(!r.check[0].encrypted && r.check[1].down.as_deref().is_some_and(|d| d.contains("you added")), "plain text only to the user's own");
         assert!(Routes::from_table(&json!({"proxy": "socks5://127.0.0.1:9050"}).to_string()).is_err(), "names must resolve at the proxy");
         assert!(Routes::from_table(&json!({"ok": false, "error": "not authorized"}).to_string()).is_err());
     }
@@ -394,7 +409,7 @@ mod tests {
     #[test]
     fn plain_text_only_to_onions_and_our_own_network() {
         let p = Proxy::parse("socks5h://127.0.0.1:9050").unwrap();
-        let e = |url: &str, route| Entry { id: "x".into(), url: url.into(), operator: String::new(), route, kind: None, credentials: false, cert_sha256: None };
+        let e = |url: &str, route| Entry { id: "x".into(), url: url.into(), operator: String::new(), route, kind: None, credentials: false, cert_sha256: None, user_added: true };
         assert!(resolve(&e("tcp://electrum.example:50001", Route::Tor), Some(&p)).unwrap().down.is_some());
         assert!(resolve(&e("tcp://electrum.example:50001", Route::Direct), None).unwrap().down.is_some());
         assert!(resolve(&e("tcp://127.0.0.1:60401", Route::Direct), None).unwrap().down.is_none());
@@ -443,13 +458,29 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_only_to_a_server_the_person_added() {
+        let e = |url: &str, user_added| Entry { id: "x".into(), url: url.into(), operator: String::new(), route: Route::Direct, kind: None, credentials: false, cert_sha256: None, user_added };
+        let added = resolve(&e("tcp://192.168.1.5:50001", true), None).unwrap();
+        assert_eq!((added.down, added.encrypted), (None, false), "the app marks it not encrypted");
+        assert!(resolve(&e("tcp://192.168.1.5:50001", false), None).unwrap().down.unwrap().contains("you added"));
+        assert!(resolve(&e("http://nas.local:3002", false), None).unwrap().down.is_some(), "not a default nor a listed one");
+        assert!(resolve(&e("ssl://192.168.1.5:50002", false), None).unwrap().encrypted);
+        let p = Proxy::parse("socks5h://127.0.0.1:9050").unwrap();
+        let onion = Entry { route: Route::Onion, ..e(&format!("tcp://{}:50001", onion()), false) };
+        let o = resolve(&onion, Some(&p)).unwrap();
+        assert_eq!((o.down, o.encrypted), (None, true), "Tor encrypts to an onion service");
+    }
+
+    #[test]
     fn certificate_pins() {
         let pin = "AB:".repeat(31) + "AB";
-        let e = |url: &str, pin: &str| Entry { id: "x".into(), url: url.into(), operator: String::new(), route: Route::Direct, kind: None, credentials: false, cert_sha256: Some(pin.into()) };
+        let e = |url: &str, pin: &str| Entry { id: "x".into(), url: url.into(), operator: String::new(), route: Route::Direct, kind: None, credentials: false, cert_sha256: Some(pin.into()), user_added: true };
         let ok = resolve(&e("ssl://192.168.1.5:50002", &pin), None).unwrap();
         assert_eq!((ok.pin, ok.down), (Some([0xab; 32]), None));
         assert!(resolve(&e("tcp://192.168.1.5:50001", &pin), None).unwrap().down.unwrap().contains("ssl://"));
-        assert!(resolve(&e("https://192.168.1.5/api", &pin), None).unwrap().down.is_some(), "no pins for Esplora");
+        let esplora = resolve(&e("https://192.168.1.5/api", &pin), None).unwrap();
+        assert_eq!((esplora.pin, esplora.down), (Some([0xab; 32]), None), "an https:// Esplora server takes a pin");
+        assert!(resolve(&e("http://192.168.1.5/api", &pin), None).unwrap().down.unwrap().contains("https://"), "not plain http");
         assert!(resolve(&e("ssl://192.168.1.5:50002", "abcd"), None).unwrap().down.unwrap().contains("hex"));
         assert_eq!(resolve(&e("ssl://192.168.1.5:50002", ""), None).unwrap().pin, None, "an empty pin is none");
     }

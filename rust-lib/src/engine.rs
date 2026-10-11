@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -49,7 +49,7 @@ const APPROVAL_LIMIT: Duration = Duration::from_secs(6 * 3600);
 
 /// Job kinds only the wallet backend may start.
 pub fn backend_only(kind: &str) -> bool {
-    matches!(kind, "sign_and_broadcast" | "cancel_send" | "abandon_send")
+    matches!(kind, "sign_and_broadcast" | "cancel_send" | "abandon_send" | "set_birthday")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +119,9 @@ struct OpenWallet {
     stop: Arc<AtomicBool>,
     wake: Arc<AtomicBool>,
     reload: Arc<AtomicBool>,
+    /// The height scans start from, and a flag that has them start again from it.
+    birthday: Arc<AtomicU32>,
+    rescan: Arc<AtomicBool>,
     netstate: Arc<Mutex<NetState>>,
     progress: Arc<Mutex<Progress>>,
     thread: Option<JoinHandle<()>>,
@@ -152,6 +155,7 @@ enum Task {
     CancelSend { preview: String },
     Rebroadcast { txid: Txid },
     Abandon { txid: Txid },
+    SetBirthday(Birthday),
 }
 
 struct Queue {
@@ -180,6 +184,9 @@ pub struct Engine {
     pending_open: Mutex<Option<Arc<AtomicBool>>>,
     last_emitted: Mutex<String>,
     closed: AtomicBool,
+    /// Routes for regtest opens in place of regtest.json's; tests only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_routes: Mutex<Option<Routes>>,
 }
 
 fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
@@ -188,10 +195,11 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
     let allowed: &[&str] = match kind {
         "open_wallet" => &["network", "group", "family", "birthday"],
         "close_wallet" => &[],
-        "build_send" => &["recipients", "feeRate", "target", "sendMax"],
+        "build_send" => &["recipients", "feeRate", "target", "sendMax", "smallChangeToFee"],
         "bump_fee" => &["txid", "feeRate"],
         "sign_and_broadcast" | "cancel_send" => &["previewId"],
         "rebroadcast" | "abandon_send" => &["txid"],
+        "set_birthday" => &["date", "height"],
         other => return Err(format!("unknown job kind {other}")),
     };
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -232,6 +240,11 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
         "cancel_send" => Task::CancelSend { preview: preview()? },
         "rebroadcast" => Task::Rebroadcast { txid: txid()? },
         "abandon_send" => Task::Abandon { txid: txid()? },
+        "set_birthday" => Task::SetBirthday(match (&v["date"], &v["height"]) {
+            (Value::String(d), Value::Null) if wallet::day_to_unix(d).is_some() => Birthday::Day(d.trim().to_string()),
+            (Value::Null, Value::Number(n)) => Birthday::Height(n.as_u64().filter(|h| *h <= u32::MAX as u64).ok_or("height must be a whole number")? as u32),
+            _ => return Err("set_birthday takes { date: YYYY-MM-DD } or { height }".into()),
+        }),
         _ => unreachable!(),
     })
 }
@@ -259,6 +272,8 @@ impl Engine {
             pending_open: Mutex::new(None),
             last_emitted: Mutex::new(String::new()),
             closed: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_routes: Mutex::new(None),
         });
         let weak = Arc::downgrade(&engine);
         let q = engine.queue.clone();
@@ -334,6 +349,7 @@ impl Engine {
             Task::CancelSend { preview } => self.cancel_send(&preview),
             Task::Rebroadcast { txid } => self.rebroadcast(txid),
             Task::Abandon { txid } => self.abandon(txid),
+            Task::SetBirthday(b) => self.set_birthday(b),
         };
         if let Err(e) = &outcome {
             tracing::info!(target: "bitcoin", "job {id} failed: {e}");
@@ -357,7 +373,8 @@ impl Engine {
     /// Emits `walletStateChanged` when what status says has changed.
     fn emit_state(&self) {
         let s = self.status_inner(false);
-        let digest = json!([s["state"], s["synced"], s["authority"]["height"], s["openHandle"], s["approvalHandle"], s["lastError"], s["historyServer"], s["needsBirthday"]]).to_string();
+        let digest = json!([s["state"], s["synced"], s["authority"]["kind"], s["authority"]["height"], s["openHandle"], s["approvalHandle"], s["lastError"], s["historyServer"], s["needsBirthday"],
+            s["birthday"], s["rescanFrom"], s["lastReorg"]["at"]]).to_string();
         let mut last = self.last_emitted.lock();
         if *last != digest {
             *last = digest;
@@ -509,10 +526,12 @@ impl Engine {
         let progress = Arc::new(Mutex::new(Progress { full_scan_done, authority: authority.summary(now), last_error: routes_err.clone(), ..Default::default() }));
         let cell = Arc::new(Mutex::new(Some(cell)));
         let (stop, wake, reload) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(routes_err.is_some())));
+        let (birthday_at, rescan) = (Arc::new(AtomicU32::new(bday)), Arc::new(AtomicBool::new(false)));
         let ctx = Ctx {
             net: network,
             family: grant.family,
-            birthday: bday,
+            birthday: birthday_at.clone(),
+            rescan: rescan.clone(),
             cell: cell.clone(),
             netstate: netstate.clone(),
             progress: progress.clone(),
@@ -540,6 +559,8 @@ impl Engine {
             stop,
             wake,
             reload,
+            birthday: birthday_at,
+            rescan,
             netstate,
             progress,
             thread: Some(thread),
@@ -557,6 +578,10 @@ impl Engine {
 
     fn routes_for(&self, network: BNetwork) -> (Routes, Option<String>) {
         if network == BNetwork::Regtest {
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Some(r) = self.test_routes.lock().clone() {
+                return (r, None);
+            }
             return (regtest_config().map(Routes::regtest).unwrap_or_default(), None);
         }
         match &self.routes_src {
@@ -662,11 +687,43 @@ impl Engine {
         });
     }
 
+    // ── Birthday ──────────────────────────────────────────────────────────
+
+    /// A birthday for a wallet restored without one: stored, and the scans start again from it,
+    /// less the margin. Refused past the wallet's first known transaction.
+    fn set_birthday(&self, b: Birthday) -> Result<Value, String> {
+        let (net, family, birthday, rescan, progress) = self.with_open(|w| Ok((w.network, w.family, w.birthday.clone(), w.rescan.clone(), w.progress.clone())))?;
+        let from = self.cell_job(Duration::from_secs(30), |cell| {
+            refuse_birthday(&b, first_known(cell)?, now_secs())?;
+            let from = match &b {
+                Birthday::Height(h) => h.saturating_sub(wallet::DATE_MARGIN_BLOCKS).max(net.activation_height(family)),
+                Birthday::Day(d) => {
+                    let chain = crate::headers::HeaderChain::restore(net, cell.load_headers()?, now_secs() as u32);
+                    wallet::height_for_day(d, net, family, &chain).ok_or("no height for that day")?
+                }
+            };
+            meta_set(&cell.conn, "birthday", &from.to_string()).map_err(|e| e.to_string())?;
+            meta_set(&cell.conn, "birthday_source", "set").map_err(|e| e.to_string())?;
+            Ok(from)
+        })?;
+        birthday.store(from, Ordering::SeqCst);
+        progress.lock().rescan_from = Some(from);
+        rescan.store(true, Ordering::SeqCst);
+        self.wake();
+        self.set_light(|l| {
+            l.birthday = Some(from);
+            l.birthday_source = Some("set".into());
+            l.needs_birthday = false;
+        });
+        tracing::info!(target: "bitcoin", "birthday set; rescanning from {from}");
+        Ok(json!({"birthday": {"height": from, "source": "set"}, "rescanFrom": from}))
+    }
+
     // ── Sends ─────────────────────────────────────────────────────────────
 
-    fn keep_preview(&self, cell: &Cell, kind: &'static str, psbt: Psbt, inputs: Vec<OutPoint>, rate: f64, replaces: Option<Txid>) -> Result<Value, String> {
+    fn keep_preview(&self, cell: &Cell, kind: &'static str, psbt: Psbt, inputs: Vec<OutPoint>, rate: f64, replaces: Option<Txid>, to_fee: u64) -> Result<Value, String> {
         let id = format!("p{}", self.next_preview.fetch_add(1, Ordering::SeqCst) + 1);
-        let json = send::preview_json(cell, &id, kind, &psbt, rate, replaces)?;
+        let json = send::preview_json(cell, &id, kind, &psbt, rate, replaces, to_fee)?;
         self.previews.lock().insert(
             id,
             Preview { kind, psbt, inputs, replaces, json: json.clone(), ticket: None, state: "built".into(), cancel: Arc::new(AtomicBool::new(false)), busy: false },
@@ -682,10 +739,10 @@ impl Engine {
         }
         let rate = send::rate_for(input.fee_rate, input.target.as_deref(), &self.fee_rates())?;
         self.cell_job(Duration::from_secs(60), |cell| {
-            let psbt = send::build(cell, &input, rate)?;
+            let (psbt, to_fee) = send::build(cell, &input, rate)?;
             let inputs = send::lock(cell, &psbt);
             cell.persist()?;
-            self.keep_preview(cell, "send", psbt, inputs, rate, None)
+            self.keep_preview(cell, "send", psbt, inputs, rate, None, to_fee)
         })
     }
 
@@ -699,7 +756,7 @@ impl Engine {
             let psbt = send::build_bump(cell, txid, rate)?;
             let inputs = send::lock(cell, &psbt);
             cell.persist()?;
-            self.keep_preview(cell, "fee_bump", psbt, inputs, rate, Some(txid))
+            self.keep_preview(cell, "fee_bump", psbt, inputs, rate, Some(txid), 0)
         })
     }
 
@@ -996,6 +1053,8 @@ impl Engine {
             v["node"] = json!(p.node);
             v["historyServer"] = json!(p.history_server);
             v["lastHistorySync"] = json!(p.last_history_sync);
+            v["lastReorg"] = json!(p.last_reorg);
+            v["rescanFrom"] = json!(p.rescan_from);
             if l.state == State::Syncing || l.state == State::Ready {
                 v["state"] = json!(if caught_up { "ready" } else { "syncing" });
             }
@@ -1041,6 +1100,12 @@ impl Engine {
             Ok(None) => json!({"ok": true, "busy": true, "confirmed": "", "waiting": "", "pending": "", "sent": "", "immature": "", "tooSmall": {"count": null, "sat": ""}}),
             Err(e) => json!({"ok": false, "error": e}),
         }
+    }
+
+    /// Routes for this engine's regtest opens, so one test process can try several; tests only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_regtest_routes(&self, routes: Routes) {
+        *self.test_routes.lock() = Some(routes);
     }
 
     /// Reveals `n` receive addresses at once, as a scan elsewhere might; tests only.
@@ -1207,6 +1272,40 @@ pub fn resolve_birthday(
     }
 }
 
+/// A birthday after the wallet's first known transaction (`first`: height, block time) is refused,
+/// as is a day still to come.
+fn refuse_birthday(b: &Birthday, first: Option<(u32, u64)>, now: u64) -> Result<(), String> {
+    match b {
+        Birthday::Height(h) => match first {
+            Some((fh, _)) if *h > fh => Err(format!("the wallet has a transaction at height {fh}, before a birthday at {h}")),
+            _ => Ok(()),
+        },
+        Birthday::Day(d) => {
+            let t = wallet::day_to_unix(d).ok_or("not a YYYY-MM-DD day")?;
+            match first {
+                _ if t > now as i64 => Err("the birthday is in the future".into()),
+                Some((fh, ft)) if t > ft as i64 => Err(format!("the wallet has a transaction from before {d}, at height {fh}")),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// The lowest height and earliest block time of the wallet's confirmed and waiting transactions.
+fn first_known(cell: &Cell) -> Result<Option<(u32, u64)>, String> {
+    let mut first: Option<(u32, u64)> = None;
+    let mut take = |h: u32, t: u64| first = Some(first.map_or((h, t), |(fh, ft)| (fh.min(h), ft.min(t))));
+    for t in cell.wallet.transactions() {
+        if let bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } = t.chain_position {
+            take(anchor.block_id.height, anchor.confirmation_time);
+        }
+    }
+    for h in cell.held()? {
+        take(h.anchor.block_id.height, h.anchor.confirmation_time);
+    }
+    Ok(first)
+}
+
 /// Locks of previews that never reached broadcasting: they died with the session that built them.
 /// A send that may have left keeps its inputs locked until it confirms or is abandoned.
 /// A send whose record says it may have gone out stays in the wallet as pending, even when the
@@ -1259,12 +1358,35 @@ mod tests {
         assert!(parse_task("bump_fee", r#"{"txid":"nope","feeRate":5}"#).is_err());
         assert!(parse_task("teleport", "{}").is_err());
         assert!(backend_only("sign_and_broadcast") && backend_only("cancel_send") && !backend_only("build_send"));
+        assert!(matches!(parse_task("set_birthday", r#"{"height":840000}"#), Ok(Task::SetBirthday(Birthday::Height(840_000)))));
+        assert!(matches!(parse_task("set_birthday", r#"{"date":"2024-04-20"}"#), Ok(Task::SetBirthday(Birthday::Day(_)))));
+        for bad in [r#"{}"#, r#"{"date":"2024-04-20","height":1}"#, r#"{"date":"april"}"#, r#"{"height":-1}"#, r#"{"height":"1"}"#, r#"{"day":"2024-04-20"}"#] {
+            assert!(parse_task("set_birthday", bad).is_err(), "{bad}");
+        }
+        assert!(backend_only("set_birthday"));
+    }
+
+    #[test]
+    fn a_birthday_after_the_first_transaction_is_refused() {
+        let day = |d: &str| Birthday::Day(d.into());
+        let now = 1_791_590_400 + 3600; // 2026-10-10, 01:00
+        // The first transaction: height 900,000, mined 2025-06-01 12:00.
+        let first = Some((900_000, 1_748_779_200));
+        assert!(refuse_birthday(&Birthday::Height(900_000), first, now).is_ok());
+        assert!(refuse_birthday(&Birthday::Height(900_001), first, now).unwrap_err().contains("900000"));
+        assert!(refuse_birthday(&day("2025-06-01"), first, now).is_ok(), "the same day");
+        assert!(refuse_birthday(&day("2025-06-02"), first, now).is_err());
+        assert!(refuse_birthday(&day("2026-10-10"), None, now).is_ok(), "today, with nothing known");
+        assert!(refuse_birthday(&day("2026-10-11"), None, now).unwrap_err().contains("future"));
+        assert!(refuse_birthday(&Birthday::Height(u32::MAX), None, now).is_ok(), "nothing known: any height");
     }
 
     /// Opens a native segwit wallet with the BIP84 test vector's account key, under a database
     /// key that changes on every open, as a device account's forgotten data password does.
     struct KeyChanging {
         opens: std::sync::atomic::AtomicU8,
+        /// The same key on every open instead.
+        fixed: bool,
     }
 
     impl manager::SignerManager for KeyChanging {
@@ -1280,7 +1402,7 @@ mod tests {
         }
         fn fetch_result(&self, _h: &str, _r: &str) -> Result<String, String> {
             let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
-            let key = format!("{:02x}", self.opens.load(Ordering::SeqCst)).repeat(32);
+            let key = if self.fixed { "07".repeat(32) } else { format!("{:02x}", self.opens.load(Ordering::SeqCst)).repeat(32) };
             Ok(json!({"ok": true, "result": {"group": "g_reset", "family": "bitcoin", "chain": "test", "network": "regtest",
                 "external": format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), "internal": format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"),
                 "fingerprint": "73c5da0a", "databaseKey": key, "origin": "restored", "birthday": null, "unlocked": null}}).to_string())
@@ -1314,7 +1436,7 @@ mod tests {
     fn a_new_database_key_sets_the_old_database_aside_and_starts_fresh() {
         crate::network::configure_regtest(Default::default());
         let root = tempfile::tempdir().unwrap();
-        let mgr = Arc::new(KeyChanging { opens: Default::default() });
+        let mgr = Arc::new(KeyChanging { opens: Default::default(), fixed: false });
         let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), mgr, None);
         let first = finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
         assert_eq!((first["created"].clone(), first["reset"].clone()), (json!(true), json!(false)));
@@ -1328,6 +1450,53 @@ mod tests {
         let dir = root.path().join("wallets/regtest/g_reset");
         let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().contains("unreadable")).collect();
         assert!(!aside.is_empty(), "the old database is kept aside");
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_birthday_set_on_an_open_wallet_stands_and_starts_the_scan_again() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), None);
+        let j = e.start_job("set_birthday", r#"{"height":500}"#);
+        let (id, r) = (j["jobId"].as_str().unwrap().to_string(), j["receipt"].as_str().unwrap().to_string());
+        let t0 = Instant::now();
+        while e.jobs().status(&id, &r)["state"] != "failed" {
+            assert!(t0.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(e.jobs().status(&id, &r)["error"].as_str().unwrap().contains("no wallet"), "only on an open wallet");
+        finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+        assert_eq!(e.status()["needsBirthday"], true, "restored, no birthday");
+        let set = finish(&e, "set_birthday", json!({"height": 500}));
+        assert_eq!(set, json!({"birthday": {"height": 212, "source": "set"}, "rescanFrom": 212}), "less the margin");
+        assert_eq!(e.with_open(|w| Ok(w.birthday.load(Ordering::SeqCst))).unwrap(), 212, "the sync thread's start");
+        let st = e.status();
+        assert_eq!((st["needsBirthday"].clone(), st["birthday"].clone(), st["birthdaySource"].clone()), (json!(false), json!(212), json!("set")));
+        finish(&e, "close_wallet", json!({}));
+        let again = finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset"}));
+        assert_eq!((again["birthday"].clone(), again["needsBirthday"].clone()), (json!({"height": 212, "source": "set"}), json!(false)), "kept: {again}");
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_reorg_reaches_the_app_in_wallet_state() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let s2 = seen.clone();
+        let sink: Sink = Arc::new(move |ev| {
+            if let Event::WalletState(v) = ev {
+                s2.lock().unwrap().push(v);
+            }
+        });
+        let e = Engine::new(root.path().join("wallets"), sink, Arc::new(KeyChanging { opens: Default::default(), fixed: true }), None);
+        finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+        let r = sync::Reorg { height: 108, depth: 1, moved: vec!["ab".into()], at: 1_791_590_400 };
+        e.with_open(|w| Ok(w.progress.lock().last_reorg = Some(r.clone()))).unwrap();
+        e.emit_state();
+        let got = seen.lock().unwrap().iter().rev().find(|v| !v["lastReorg"].is_null()).cloned();
+        assert_eq!(got.map(|v| v["lastReorg"].clone()), Some(json!({"height": 108, "depth": 1, "moved": ["ab"], "at": 1_791_590_400u64})));
         e.shutdown();
     }
 

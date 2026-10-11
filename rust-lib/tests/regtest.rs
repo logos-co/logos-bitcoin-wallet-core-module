@@ -137,6 +137,19 @@ fn bitcoin_wallet_on_regtest() {
     t.wait("the payment confirmed", 60, || t.sats("confirmed") == 100_000_000);
     assert_eq!(t.row(&funded.to_string())["intent"], "receive");
 
+    // A birthday for the restore: refused past the first payment, then set; the full scan runs again.
+    let first_height = t.row(&funded.to_string())["height"].as_u64().unwrap();
+    let e = t.job_err("set_birthday", json!({"height": first_height + 1}));
+    assert!(e.contains("before a birthday"), "{e}");
+    let set = t.job("set_birthday", json!({"height": first_height}));
+    assert_eq!(set["birthday"]["source"], "set", "{set}");
+    t.wait("the rescan", 60, || t.engine.status()["rescanFrom"].is_null());
+    t.synced();
+    let st = t.engine.status();
+    assert_eq!((st["needsBirthday"].clone(), st["birthdaySource"].clone()), (json!(false), json!("set")), "{st}");
+    assert!(t.events.lock().unwrap().iter().any(|(n, v)| n == "walletStateChanged" && v["rescanFrom"] == set["rescanFrom"]), "the app sees the rescan");
+    assert_eq!(t.sats("confirmed"), 100_000_000, "the rescan keeps the payment");
+
     // Send from native segwit: approval through the manager, BDK finalizes, the node accepts it.
     let theirs = t.wallet_rpc("getnewaddress", json!(["payee"])).as_str().unwrap().to_string();
     let (preview, sent) = t.send(&theirs, 10_000_000, None);
@@ -265,6 +278,7 @@ fn bitcoin_wallet_on_regtest() {
     t.wait("the payment confirmed", 60, || t.row(&reorged)["state"] == "confirmed");
     let old_block = t.rpc("getbestblockhash", json!([]));
     let h = t.tip();
+    assert_eq!(t.row(&reorged)["blockHash"], old_block);
     let suspects_before = t.alerts("suspect", "electrum-0") + t.alerts("suspect", "electrum-1");
     // The fork node replaces the block offline and reconnects: the node electrs follows reorgs as
     // on a live network, keeping the old block as a valid stale fork.
@@ -276,6 +290,11 @@ fn bitcoin_wallet_on_regtest() {
         let r = t.row(&reorged);
         r["state"] == "confirmed" && r["height"].as_u64() == Some(h) && r["confirmations"] == 2
     });
+    assert_eq!(t.row(&reorged)["blockHash"], new_block, "the row names the new block");
+    let lr = t.engine.status()["lastReorg"].clone();
+    assert_eq!((lr["height"].as_u64(), lr["depth"].as_u64()), (Some(h), Some(1)), "{lr}");
+    assert!(lr["moved"].as_array().unwrap().contains(&json!(reorged)), "{lr}");
+    t.wait("walletStateChanged with the reorg", 10, || t.events.lock().unwrap().iter().any(|(n, v)| n == "walletStateChanged" && v["lastReorg"] == lr));
     println!("reorg at {h}: {} replaced by {}", old_block, new_block);
     // A server that is only behind the reorg is not blamed for it.
     assert_eq!(t.alerts("suspect", "electrum-0") + t.alerts("suspect", "electrum-1"), suspects_before, "a lagging server was blamed");
@@ -303,6 +322,24 @@ fn bitcoin_wallet_on_regtest() {
     t.synced();
     t.wait("the taproot send confirmed", 60, || t.row(&ttxid)["state"] == "confirmed");
     println!("taproot send {ttxid}: fee {} sat, vsize {}", tpreview["feeSat"], tpreview["vsize"]);
+
+    // Change too small to spend goes to the fee when asked; the node takes the transaction. One
+    // coin, so the probe's fee is the send's: 450 sat of change, under the 580 a taproot input costs.
+    let coin = t.sats("confirmed");
+    let probe = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": (coin / 2).to_string()}], "feeRate": 10.0}));
+    let probe_fee: u64 = probe["feeSat"].as_str().unwrap().parse().unwrap();
+    t.job("cancel_send", json!({"previewId": probe["previewId"]}));
+    let amount = coin - probe_fee - 450;
+    let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": amount.to_string()}], "feeRate": 10.0, "smallChangeToFee": true}));
+    assert_eq!(p["outputs"].as_array().unwrap().len(), 1, "{p}");
+    assert_eq!((p["warnings"][0]["kind"].as_str(), p["warnings"][0]["amountSat"].as_str()), (Some("change_to_fee"), Some("450")), "{p}");
+    assert_eq!(p["feeSat"], (probe_fee + 450).to_string());
+    let no_change = t.sign(p["previewId"].as_str().unwrap())["txid"].as_str().unwrap().to_string();
+    assert!(t.in_mempool(&no_change));
+    t.mine(1);
+    t.synced();
+    t.wait("the send without change confirmed", 60, || t.row(&no_change)["state"] == "confirmed");
+    assert_eq!(t.sats("confirmed"), 0);
 
     // Reopen by group: the key and descriptors come from the manager again, the history from disk.
     let group = t.engine.status()["group"].as_str().unwrap().to_string();

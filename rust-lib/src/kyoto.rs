@@ -185,14 +185,16 @@ pub fn required(net: BNetwork, regtest: Option<u8>, peers: usize) -> u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub handshake: Duration,
-    pub response: Duration,
+    /// `None` keeps bip157's default, 5 s.
+    pub response: Option<Duration>,
     pub filter_batch: Duration,
 }
 
 pub fn timeouts(route: Route) -> Timeouts {
     match route {
-        Route::Direct => Timeouts { handshake: Duration::from_secs(5), response: Duration::from_secs(10), filter_batch: Duration::from_secs(30) },
-        Route::Tor | Route::Onion => Timeouts { handshake: Duration::from_secs(30), response: Duration::from_secs(30), filter_batch: Duration::from_secs(240) },
+        Route::Direct => Timeouts { handshake: Duration::from_secs(5), response: None, filter_batch: Duration::from_secs(30) },
+        // The response timeout also covers the version handshake after the SOCKS connect.
+        Route::Tor | Route::Onion => Timeouts { handshake: Duration::from_secs(30), response: Some(Duration::from_secs(15)), filter_batch: Duration::from_secs(240) },
     }
 }
 
@@ -288,8 +290,10 @@ impl Client {
             .add_peers(dial.iter().map(|(_, p)| p.trusted()))
             .required_peers(required)
             .handshake_timeout(t.handshake)
-            .response_timeout(t.response)
             .filter_batch_timeout(t.filter_batch);
+        if let Some(r) = t.response {
+            b = b.response_timeout(r);
+        }
         if matches!(route.route, Route::Tor | Route::Onion) {
             b = b.socks5_proxy(proxy_addr(proxy.ok_or("routed through Tor, and no proxy is set")?)?);
         }
@@ -606,6 +610,8 @@ mod tests {
         assert_eq!(required(BNetwork::Regtest, Some(3), 3), 3);
         assert_eq!(required(BNetwork::Regtest, None, 0), 1);
         assert_eq!(timeouts(Route::Tor).handshake, Duration::from_secs(30));
+        assert_eq!(timeouts(Route::Onion).response, Some(Duration::from_secs(15)), "Tor: 15 s per response");
+        assert_eq!(timeouts(Route::Direct).response, None, "directly: bip157's default");
         assert!(proxy_addr(&Proxy::parse("socks5h://tor.example:9050").unwrap()).is_err());
         assert_eq!(proxy_addr(&Proxy::parse("socks5h://localhost:9050").unwrap()).unwrap().port(), 9050);
     }

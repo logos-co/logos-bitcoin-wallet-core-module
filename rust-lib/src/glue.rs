@@ -18,7 +18,7 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, version, crates }`.
     fn version(&self) -> String;
     /// `{ ok, jobId, receipt }` for open_wallet, close_wallet, build_send, bump_fee, rebroadcast, and
-    /// for the backend sign_and_broadcast, cancel_send and abandon_send (README, Job kinds).
+    /// for the backend sign_and_broadcast, cancel_send, abandon_send and set_birthday (README, Job kinds).
     fn start_job(&self, kind: String, params: String) -> String;
     /// `{ ok, jobId, kind, state: queued|running|done|failed|cancelled, error }`.
     fn job_status(&self, job_id: String, receipt: String) -> String;

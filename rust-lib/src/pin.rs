@@ -1,6 +1,7 @@
-//! Electrum over TLS with a pinned end-entity certificate, for servers with self-signed ones:
-//! the pin takes the place of the CAs and the name check; the handshake signature is still
-//! verified against the pinned certificate's key, so a copy of the certificate proves nothing.
+//! Electrum and Esplora over TLS with a pinned end-entity certificate, for servers with
+//! self-signed ones: the pin takes the place of the CAs and the name check; the handshake
+//! signature is still verified against the pinned certificate's key, so a copy of the
+//! certificate proves nothing.
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -189,11 +190,29 @@ pub fn certificate_sha256(url: &str, proxy: Option<(&Proxy, &Isolation)>, timeou
 }
 
 fn host_port(url: &str) -> Result<(String, u16), String> {
-    let rest = url.strip_prefix("ssl://").ok_or("a pinned certificate is for an ssl:// server")?;
+    let (rest, default_port) = match url.split_once("://") {
+        Some(("ssl", rest)) => (rest, None),
+        Some(("https", rest)) => (rest, Some(443)),
+        _ => return Err("a pinned certificate is for an ssl:// or https:// server".into()),
+    };
     let rest = rest.split(['/', '?']).next().unwrap_or(rest);
-    let (host, port) = rest.rsplit_once(':').ok_or("the server's URL has no port")?;
-    let port = port.parse::<u16>().map_err(|_| "the server's URL has a bad port".to_string())?;
+    let (host, port) = match (rest.rsplit_once(':').filter(|(_, p)| !p.contains(']')), default_port) {
+        (Some((host, port)), _) => (host, port.parse::<u16>().map_err(|_| "the server's URL has a bad port".to_string())?),
+        (None, Some(port)) => (rest, port),
+        (None, None) => return Err("the server's URL has no port".into()),
+    };
     Ok((host.trim_matches(['[', ']']).to_string(), port))
+}
+
+/// A rustls client configuration that accepts only the pinned certificate.
+pub fn client_config(pin: [u8; 32]) -> Result<ClientConfig, String> {
+    let verifier = Arc::new(Pinned::new(pin));
+    Ok(ClientConfig::builder_with_provider(verifier.provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
 }
 
 /// An Electrum client over TLS to `url`, accepting only the pinned certificate; through the
@@ -201,13 +220,7 @@ fn host_port(url: &str) -> Result<(String, u16), String> {
 pub fn connect(url: &str, pin: [u8; 32], proxy: Option<(&Proxy, &Isolation)>, timeout: Duration) -> Result<RawClient<ElectrumSslStream>, String> {
     let (host, port) = host_port(url)?;
     let tcp = tcp(&host, port, proxy, timeout)?;
-    let verifier = Arc::new(Pinned::new(pin));
-    let config = ClientConfig::builder_with_provider(verifier.provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+    let config = client_config(pin)?;
     let name = ServerName::try_from(host.clone()).map_err(|_| format!("{host} is not a server name"))?;
     let session = ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
     let client = RawClient::from(StreamOwned::new(session, tcp));
@@ -242,8 +255,7 @@ mod tests {
         }
     }
 
-    /// A TLS server answering Electrum's server.version and headers.subscribe.
-    fn server(cert: &'static [u8], key: &'static [u8], tls12_only: bool) -> u16 {
+    fn tls_config(cert: &'static [u8], key: &'static [u8], tls12_only: bool) -> Arc<rustls::ServerConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let signing = provider.key_provider.load_private_key(PrivateKeyDer::try_from(key).unwrap()).unwrap();
         let certified = rustls::sign::CertifiedKey::new(vec![CertificateDer::from(cert)], signing);
@@ -253,9 +265,43 @@ mod tests {
             .unwrap()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Fixed(Arc::new(certified))));
+        Arc::new(config)
+    }
+
+    /// An HTTPS server answering two of Esplora's calls: the tip height and the fee estimates.
+    fn https(cert: &'static [u8], key: &'static [u8], tls12_only: bool) -> u16 {
+        let config = tls_config(cert, key, tls12_only);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let config = Arc::new(config);
+        std::thread::spawn(move || {
+            for tcp in listener.incoming().flatten() {
+                let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut tls = StreamOwned::new(conn, tcp);
+                let mut head = String::new();
+                let mut reader = BufReader::new(&mut tls);
+                while reader.read_line(&mut head).map(|n| n > 0).unwrap_or(false) && !head.ends_with("\r\n\r\n") {}
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = match path.as_str() {
+                    "/blocks/tip/height" => "7".to_string(),
+                    "/fee-estimates" => serde_json::json!({"2": 12.5, "6": 5.0, "24": 1.5}).to_string(),
+                    _ => String::new(),
+                };
+                let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
+                let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let tls = reader.into_inner();
+                let _ = tls.write_all(reply.as_bytes()).and_then(|_| tls.flush());
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        port
+    }
+
+    /// A TLS server answering Electrum's server.version and headers.subscribe.
+    fn server(cert: &'static [u8], key: &'static [u8], tls12_only: bool) -> u16 {
+        let config = tls_config(cert, key, tls12_only);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for tcp in listener.incoming().flatten() {
                 let conn = rustls::ServerConnection::new(config.clone()).unwrap();
@@ -321,6 +367,29 @@ mod tests {
         }
         let port = server(V3, V1_KEY, false);
         assert!(certificate_sha256(&format!("ssl://127.0.0.1:{port}"), None, Duration::from_secs(5)).is_err(), "no pin from a server without the key");
+    }
+
+    #[test]
+    fn a_pinned_esplora_server_answers_over_its_own_certificate() {
+        use crate::routes::{Isolation, Kind, Route, Source};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let esplora = |port: u16, pin: [u8; 32]| {
+            let src = Source { id: "esplora-0".into(), url: format!("https://127.0.0.1:{port}"), operator: String::new(), route: Route::Direct, kind: Kind::Esplora, down: None, credentials: false, pin: Some(pin), encrypted: true };
+            crate::net::esplora(&src, None, &Isolation::fresh(), None).unwrap()
+        };
+        for (cert, key, tls12) in [(V3, V3_KEY, false), (V1, V1_KEY, false), (V1, V1_KEY, true)] {
+            let port = https(cert, key, tls12);
+            let c = esplora(port, pin_of(cert));
+            assert_eq!(rt.block_on(c.get_height()).unwrap_or_else(|e| panic!("tls12={tls12}: {e:?}")), 7);
+            assert_eq!(rt.block_on(c.get_fee_estimates()).unwrap().get(&6), Some(&5.0));
+            let e = format!("{:?}", rt.block_on(esplora(port, pin_of(V3_KEY)).get_height()).unwrap_err());
+            assert!(e.contains("not the pinned one"), "another pin is refused: {e}");
+            assert_eq!(certificate_sha256(&format!("https://127.0.0.1:{port}/api"), None, Duration::from_secs(5)).unwrap(), pin_of(cert), "a probe reads it");
+        }
+        // The pinned certificate served with another key: the handshake signature gives it away.
+        let port = https(V3, V1_KEY, false);
+        let e = format!("{:?}", rt.block_on(esplora(port, pin_of(V3)).get_height()).unwrap_err());
+        assert!(e.to_lowercase().contains("signature"), "{e}");
     }
 
     #[test]

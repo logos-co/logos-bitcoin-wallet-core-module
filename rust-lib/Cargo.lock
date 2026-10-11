@@ -393,6 +393,7 @@ dependencies = [
  "logos-signer-interface",
  "parking_lot",
  "rand 0.8.8",
+ "reqwest",
  "rusqlite",
  "rustls",
  "rustls-webpki",

@@ -1,18 +1,21 @@
 //! The local node as the chain authority: `bitcoind_module`'s rpc(method, paramsJson) over Logos
-//! IPC behind bitcoincore_rpc's RpcApi, followed with bdk_bitcoind_rpc's Emitter.
+//! IPC behind bitcoincore_rpc's RpcApi, followed with bdk_bitcoind_rpc's Emitter. A backlog is
+//! scanned with the node's block filters; a pruned block that matches is asked of its peers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bdk_bitcoind_rpc::bitcoincore_rpc::{self, jsonrpc, RpcApi};
 use bdk_bitcoind_rpc::Emitter;
 use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, IndexedTxGraph, TxUpdate};
 use bdk_wallet::KeychainKind;
+use bitcoin::bip158::BlockFilter;
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::{BlockHash, Transaction, Txid};
+use bitcoin::{Block, BlockHash, ScriptBuf, Transaction, Txid};
 use serde_json::{json, Value};
 
 use crate::authority::{Authority, Change, ChainAuthority};
@@ -115,6 +118,29 @@ pub struct NodeStatus {
     pub headers: u32,
     pub initial_sync: bool,
     pub synced: bool,
+    pub pruned: bool,
+    /// The lowest block a pruned node still holds.
+    pub prune_height: Option<u32>,
+    /// Whether the node serves block filters; unknown until a scan asks.
+    pub filters: Option<bool>,
+    /// Blocks the filters matched this session, and those fetched from the node's peers.
+    pub matched: u32,
+    pub from_peers: u32,
+    pub pruned_gap: Option<PrunedGap>,
+}
+
+/// Matched blocks below a pruned node's prune height that neither it nor its peers gave.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrunedGap {
+    /// Where the scan of the missing blocks started; `below` is the prune height.
+    pub from: u32,
+    pub below: u32,
+    /// The heights the filters matched; empty when the node has no filters to say.
+    pub heights: Vec<u32>,
+    /// Who scanned them instead: a history server, `kyoto`, or nobody yet.
+    pub via: Option<String>,
+    pub resolved: bool,
 }
 
 /// Whether the node runs `net` and is synced: past initial sync, its blocks at its headers.
@@ -127,7 +153,9 @@ pub fn status(c: &NodeClient, net: BNetwork) -> Result<NodeStatus, String> {
     let n = |k: &str| i[k].as_u64().unwrap_or(0) as u32;
     let initial_sync = i["initialblockdownload"].as_bool().unwrap_or(true);
     let (blocks, headers) = (n("blocks"), n("headers"));
-    Ok(NodeStatus { blocks, headers, initial_sync, synced: !initial_sync && blocks + 1 >= headers })
+    let pruned = i["pruned"].as_bool().unwrap_or(false);
+    let prune_height = i["pruneheight"].as_u64().filter(|_| pruned).map(|h| h as u32);
+    Ok(NodeStatus { blocks, headers, initial_sync, synced: !initial_sync && blocks + 1 >= headers, pruned, prune_height, ..Default::default() })
 }
 
 fn hash_at(c: &NodeClient, height: u32) -> Result<BlockHash, String> {
@@ -148,6 +176,10 @@ pub struct Found {
     /// The last block scanned for the wallet.
     pub scanned: Option<(u32, BlockHash)>,
     pub at_tip: bool,
+    /// Matched blocks the pruned node no longer holds and its peers didn't send.
+    pub missing: Vec<u32>,
+    /// Blocks below the prune height left unscanned, without filters to say which matter: from, below.
+    pub unscanned: Option<(u32, u32)>,
 }
 
 /// Follows the node: its headers into the authority's chain, its blocks and mempool for the wallet.
@@ -155,16 +187,172 @@ pub struct Follower {
     client: Arc<NodeClient>,
     emitter: Option<Emitter<Arc<NodeClient>>>,
     scanned: Option<(u32, BlockHash)>,
+    /// The blocks scanned lately, to find where a reorg left the scan.
+    recent: VecDeque<(u32, BlockHash)>,
+    pub filters: Option<bool>,
+    pub matched: u32,
+    pub from_peers: u32,
 }
 
 /// Headers fetched per call to `headers`: two calls each over IPC.
 pub const HEADERS_PER_POLL: u32 = 2_000;
 /// Blocks scanned per call to `scan`.
 pub const BLOCKS_PER_POLL: usize = 500;
+/// Filters read per call to `scan`: one call each, and a block's when it matches.
+pub const FILTERS_PER_POLL: u32 = 1_000;
+/// Further behind than this, filters lead and only matching blocks are read.
+const FILTER_BACKLOG: u32 = 6;
+const RECENT_KEPT: usize = 144;
+/// How long a block asked of a peer has to arrive.
+const PEER_WAIT: Duration = Duration::from_secs(20);
+
+/// The scripts a filter is matched against: every one the index derived, the lookahead included.
+fn watched(index: &KeychainTxOutIndex<KeychainKind>) -> Vec<ScriptBuf> {
+    index.inner().all_spks().values().cloned().collect()
+}
+
+/// Peers that serve old blocks: NETWORK, not only NETWORK_LIMITED's last 288.
+fn full_block_peers(peers: &Value) -> Vec<i64> {
+    peers
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| p["servicesnames"].as_array().is_some_and(|s| s.iter().any(|n| n == "NETWORK")))
+                .filter_map(|p| p["id"].as_i64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decode_block(v: &Value, hash: &BlockHash) -> Result<Block, String> {
+    let block: Block = deserialize_hex(v.as_str().unwrap_or_default()).map_err(|e| format!("getblock: {e}"))?;
+    if block.block_hash() != *hash || !block.check_merkle_root() {
+        return Err(format!("block {hash} doesn't match its header"));
+    }
+    Ok(block)
+}
 
 impl Follower {
     pub fn new(client: Arc<NodeClient>, scanned: Option<(u32, BlockHash)>) -> Self {
-        Self { client, emitter: None, scanned }
+        Self { client, emitter: None, scanned, recent: VecDeque::new(), filters: None, matched: 0, from_peers: 0 }
+    }
+
+    fn mark(&mut self, height: u32, hash: BlockHash) {
+        self.scanned = Some((height, hash));
+        if self.recent.len() == RECENT_KEPT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((height, hash));
+    }
+
+    /// After a reorg under the last block scanned: back to the newest scanned block still on the
+    /// authority's chain, or `RECENT_KEPT` blocks down when none is.
+    fn rewind(&mut self, authority: &ChainAuthority) {
+        let Some((h, hash)) = self.scanned else { return };
+        if authority.hash_at(h) == Some(hash) {
+            return;
+        }
+        self.emitter = None;
+        while let Some((rh, rhash)) = self.recent.pop_back() {
+            if authority.hash_at(rh) == Some(rhash) {
+                self.scanned = Some((rh, rhash));
+                self.recent.push_back((rh, rhash));
+                return;
+            }
+        }
+        let back = h.saturating_sub(RECENT_KEPT as u32);
+        self.scanned = authority.hash_at(back).map(|x| (back, x));
+    }
+
+    /// Whether the node has a filter index: `getblockfilter` answers for the block at `height`.
+    /// An index still catching up is asked again next round.
+    fn has_filters(&mut self, authority: &ChainAuthority, height: u32) -> bool {
+        if let Some(f) = self.filters {
+            return f;
+        }
+        let Some(hash) = authority.hash_at(height) else { return false };
+        match self.client.raw("getblockfilter", &[json!(hash.to_string())]) {
+            Ok(v) if v["filter"].is_string() => {
+                self.filters = Some(true);
+                true
+            }
+            Err(Failure::Rpc { code, message }) if code == NOT_ALLOWED || message.contains("not enabled") => {
+                tracing::info!(target: "bitcoin", "node: no block filters ({message}); scanning whole blocks");
+                self.filters = Some(false);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// A block from the node's disk, or from one of its peers when it was pruned; `None` when no
+    /// peer sends it in time.
+    fn block(&mut self, hash: &BlockHash, stop: &AtomicBool) -> Result<Option<Block>, String> {
+        let get = |c: &NodeClient| c.raw("getblock", &[json!(hash.to_string()), json!(0)]);
+        match get(&self.client) {
+            Ok(v) => return decode_block(&v, hash).map(Some),
+            Err(Failure::Rpc { message, .. }) if message.contains("pruned") => {}
+            Err(e) => return Err(format!("getblock {hash}: {e}")),
+        }
+        let peers = self.client.raw("getpeerinfo", &[]).map_err(|e| format!("getpeerinfo: {e}"))?;
+        for id in full_block_peers(&peers) {
+            // The node asks a peer it is already connected to, so its own proxy setting holds.
+            match self.client.raw("getblockfrompeer", &[json!(hash.to_string()), json!(id)]) {
+                Ok(_) => {}
+                Err(Failure::Rpc { message, .. }) if message.contains("already") => {}
+                Err(e) => {
+                    tracing::info!(target: "bitcoin", "node: getblockfrompeer {hash} from peer {id}: {e}");
+                    continue;
+                }
+            }
+            let until = Instant::now() + PEER_WAIT;
+            while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                if let Ok(v) = get(&self.client) {
+                    self.from_peers += 1;
+                    return decode_block(&v, hash).map(Some);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Scans up to `FILTERS_PER_POLL` blocks from `start` with the node's filters, reading only the
+    /// blocks they match.
+    fn scan_filters(&mut self, authority: &ChainAuthority, index: &KeychainTxOutIndex<KeychainKind>, start: u32, end: u32, stop: &AtomicBool) -> Result<Found, String> {
+        let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(index.clone());
+        let mut spks = watched(&graph.index);
+        let mut found = Found::default();
+        for h in start..=end.min(start + FILTERS_PER_POLL - 1) {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let hash = authority.hash_at(h).ok_or_else(|| format!("no header at {h} yet"))?;
+            let f = match self.client.raw("getblockfilter", &[json!(hash.to_string())]) {
+                Ok(f) => f,
+                Err(e) => {
+                    // The index hasn't reached it yet: this round ends here, the next goes on.
+                    tracing::info!(target: "bitcoin", "node: getblockfilter {h}: {e}; waiting for the filter index");
+                    break;
+                }
+            };
+            let content = hex::decode(f["filter"].as_str().unwrap_or_default()).map_err(|e| format!("getblockfilter {h}: {e}"))?;
+            if BlockFilter::new(&content).match_any(&hash, spks.iter().map(|s| s.as_bytes())).map_err(|e| format!("filter {h}: {e}"))? {
+                self.matched += 1;
+                match self.block(&hash, stop)? {
+                    Some(block) => {
+                        let _ = graph.apply_block_relevant(&block, h);
+                        spks = watched(&graph.index);
+                    }
+                    None => found.missing.push(h),
+                }
+            }
+            self.mark(h, hash);
+            found.scanned = self.scanned;
+        }
+        found.last_active = graph.index.last_used_indices();
+        found.tx_update = TxUpdate::from(graph.graph().clone());
+        Ok(found)
     }
 
     pub fn client(&self) -> &Arc<NodeClient> {
@@ -196,21 +384,39 @@ impl Follower {
     }
 
     /// Scans blocks after the last one scanned, from `birthday`, then the mempool once at the tip.
-    pub fn scan(&mut self, authority: &ChainAuthority, index: &KeychainTxOutIndex<KeychainKind>, expected: Vec<Arc<Transaction>>, birthday: u32) -> Result<Found, String> {
-        let start = self.scanned.map_or(birthday, |(h, _)| h + 1).max(1);
+    /// A backlog goes by the node's filters when it has them. Without them, a pruned node's
+    /// missing blocks are skipped and reported as `unscanned`.
+    pub fn scan(&mut self, authority: &ChainAuthority, index: &KeychainTxOutIndex<KeychainKind>, expected: Vec<Arc<Transaction>>, birthday: u32, prune_height: Option<u32>, stop: &AtomicBool) -> Result<Found, String> {
+        self.rewind(authority);
+        let mut start = self.scanned.map_or(birthday, |(h, _)| h + 1).max(1);
+        let tip = authority.chain().tip_height();
+        if tip >= start + FILTER_BACKLOG && self.has_filters(authority, start) {
+            // A backlog, as after the node was away: filters, and a fresh Emitter at the tip.
+            self.emitter = None;
+            return self.scan_filters(authority, index, start, tip, stop);
+        }
+        let mut unscanned = None;
+        if let Some(p) = prune_height.filter(|p| self.emitter.is_none() && start < *p) {
+            let hash = authority.hash_at(p - 1).ok_or_else(|| format!("no header at {} yet", p - 1))?;
+            unscanned = Some((start, p));
+            self.mark(p - 1, hash);
+            start = p;
+        }
         if self.emitter.is_none() {
-            // The emitter finds its footing on the authority's hash below `start`, as the node holds it.
+            // The emitter finds its footing on the authority's hash below `start`, as the node holds
+            // it. Its start height is that block's too: past the node's tip it would fail to start.
             let below = start - 1;
             let hash = authority.hash_at(below).ok_or_else(|| format!("no header at {below} yet"))?;
             let cp = CheckPoint::new(BlockId { height: below, hash });
-            self.emitter = Some(Emitter::new(self.client.clone(), cp, start, expected));
+            self.emitter = Some(Emitter::new(self.client.clone(), cp, below, expected));
         }
         let emitter = self.emitter.as_mut().expect("set above");
         let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(index.clone());
         let mut found = Found::default();
-        let mut blocks = 0;
+        let mut emitted = vec![];
+        let mut ahead = false;
         loop {
-            if blocks == BLOCKS_PER_POLL {
+            if emitted.len() == BLOCKS_PER_POLL {
                 break;
             }
             match emitter.next_block().map_err(|e| format!("node: {e}"))? {
@@ -218,19 +424,26 @@ impl Follower {
                     let (height, hash) = (ev.block_height(), ev.block_hash());
                     if authority.hash_at(height) != Some(hash) {
                         // The node moved past the headers just taken: the next poll takes them.
-                        self.emitter = None;
+                        ahead = true;
                         break;
                     }
                     let _ = graph.apply_block_relevant(&ev.block, height);
-                    self.scanned = Some((height, hash));
-                    found.scanned = self.scanned;
-                    blocks += 1;
+                    emitted.push((height, hash));
                 }
                 None => {
                     found.at_tip = true;
                     break;
                 }
             }
+        }
+        if ahead {
+            self.emitter = None;
+        }
+        if !emitted.is_empty() || unscanned.is_some() {
+            for (height, hash) in emitted {
+                self.mark(height, hash);
+            }
+            found.scanned = self.scanned;
         }
         if found.at_tip {
             if let Some(e) = self.emitter.as_mut() {
@@ -241,6 +454,7 @@ impl Follower {
         }
         found.last_active = graph.index.last_used_indices();
         found.tx_update = TxUpdate::from(graph.graph().clone());
+        found.unscanned = unscanned;
         Ok(found)
     }
 }
@@ -324,6 +538,133 @@ mod tests {
         assert!(!st.synced && st.initial_sync);
         let (_, c) = canned(vec![("getblockchaininfo", json!({"chain": "main", "blocks": 935_000, "headers": 935_001, "initialblockdownload": false}))]);
         assert!(status(&c, BNetwork::Mainnet).unwrap().synced, "one block behind its headers is synced");
+    }
+
+    /// A regtest chain of `n` blocks, one of them paying `to` at height `pay_at`, served as a
+    /// pruned node with filters would: blocks in `pruned` come back only once a peer sent them.
+    struct Pruned {
+        blocks: Vec<Block>,
+        pruned: Mutex<std::collections::HashSet<BlockHash>>,
+        peers_send: bool,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Pruned {
+        fn new(n: u32, pay_at: u32, to: ScriptBuf, prune_below: u32, peers_send: bool) -> Self {
+            use bitcoin::hashes::Hash;
+            let mut blocks = vec![bitcoin::constants::genesis_block(bitcoin::Network::Regtest)];
+            for h in 1..=n {
+                let coinbase = Transaction {
+                    version: bitcoin::transaction::Version::TWO,
+                    lock_time: bitcoin::absolute::LockTime::ZERO,
+                    input: vec![bitcoin::TxIn { script_sig: bitcoin::script::Builder::new().push_int(i64::from(h)).into_script(), ..Default::default() }],
+                    output: vec![bitcoin::TxOut { value: bitcoin::Amount::from_sat(50), script_pubkey: ScriptBuf::new_op_return([h as u8]) }],
+                };
+                let mut txdata = vec![coinbase];
+                if h == pay_at {
+                    txdata.push(Transaction {
+                        version: bitcoin::transaction::Version::TWO,
+                        lock_time: bitcoin::absolute::LockTime::ZERO,
+                        input: vec![bitcoin::TxIn { previous_output: bitcoin::OutPoint { txid: Txid::from_byte_array([7; 32]), vout: 0 }, ..Default::default() }],
+                        output: vec![bitcoin::TxOut { value: bitcoin::Amount::from_sat(40_000), script_pubkey: to.clone() }],
+                    });
+                }
+                let prev = blocks.last().unwrap().header;
+                let mut header = bitcoin::block::Header { version: prev.version, prev_blockhash: prev.block_hash(), merkle_root: bitcoin::TxMerkleNode::all_zeros(), time: prev.time + 600, bits: prev.bits, nonce: 0 };
+                let mut block = Block { header, txdata };
+                header.merkle_root = block.compute_merkle_root().unwrap();
+                while header.validate_pow(header.target()).is_err() {
+                    header.nonce += 1;
+                }
+                block.header = header;
+                blocks.push(block);
+            }
+            let pruned = blocks.iter().take(prune_below as usize).map(|b| b.block_hash()).collect();
+            Self { blocks, pruned: Mutex::new(pruned), peers_send, asked: Mutex::default() }
+        }
+
+        fn by_hash(&self, hash: &str) -> Option<&Block> {
+            self.blocks.iter().find(|b| b.block_hash().to_string() == hash)
+        }
+    }
+
+    impl NodeRpc for Pruned {
+        fn rpc(&self, method: &str, params: &str) -> Result<String, String> {
+            self.asked.lock().unwrap().push(format!("{method} {params}"));
+            let p: Value = serde_json::from_str(params).unwrap();
+            let ok = |v: Value| Ok(json!({"result": v, "error": null}).to_string());
+            let err = |code: i64, m: &str| Ok(json!({"result": null, "error": {"code": code, "message": m}}).to_string());
+            let block = p[0].as_str().and_then(|h| self.by_hash(h));
+            match (method, block) {
+                ("getblockfilter", Some(b)) => {
+                    let f = BlockFilter::new_script_filter(b, |_| Ok::<_, bitcoin::bip158::Error>(ScriptBuf::new_op_return([0u8]))).unwrap();
+                    ok(json!({"filter": hex::encode(f.content), "header": "00".repeat(32)}))
+                }
+                ("getblock", Some(b)) if self.pruned.lock().unwrap().contains(&b.block_hash()) => err(-1, "Block not available (pruned data)"),
+                ("getblock", Some(b)) => ok(json!(serialize_hex(b))),
+                ("getpeerinfo", _) => ok(json!([{"id": 3, "servicesnames": ["NETWORK_LIMITED", "WITNESS"]}, {"id": 7, "servicesnames": ["NETWORK", "WITNESS"]}])),
+                ("getblockfrompeer", Some(b)) if self.peers_send && p[1] == 7 => {
+                    self.pruned.lock().unwrap().remove(&b.block_hash());
+                    ok(json!({}))
+                }
+                ("getblockfrompeer", _) => err(-1, "Peer does not exist"),
+                _ => err(-8, "unexpected"),
+            }
+        }
+    }
+
+    /// The wallet's index and an authority holding `chain`'s headers.
+    fn wallet_and_authority(chain: &Pruned) -> (KeychainTxOutIndex<KeychainKind>, ChainAuthority) {
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let w = bdk_wallet::Wallet::create(format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"))
+            .network(bitcoin::Network::Regtest)
+            .create_wallet_no_persist()
+            .unwrap();
+        let headers = chain.blocks.iter().enumerate().skip(1).map(|(h, b)| (h as u32, b.header)).collect();
+        (w.spk_index().clone(), ChainAuthority::restore(BNetwork::Regtest, headers, vec![], 2_000_000_000))
+    }
+
+    fn wallet_script() -> ScriptBuf {
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let mut w = bdk_wallet::Wallet::create(format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"))
+            .network(bitcoin::Network::Regtest)
+            .create_wallet_no_persist()
+            .unwrap();
+        // An address past the first, within the lookahead.
+        w.reveal_next_address(KeychainKind::External);
+        w.reveal_next_address(KeychainKind::External).script_pubkey()
+    }
+
+    #[test]
+    fn a_filter_scan_reads_only_matching_blocks_and_asks_peers_for_pruned_ones() {
+        let chain = Arc::new(Pruned::new(12, 3, wallet_script(), 6, true));
+        let (index, authority) = wallet_and_authority(&chain);
+        let mut f = Follower::new(Arc::new(NodeClient::new(chain.clone())), None);
+        let found = f.scan(&authority, &index, vec![], 1, Some(6), &AtomicBool::new(false)).unwrap();
+        assert_eq!(found.scanned.map(|s| s.0), Some(12), "the backlog to the tip by filters");
+        assert_eq!((f.filters, f.matched, f.from_peers, found.missing.clone()), (Some(true), 1, 1, vec![]));
+        let paid = chain.blocks[3].txdata[1].compute_txid();
+        assert!(found.tx_update.txs.iter().any(|t| t.compute_txid() == paid));
+        assert!(found.tx_update.anchors.iter().any(|(a, t)| *t == paid && a.block_id.height == 3));
+        let asked = chain.asked.lock().unwrap().clone();
+        let n = |m: &str| asked.iter().filter(|l| l.starts_with(&format!("{m} "))).count();
+        assert_eq!(n("getblock"), 2, "the pruned block, then the copy its peer sent: {asked:?}");
+        assert!(asked.iter().any(|l| l.starts_with("getblockfrompeer") && l.ends_with(",7]")), "the full node, not the NETWORK_LIMITED one");
+        assert!(!asked.iter().any(|l| l.starts_with("getblockfrompeer") && l.ends_with(",3]")));
+    }
+
+    #[test]
+    fn a_pruned_block_no_peer_sends_is_reported_missing() {
+        let chain = Arc::new(Pruned::new(12, 3, wallet_script(), 6, false));
+        let (index, authority) = wallet_and_authority(&chain);
+        let mut f = Follower::new(Arc::new(NodeClient::new(chain.clone())), None);
+        let found = f.scan(&authority, &index, vec![], 1, Some(6), &AtomicBool::new(false)).unwrap();
+        assert_eq!((found.missing.clone(), found.scanned.map(|s| s.0)), (vec![3], Some(12)), "the scan goes on past it");
+        assert!(found.tx_update.txs.is_empty());
+        // After a reorg under the last block scanned, the scan resumes below it.
+        let (_, other) = wallet_and_authority(&Pruned::new(12, 0, wallet_script(), 0, false));
+        f.rewind(&other);
+        assert!(f.scanned.is_none_or(|(h, _)| h < 12), "{:?}", f.scanned);
     }
 
     #[test]

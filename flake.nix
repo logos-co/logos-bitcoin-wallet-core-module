@@ -51,6 +51,30 @@
             --set-default ELECTRS ${pkgs.electrs}/bin/electrs \
             --prefix PATH : ${nixpkgs.lib.makeBinPath [ pkgs.curl pkgs.perl pkgs.python3 ]}
         '';
+      # Blockstream's electrs, the esplora flavour, for the regtest test of the Esplora path.
+      esploraElectrs = system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "esplora-electrs";
+          version = "0.4.1-unstable-2026-10-05";
+          src = pkgs.fetchFromGitHub {
+            owner = "Blockstream";
+            repo = "electrs";
+            rev = "dd09701e84dc88a2c58a1365f798222b66e13772";
+            hash = "sha256-AD+EYQnJdbd9VF8nw7dEYIieyjYdSHO8Y8l5HoQHdOs=";
+          };
+          cargoHash = "sha256-P8slOt07Fu6NNzYLEso3UQtfx7Yj+C4w98lq/Wr8oTk=";
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
+          buildInputs = [ pkgs.zeromq ];
+          # nixpkgs' RocksDB, linked dynamically, as electrs' own flake does.
+          ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
+          ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
+          # A test server: no LTO, so it builds in minutes.
+          CARGO_PROFILE_RELEASE_LTO = "false";
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16";
+          cargoBuildFlags = [ "--bin" "electrs" ];
+          doCheck = false;
+        };
     in
     {
       packages = forAllSystems (system:
@@ -61,6 +85,6 @@
           rustEnv = { BIP157_PATCHES_CHECKED = "${bip157Check (buildSystem system)}"; };
         }).packages.${system}
         // { bip157-check = bip157Check (buildSystem system); }
-        // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; });
+        // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; esplora-electrs = esploraElectrs system; });
     };
 }

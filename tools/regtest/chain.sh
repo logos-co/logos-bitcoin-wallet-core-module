@@ -8,20 +8,30 @@
 #   chain.sh fund <address> <btc> [blocks]   pay an address from the miner, then mine
 #   chain.sh reorg [depth]       replace the tip: the fork node builds depth+1 blocks offline, then
 #                                reconnects, so the main node reorgs as it would on a live network
-#   chain.sh rpc <method> [json-params] | electrum | peers | stop
+#   chain.sh pruned              start a pruned node (-prune=550 -fastprune, a filter index) that
+#                                dials the main node only; it waits until the node has caught up
+#   chain.sh prune <height>      prune that node's blocks below <height>; prints its pruneheight
+#   chain.sh esplora             start Blockstream's electrs (the esplora flavour, $ESPLORA) on the
+#                                main node, its REST API on 127.0.0.1:$ESPLORA_PORT
+#   chain.sh rpc <method> [json-params] | pruned-rpc <method> [json-params] | electrum | peers | stop
 # Env: BITCOIND, ELECTRS (binaries; default: on PATH), CHAIN_DIR (state, default ./chain),
-# RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, PEER_RPC_PORT, PEER_P2P_PORT, ELECTRUM_PORTS
-# (two, comma-separated). Ports avoid the regtest defaults, so another regtest node is left alone.
+# RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, PEER_RPC_PORT, PEER_P2P_PORT, PRUNED_RPC_PORT,
+# PRUNED_P2P_PORT, ELECTRUM_PORTS (two, comma-separated), ESPLORA (binary), ESPLORA_PORT (3002;
+# it also takes the next two). Ports avoid the regtest defaults, so another regtest node is left
+# alone.
 set -u
 C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
 BITCOIND="${BITCOIND:-bitcoind}"; ELECTRS="${ELECTRS:-electrs}"
 RPC_PORT="${RPC_PORT:-18543}"; P2P_PORT="${P2P_PORT:-18544}"
 FORK_RPC_PORT="${FORK_RPC_PORT:-18553}"; FORK_P2P_PORT="${FORK_P2P_PORT:-18554}"
 PEER_RPC_PORT="${PEER_RPC_PORT:-18563}"; PEER_P2P_PORT="${PEER_P2P_PORT:-18564}"
+PRUNED_RPC_PORT="${PRUNED_RPC_PORT:-18573}"; PRUNED_P2P_PORT="${PRUNED_P2P_PORT:-18574}"
+ESPLORA="${ESPLORA:-esplora-electrs}"; ESPLORA_PORT="${ESPLORA_PORT:-3002}"
 IFS=, read -r -a EPORTS <<< "${ELECTRUM_PORTS:-60601,60611}"
 DATA="$C/bitcoind"; COOKIE="$DATA/regtest/.cookie"
 FDATA="$C/bitcoind-fork"; FCOOKIE="$FDATA/regtest/.cookie"
 PDATA="$C/bitcoind-peer"; PCOOKIE="$PDATA/regtest/.cookie"
+RDATA="$C/bitcoind-pruned"; RCOOKIE="$RDATA/regtest/.cookie"
 FILTERS=(-blockfilterindex=1 -peerblockfilters=1)
 json_str() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"; }
 json_num() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"; }
@@ -48,7 +58,14 @@ prpc() {
   curl -s --max-time 120 --user "$(cat "$PCOOKIE" 2>/dev/null)" -H 'content-type: application/json' \
     --data-binary "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" "http://127.0.0.1:$PEER_RPC_PORT/"
 }
+# The pruned node's RPC.
+rrpc() {
+  [ -s "$RCOOKIE" ] || return 0
+  curl -s --max-time 120 --user "$(cat "$RCOOKIE" 2>/dev/null)" -H 'content-type: application/json' \
+    --data-binary "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" "http://127.0.0.1:$PRUNED_RPC_PORT/"
+}
 height() { rpc getblockcount | json_num result; }
+index_height() { "$1" getindexinfo | sed -n 's/.*"best_block_height"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p'; }
 best() { rpc getbestblockhash | json_str result; }
 fork_best() { frpc getbestblockhash | json_str result; }
 miner_addr() {
@@ -127,7 +144,7 @@ prepare)
   # Kyoto's peers serve filters only once their indexes reach the tip.
   for r in rpc frpc prpc; do
     for _ in $(seq 1 300); do
-      [ "$($r getindexinfo | sed -n 's/.*"best_block_height"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')" = "$(height)" ] && break
+      [ "$(index_height $r)" = "$(height)" ] && break
       sleep 0.2
     done
   done
@@ -151,9 +168,48 @@ reorg)
   for _ in $(seq 1 300); do [ "$(best)" = "$want" ] && break; sleep 0.1; done
   [ "$(best)" = "$want" ] || { echo "the main node did not take the fork"; exit 1; }
   echo "replaced $old with $want at height $(height)";;
+pruned)
+  stop_pid pruned
+  mkdir -p "$RDATA"
+  "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$RDATA" -server=1 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
+    -rpcport="$PRUNED_RPC_PORT" -port="$PRUNED_P2P_PORT" -bind="127.0.0.1:$PRUNED_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
+    -listen=1 -prune=550 -fastprune -blockfilterindex=1 -disablewallet -whitelist=download,noban@127.0.0.1 \
+    -dnsseed=0 -fixedseeds=0 -printtoconsole=0 < /dev/null >> "$C/pruned.out" 2>&1 &
+  echo $! > "$C/pruned.pid"
+  until [ -n "$(rrpc getblockcount | json_num result)" ]; do
+    kill -0 "$(cat "$C/pruned.pid")" 2>/dev/null || { echo "the pruned node exited; see $RDATA/regtest/debug.log"; exit 1; }
+    sleep 0.5
+  done
+  for _ in $(seq 1 600); do
+    [ "$(rrpc getblockcount | json_num result)" = "$(height)" ] && [ "$(index_height rrpc)" = "$(height)" ] && break
+    sleep 0.1
+  done
+  [ "$(index_height rrpc)" = "$(height)" ] || { echo "the pruned node did not catch up"; exit 1; }
+  echo "pruned node at $(rrpc getblockcount | json_num result)";;
+prune)
+  for _ in $(seq 1 600); do [ "$(index_height rrpc)" = "$(height)" ] && break; sleep 0.1; done
+  rrpc pruneblockchain "[$2]" > /dev/null
+  rrpc getblockchaininfo | json_num pruneheight;;
+pruned-rpc) rrpc "$2" "${3:-[]}";;
+esplora)
+  stop_pid esplora
+  mkdir -p "$C/esplora"
+  # Blocks over JSON-RPC: it would otherwise read Core's block files, which Core now obfuscates.
+  "${DETACH[@]}" "$ESPLORA" -v --network regtest --daemon-dir "$DATA" --daemon-rpc-addr "127.0.0.1:$RPC_PORT" \
+    --cookie "$(cat "$COOKIE")" --jsonrpc-import --db-dir "$C/esplora" --http-addr "127.0.0.1:$ESPLORA_PORT" \
+    --electrum-rpc-addr "127.0.0.1:$(( ESPLORA_PORT + 1 ))" --monitoring-addr "127.0.0.1:$(( ESPLORA_PORT + 2 ))" \
+    < /dev/null >> "$C/esplora.log" 2>&1 &
+  echo $! > "$C/esplora.pid"
+  for _ in $(seq 1 600); do
+    [ "$(curl -s --max-time 2 "http://127.0.0.1:$ESPLORA_PORT/blocks/tip/height")" = "$(height)" ] && break
+    kill -0 "$(cat "$C/esplora.pid")" 2>/dev/null || { echo "esplora exited; see $C/esplora.log"; exit 1; }
+    sleep 0.2
+  done
+  [ "$(curl -s --max-time 2 "http://127.0.0.1:$ESPLORA_PORT/blocks/tip/height")" = "$(height)" ] || { echo "esplora did not catch up"; exit 1; }
+  echo "esplora: http://127.0.0.1:$ESPLORA_PORT";;
 rpc) rpc "$2" "${3:-[]}" "${4:-}";;
 electrum) echo "electrum: tcp://127.0.0.1:${EPORTS[0]},tcp://127.0.0.1:${EPORTS[1]}";;
 peers) echo "127.0.0.1:$P2P_PORT,127.0.0.1:$FORK_P2P_PORT,127.0.0.1:$PEER_P2P_PORT";;
-stop) stop_pid electrs0; stop_pid electrs1; stop_pid peer; stop_pid fork; stop_pid bitcoind;;
+stop) stop_pid esplora; stop_pid electrs0; stop_pid electrs1; stop_pid pruned; stop_pid peer; stop_pid fork; stop_pid bitcoind;;
 *) sed -n '2,15p' "$0"; exit 2;;
 esac

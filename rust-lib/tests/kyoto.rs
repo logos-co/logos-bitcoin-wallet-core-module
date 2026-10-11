@@ -106,6 +106,7 @@ fn kyoto_is_the_authority_on_regtest() {
     t.wait("the payment confirmed", 60, || t.row(&reorged)["state"] == "confirmed");
     let h = t.tip();
     let old_block = t.rpc("getblockhash", json!([h]));
+    assert_eq!(t.row(&reorged)["blockHash"], old_block);
     chain(&["reorg", "1"]);
     let new_block = t.rpc("getblockhash", json!([h]));
     assert_ne!(old_block, new_block);
@@ -114,7 +115,23 @@ fn kyoto_is_the_authority_on_regtest() {
         let r = t.row(&reorged);
         r["state"] == "confirmed" && r["height"].as_u64() == Some(h) && r["confirmations"] == 2
     });
+    assert_eq!(t.row(&reorged)["blockHash"], new_block, "the row names the new block");
+    let lr = t.engine.status()["lastReorg"].clone();
+    assert_eq!((lr["height"].as_u64(), lr["depth"].as_u64()), (Some(h), Some(1)), "{lr}");
+    assert!(lr["moved"].as_array().unwrap().contains(&json!(reorged)), "{lr}");
+    t.wait("walletStateChanged with the reorg", 10, || t.events.lock().unwrap().iter().any(|(n, v)| n == "walletStateChanged" && v["lastReorg"] == lr));
     println!("KYOTO reorg at {h}: {old_block} replaced by {new_block}");
+
+    // A birthday: Kyoto starts again from it and scans its filters; every payment is still there.
+    let first_height = t.row(&funded)["height"].as_u64().unwrap();
+    assert!(t.job_err("set_birthday", json!({"height": first_height + 1})).contains("before a birthday"));
+    let set = t.job("set_birthday", json!({"height": first_height}));
+    t.wait("Kyoto's rescan", 90, || t.engine.status()["rescanFrom"].is_null());
+    t.synced();
+    assert!(t.events.lock().unwrap().iter().any(|(n, v)| n == "walletStateChanged" && v["rescanFrom"] == set["rescanFrom"]));
+    for id in [&funded, &txid, &reorged] {
+        assert_eq!(t.row(id)["state"], "confirmed", "{id} after the rescan");
+    }
 
     // Addresses revealed past what the client watches: it is rebuilt, and finds a payment there.
     let rebuilds = kyoto(&t)["rebuilds"].as_u64().unwrap();
