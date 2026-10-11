@@ -442,6 +442,8 @@ impl Cell {
         };
         let row = |tx: &Transaction, txid: Txid, state: &str, block: Option<BlockId>, time: u64| -> Value {
             let height = block.map(|b| b.height);
+            // The wallet's own sends carry their record: its state, and how the broadcast went.
+            let record = sends.iter().find(|s| s.txid == txid);
             let c = intent::classify(&self.shape(tx, bumps.contains(&txid)));
             let fee = self.wallet.calculate_fee(tx).ok().map(|f| f.to_sat().to_string());
             json!({
@@ -450,8 +452,10 @@ impl Cell {
                 "counterparties": c.counterparties, "height": height, "blockHash": block.map(|b| b.hash.to_string()),
                 "confirmations": height.map(|h| tip.saturating_sub(h) + 1).unwrap_or(0),
                 "time": time, "state": state,
-                "replaces": sends.iter().find(|s| s.txid == txid).and_then(|s| s.replaces).map(|t| t.to_string()),
-                "sendState": sends.iter().find(|s| s.txid == txid).map(|s| s.state.clone()),
+                "replaces": record.and_then(|s| s.replaces).map(|t| t.to_string()),
+                "sendState": record.map(|s| s.state.clone()),
+                "broadcast": record.and_then(|s| s.broadcast.clone()),
+                "via": record.and_then(|s| s.via.clone()),
                 "replacedBy": replaced.get(&txid).map(|t| t.to_string()),
                 "reportedBy": reporters.get(&txid),
             })
@@ -668,6 +672,52 @@ mod tests {
         assert_eq!(r["confirmedVia"], spend.compute_txid().to_string());
         let b = cell.balance(&held, 1.0);
         assert_eq!((b["unchecked"].as_str(), b["waiting"].as_str()), (Some("100000"), Some("0")), "{b}");
+    }
+
+    /// A send whose broadcast nobody confirmed reads `unknown` in history, as its record says.
+    #[test]
+    fn a_send_row_carries_how_its_broadcast_went() {
+        use bdk_wallet::chain::{CheckPoint, TxUpdate};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, TxIn, TxOut};
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[5; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (mut w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let to_us = w.reveal_next_address(KeychainKind::External).script_pubkey();
+        let funding = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([9; 32]), vout: 0 }, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(100_000), script_pubkey: to_us }],
+        };
+        let coin = OutPoint { txid: funding.compute_txid(), vout: 0 };
+        let spend = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: coin, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(99_000), script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])) }],
+        };
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let b1 = BlockId { height: 1, hash: BlockHash::from_byte_array([1; 32]) };
+        let mut u = TxUpdate::default();
+        u.txs.push(std::sync::Arc::new(funding.clone()));
+        u.txs.push(std::sync::Arc::new(spend.clone()));
+        u.anchors.insert((ConfirmationBlockTime { block_id: b1, confirmation_time: 1 }, funding.compute_txid()));
+        u.seen_ats.insert((spend.compute_txid(), 2));
+        let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
+        w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let record = SendRecord { txid: spend.compute_txid(), tx: spend.clone(), inputs: vec![coin], state: "sent".into(), created: 2, replaces: None, via: Some("kyoto".into()), broadcast: Some("unknown".into()) };
+        cell.store_send(&record).unwrap();
+        let h = cell.history(0, 50, &[]).unwrap();
+        let row = |t: &Transaction| h["rows"].as_array().unwrap().iter().find(|r| r["txid"] == t.compute_txid().to_string()).cloned().unwrap();
+        let s = row(&spend);
+        assert_eq!((s["sendState"].as_str(), s["broadcast"].as_str(), s["via"].as_str()), (Some("sent"), Some("unknown"), Some("kyoto")), "{s}");
+        let r = row(&funding);
+        assert!(r["broadcast"].is_null() && r["via"].is_null() && r["sendState"].is_null(), "a receive has no record: {r}");
     }
 
     #[test]
