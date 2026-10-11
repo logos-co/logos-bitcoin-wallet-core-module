@@ -1,0 +1,15 @@
+# Cargo
+debug/
+target/
+Cargo.lock
+.DS_Store
+.vscode/
+
+# database
+data/
+light_client_data/
+.bdk_*
+
+# files
+*.log
+*.txt

@@ -262,29 +262,28 @@ impl bitcoin_wallet_core::sync::RouteSource for KyotoOnly {
     }
 }
 
-/// Kyoto on live signet through Tor, from the peer-list crawler's onion peers: a wallet with a
-/// recent birthday syncs headers from the checkpoint, then scans filters from the birthday.
-/// LIVE_PEERS (comma-separated host:port), LIVE_PROXY (socks5h://, an IsolateDestAddr port),
-/// LIVE_BIRTHDAY (a height).
+/// The test phrase restored on a live network through Tor, compared with an explorer's list
+/// (LIVE_EXPLORER). LIVE_NETWORK, LIVE_PEERS, LIVE_PROXY, LIVE_BIRTHDAY, LIVE_OUT: README, "Regtest".
 #[test]
 #[ignore]
-fn kyoto_on_live_signet() {
+fn kyoto_on_a_live_network() {
     let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
     let (Ok(peers), Ok(proxy)) = (std::env::var("LIVE_PEERS"), std::env::var("LIVE_PROXY")) else {
         eprintln!("skipped: LIVE_PEERS and LIVE_PROXY are not set");
         return;
     };
+    let network = std::env::var("LIVE_NETWORK").unwrap_or_else(|_| "signet".into());
     let birthday: u32 = std::env::var("LIVE_BIRTHDAY").ok().and_then(|b| b.parse().ok()).unwrap_or(325_000);
     let peers: Vec<&str> = peers.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     let kyoto = json!({"id": "kyoto", "kind": "kyoto", "url": "p2p://peer-list", "operator": "peers", "route": "onion"});
-    let table = json!({"ok": true, "network": "signet", "proxy": proxy, "chain": [kyoto], "history": [kyoto], "broadcast": [kyoto],
+    let table = json!({"ok": true, "network": network, "proxy": proxy, "chain": [kyoto], "history": [kyoto], "broadcast": [kyoto],
         "pending": [], "fees": [], "check": [], "peers": peers, "crossCheck": false}).to_string();
     let (sink, _events) = collecting();
     let manager = Arc::new(MockManager::new(Duration::from_millis(100)));
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::new(root.path().join("wallets"), sink, manager, Some(Arc::new(KyotoOnly(table))));
     let started = Instant::now();
-    let r = engine.start_job("open_wallet", &json!({"network": "signet", "family": "bitcoin", "birthday": birthday}).to_string());
+    let r = engine.start_job("open_wallet", &json!({"network": network, "family": "bitcoin", "birthday": birthday}).to_string());
     let (id, receipt) = (r["jobId"].as_str().unwrap().to_string(), r["receipt"].as_str().unwrap().to_string());
     while engine.jobs().status(&id, &receipt)["state"] != "done" {
         assert!(started.elapsed() < Duration::from_secs(60), "{}", engine.jobs().status(&id, &receipt));
@@ -293,19 +292,66 @@ fn kyoto_on_live_signet() {
     let mut last = String::new();
     loop {
         let st = engine.status();
-        let line = format!("{} kyoto {} headers {} progress {:.2} connected {} restarts {} authority {}",
-            st["state"], st["kyoto"]["phase"], st["kyoto"]["headers"], st["kyoto"]["progress"].as_f64().unwrap_or(0.0),
-            st["kyoto"]["connected"], st["kyoto"]["restarts"], st["authority"]["height"]);
+        let k = &st["kyoto"];
+        let line = format!("{} kyoto {} headers {} progress {:.2} connected {} restarts {} rescans {} window {} conflict {} authority {} base {} rescanFrom {}",
+            st["state"], k["phase"], k["headers"], k["progress"].as_f64().unwrap_or(0.0), k["connected"], k["restarts"], k["rescans"], k["window"],
+            k["lastConflict"]["at"], st["authority"]["height"], st["authority"]["base"], st["rescanFrom"]);
         if line != last {
             println!("LIVE {:>5} s: {line}", started.elapsed().as_secs());
             last = line;
         }
-        if st["synced"] == true {
+        if st["synced"] == true && st["rescanFrom"].is_null() {
             println!("LIVE synced to {} in {} s", st["authority"]["height"], started.elapsed().as_secs());
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(3 * 3600), "no sync in 3 hours: {st}");
+        assert!(started.elapsed() < Duration::from_secs(6 * 3600), "no sync in 6 hours: {st}");
         std::thread::sleep(Duration::from_secs(2));
+    }
+    if let Ok(path) = std::env::var("LIVE_EXPLORER") {
+        let ex: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut rows: HashMap<String, Value> = HashMap::new();
+        for page in 0.. {
+            let h = engine.history(page);
+            let got = h["rows"].as_array().unwrap().clone();
+            rows.extend(got.iter().map(|r| (r["txid"].as_str().unwrap().to_string(), r.clone())));
+            if got.is_empty() || rows.len() as u64 >= h["total"].as_u64().unwrap() {
+                break;
+            }
+        }
+        let tip = engine.status()["authority"]["height"].as_u64().unwrap();
+        let upto = ex["tipBefore"].as_u64().unwrap().min(tip);
+        let mut diffs = vec![];
+        let listed: Vec<&Value> = ex["txs"].as_array().unwrap().iter().filter(|e| e["confirmed"] == true && e["height"].as_u64().unwrap() <= upto).collect();
+        for e in &listed {
+            let (txid, height) = (e["txid"].as_str().unwrap(), e["height"].as_u64().unwrap());
+            match rows.get(txid) {
+                Some(r) if r["state"] == "confirmed" && r["height"].as_u64() == Some(height) => {}
+                Some(r) => diffs.push(json!({"txid": txid, "explorer": height, "wallet": [r["state"], r["height"]]})),
+                None => diffs.push(json!({"txid": txid, "explorer": height, "wallet": null})),
+            }
+        }
+        // Rows the explorer lacks: a gap-limit explorer misses payments past 20 unused addresses that
+        // a wider scan's window happens to hold. Listed for a look, not failed.
+        let known: std::collections::HashSet<&str> = listed.iter().map(|e| e["txid"].as_str().unwrap()).collect();
+        let extra: Vec<Value> = rows.iter().filter(|(t, r)| r["height"].as_u64().is_some_and(|h| h <= upto) && !known.contains(t.as_str()))
+            .map(|(t, r)| json!({"txid": t, "wallet": [r["state"], r["height"]], "amountSat": r["amountSat"], "intent": r["intent"]})).collect();
+        let after = rows.values().filter(|r| r["height"].as_u64().is_none_or(|h| h > upto)).count();
+        let balance = engine.balance();
+        let summary = json!({"network": network, "birthday": birthday, "seconds": started.elapsed().as_secs(), "tip": tip, "explorerTip": upto,
+            "explorerTxs": listed.len(), "walletRows": rows.len(), "rowsAfterExplorerTip": after, "differences": diffs, "extra": extra,
+            "walletConfirmed": balance["confirmed"], "explorerConfirmed": ex["balance"]["confirmed"], "status": engine.status()});
+        if let Ok(out) = std::env::var("LIVE_OUT") {
+            std::fs::write(out, serde_json::to_string_pretty(&summary).unwrap()).unwrap();
+        }
+        println!("LIVE compare: {} explorer transactions up to {upto}, {} wallet rows ({after} after), {} difference(s), {} the explorer lacks; confirmed {} vs the explorer's {}",
+            listed.len(), rows.len(), diffs.len(), extra.len(), balance["confirmed"], ex["balance"]["confirmed"]);
+        for d in diffs.iter().take(30) {
+            println!("LIVE diff: {d}");
+        }
+        for e in extra.iter().take(30) {
+            println!("LIVE extra: {e}");
+        }
+        assert!(diffs.is_empty(), "{} difference(s) from the explorer", diffs.len());
     }
     engine.shutdown();
 }

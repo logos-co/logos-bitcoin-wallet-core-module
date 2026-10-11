@@ -91,6 +91,12 @@ impl Cell {
         Ok(out)
     }
 
+    /// Drops every stored header: the chain starts again from another checkpoint.
+    pub fn clear_headers(&mut self) -> Result<(), String> {
+        sql(self.conn.execute("DELETE FROM core_headers", []))?;
+        Ok(())
+    }
+
     /// Rewrites stored headers from `from` up to the chain's tip.
     pub fn store_headers(&mut self, chain: &HeaderChain, from: u32) -> Result<(), String> {
         let tx = sql(self.conn.transaction())?;
@@ -301,15 +307,23 @@ impl Cell {
         tx.output.iter().filter(|o| self.wallet.is_mine(o.script_pubkey.clone())).map(|o| o.value.to_sat()).sum()
     }
 
-    /// Confirmed, waiting, pending, sent and too small, in satoshis as decimal strings.
+    /// The height of the checkpoint the wallet's chain starts from.
+    pub fn chain_base(&self) -> u32 {
+        crate::storage::meta_get(&self.conn, crate::sync::CHAIN_BASE).ok().flatten().and_then(|s| s.parse().ok()).unwrap_or_else(|| self.network.checkpoint().height)
+    }
+
+    /// Confirmed, waiting, unchecked, pending, sent and too small, in satoshis as decimal strings.
     pub fn balance(&self, held: &[Held], rate: f64) -> Value {
         let b = self.wallet.balance();
-        let held_ids: BTreeSet<Txid> = held.iter().map(|h| h.txid).collect();
-        let waiting: u64 = held_ids.iter().filter_map(|t| self.wallet.tx_graph().get_tx(*t)).map(|tx| self.ours_in(&tx)).sum();
+        let base = self.chain_base();
+        let ours = |ids: BTreeSet<Txid>| -> u64 { ids.iter().filter_map(|t| self.wallet.tx_graph().get_tx(*t)).map(|tx| self.ours_in(&tx)).sum() };
+        let waiting = ours(held.iter().filter(|h| h.anchor.block_id.height >= base).map(|h| h.txid).collect());
+        let unchecked = ours(held.iter().filter(|h| h.anchor.block_id.height < base).map(|h| h.txid).collect());
         let (count, sat) = self.too_small(rate);
         json!({
             "confirmed": b.confirmed.to_sat().to_string(),
             "waiting": waiting.to_string(),
+            "unchecked": unchecked.to_string(),
             "pending": b.untrusted_pending.to_sat().to_string(),
             "sent": b.trusted_pending.to_sat().to_string(),
             "immature": b.immature.to_sat().to_string(),
@@ -415,6 +429,10 @@ impl Cell {
         let ours: BTreeSet<Txid> = sends.iter().map(|s| s.txid).collect();
         let mut rows: Vec<(u8, u32, u64, Value)> = vec![];
         let mut seen = BTreeSet::new();
+        let base = self.chain_base();
+        let held_of: BTreeMap<Txid, &Held> = held.iter().map(|h| (h.txid, h)).collect();
+        // Held above the chain's tip: waiting; below its start, where nothing links: unchecked.
+        let held_state = |h: &Held| if h.anchor.block_id.height < base { "unchecked" } else { "waiting" };
         let row = |tx: &Transaction, txid: Txid, state: &str, block: Option<BlockId>, time: u64| -> Value {
             let height = block.map(|b| b.height);
             let c = intent::classify(&self.shape(tx, bumps.contains(&txid)));
@@ -436,8 +454,22 @@ impl Cell {
             seen.insert(txid);
             let tx = wtx.tx_node.tx.clone();
             match wtx.chain_position {
-                ChainPosition::Confirmed { anchor, .. } => {
+                ChainPosition::Confirmed { anchor, transitively: None } => {
                     rows.push((2, anchor.block_id.height, anchor.confirmation_time, row(&tx, txid, "confirmed", Some(anchor.block_id), anchor.confirmation_time)));
+                }
+                // Confirmed only because a descendant is: the anchor is the descendant's, not its own.
+                ChainPosition::Confirmed { anchor, transitively: Some(via) } => {
+                    let mut r = match held_of.get(&txid) {
+                        Some(h) => row(&tx, txid, held_state(h), Some(h.anchor.block_id), h.anchor.confirmation_time),
+                        None => {
+                            let mut r = row(&tx, txid, "confirmed", None, anchor.confirmation_time);
+                            r["confirmations"] = json!(tip.saturating_sub(anchor.block_id.height) + 1);
+                            r
+                        }
+                    };
+                    r["confirmedVia"] = json!(via.to_string());
+                    let at = held_of.get(&txid).map_or(anchor.block_id.height, |h| h.anchor.block_id.height);
+                    rows.push((2, at, anchor.confirmation_time, r));
                 }
                 ChainPosition::Unconfirmed { last_seen, first_seen } => {
                     let state = if ours.contains(&txid) { "sent" } else { "pending" };
@@ -449,7 +481,7 @@ impl Cell {
         for h in held {
             if seen.insert(h.txid) {
                 if let Some(tx) = self.wallet.tx_graph().get_tx(h.txid) {
-                    rows.push((1, h.anchor.block_id.height, h.anchor.confirmation_time, row(&tx, h.txid, "waiting", Some(h.anchor.block_id), h.anchor.confirmation_time)));
+                    rows.push((1, h.anchor.block_id.height, h.anchor.confirmation_time, row(&tx, h.txid, held_state(h), Some(h.anchor.block_id), h.anchor.confirmation_time)));
                 }
             }
         }
@@ -577,6 +609,57 @@ mod tests {
         let o = row(&original).expect("the original's row");
         assert_eq!((o["state"].as_str(), o["replacedBy"].is_null()), (Some("confirmed"), true), "{o}");
         assert!(row(&bump).is_none(), "the conflicted bump has no row");
+    }
+
+    /// A coin whose own block can't be checked, spent in one that can: BDK calls it confirmed
+    /// through its spender, whose height is not its own.
+    #[test]
+    fn a_transaction_confirmed_through_its_spender_shows_its_own_height_or_none() {
+        use bdk_wallet::chain::{CheckPoint, TxUpdate};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, TxIn, TxOut};
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[4; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (mut w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let to_us = w.reveal_next_address(KeychainKind::External).script_pubkey();
+        let funding = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([9; 32]), vout: 0 }, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(100_000), script_pubkey: to_us }],
+        };
+        let spend = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint { txid: funding.compute_txid(), vout: 0 }, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(99_000), script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])) }],
+        };
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let (b2, b6) = (BlockId { height: 2, hash: BlockHash::from_byte_array([2; 32]) }, BlockId { height: 6, hash: BlockHash::from_byte_array([6; 32]) });
+        let mut u = TxUpdate::default();
+        u.txs.push(std::sync::Arc::new(funding.clone()));
+        u.txs.push(std::sync::Arc::new(spend.clone()));
+        // Only the spend's anchor is checked; the funding's, below the chain's start at 5, is held.
+        u.anchors.insert((ConfirmationBlockTime { block_id: b6, confirmation_time: 6 }, spend.compute_txid()));
+        let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b6]).unwrap();
+        w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
+        crate::storage::meta_set(&conn, crate::sync::CHAIN_BASE, "5").unwrap();
+        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let held = [Held { txid: funding.compute_txid(), anchor: ConfirmationBlockTime { block_id: b2, confirmation_time: 2 }, source: "esplora-0".into() }];
+        let row = |held: &[Held]| {
+            let h = cell.history(0, 50, held).unwrap();
+            h["rows"].as_array().unwrap().iter().find(|r| r["txid"] == funding.compute_txid().to_string()).cloned().unwrap()
+        };
+        let r = row(&held);
+        assert_eq!((r["state"].as_str(), r["height"].as_u64(), r["confirmedVia"].as_str()), (Some("unchecked"), Some(2), Some(spend.compute_txid().to_string().as_str())), "{r}");
+        let r = row(&[]);
+        assert_eq!((r["state"].as_str(), r["height"].as_u64(), r["blockHash"].as_str()), (Some("confirmed"), None, None), "never the spender's height: {r}");
+        assert_eq!(r["confirmedVia"], spend.compute_txid().to_string());
+        let b = cell.balance(&held, 1.0);
+        assert_eq!((b["unchecked"].as_str(), b["waiting"].as_str()), (Some("100000"), Some("0")), "{b}");
     }
 
     #[test]

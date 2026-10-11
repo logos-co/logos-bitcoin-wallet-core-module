@@ -76,9 +76,15 @@ required-features = ["test-hooks"]
 name = "esplora"
 required-features = ["test-hooks"]
 
+[[test]]
+name = "restore"
+required-features = ["test-hooks"]
+
 # bip157 0.7.0 as published plus patches/bip157, held to an allowlist (tools/kyoto, README).
 [patch.crates-io]
 bip157 = { path = "vendor/bip157" }
+# bdk_kyoto 0.18.0 plus patches/bdk_kyoto, held to tools/kyoto/patch-bdk_kyoto.sh's allowlist.
+bdk_kyoto = { path = "vendor/bdk_kyoto" }
 
 [profile.release]
 panic = "unwind"

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use bitcoin::{Psbt, Txid};
 use bitcoin_wallet_core::engine::{Engine, Event, Sink};
 use bitcoin_wallet_core::manager::SignerManager;
+use bitcoin_wallet_core::node::NodeRpc;
 use logos_signer_interface::mock::{MockOptions, MockSigner};
 use logos_signer_interface::{Payload, RequestKind, SignRequest, Signer};
 use serde_json::{json, Value};
@@ -193,6 +194,54 @@ impl SignerManager for MockManager {
     fn close_account(&self, p: &str) -> Result<String, String> {
         self.log.lock().unwrap().push(format!("close {p}"));
         Ok(json!({"ok": true, "closed": true}).to_string())
+    }
+}
+
+// ── A node, as bitcoind_module serves it ─────────────────────────────────
+
+/// bitcoind_module's rpc() methods, as in its src/rpc_allowlist.h.
+const ALLOWED: &[&str] = &[
+    "getblockchaininfo", "getblockcount", "getblockhash", "getblockheader", "getblock", "getblockfilter", "getblockfrompeer",
+    "getrawmempool", "getmempoolentry", "getrawtransaction", "sendrawtransaction", "estimatesmartfee", "getnetworkinfo", "getpeerinfo",
+];
+
+/// A node as the core sees it through bitcoind_module: Core's JSON-RPC behind the allowlist.
+pub struct ModuleRpc {
+    url: String,
+    cookie: String,
+    calls: Mutex<Vec<String>>,
+}
+
+impl ModuleRpc {
+    pub fn new(url: String, cookie: String) -> Self {
+        Self { url, cookie, calls: Mutex::default() }
+    }
+
+    pub fn count(&self, method: &str) -> usize {
+        self.calls.lock().unwrap().iter().filter(|m| *m == method).count()
+    }
+}
+
+impl NodeRpc for ModuleRpc {
+    fn rpc(&self, method: &str, params: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(method.to_string());
+        if !ALLOWED.contains(&method) {
+            return Ok(json!({"result": null, "error": {"code": -32601, "message": format!("method not allowed: {method}")}}).to_string());
+        }
+        let body = format!(r#"{{"jsonrpc":"1.0","id":1,"method":"{method}","params":{params}}}"#);
+        let mut child = Command::new("curl")
+            .args(["-s", "--max-time", "60", "--user", self.cookie.trim(), "-H", "content-type: application/json", "--data-binary", "@-", &self.url])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut child.stdin.take().ok_or("curl stdin")?, body.as_bytes()).map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        if text.trim().is_empty() {
+            return Err(format!("{method}: no answer"));
+        }
+        Ok(text)
     }
 }
 

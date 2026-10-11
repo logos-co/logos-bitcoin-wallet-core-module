@@ -38,6 +38,23 @@
           diff -r patched ${./rust-lib/vendor/bip157}
           echo "bip157 0.7.0 + $(ls ${./patches/bip157} | wc -l) patches" > $out
         '';
+      # The same for bdk_kyoto 0.18.0, patches/bdk_kyoto and tools/kyoto/patch-bdk_kyoto.sh.
+      bdkKyotoCheck = system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in
+        pkgs.runCommand "bdk_kyoto-0.18.0-patches-check" {
+          crate = pkgs.fetchurl {
+            url = "https://static.crates.io/crates/bdk_kyoto/bdk_kyoto-0.18.0.crate";
+            sha256 = "cb06429fe9ed238f12bff092ae5cbb34ae51e647486d148fa51744d6e4b289d5";
+          };
+          nativeBuildInputs = [ pkgs.git pkgs.gnutar pkgs.gzip pkgs.diffutils ];
+        } ''
+          export HOME=$TMPDIR
+          mkdir pristine
+          tar xzf $crate -C pristine --strip-components=1
+          bash ${./tools/kyoto/patch-bdk_kyoto.sh} pristine patched ${./patches/bdk_kyoto}
+          diff -r patched ${./rust-lib/vendor/bdk_kyoto}
+          echo "bdk_kyoto 0.18.0 + $(ls ${./patches/bdk_kyoto} | wc -l) patches" > $out
+        '';
       # tools/regtest/chain.sh with bitcoind and electrs, for harnesses outside this repository.
       regtestChain = system:
         let pkgs = nixpkgs.legacyPackages.${system}; in
@@ -78,6 +95,7 @@
           nativeBuildInputs = [ bpkgs.perl bpkgs.pkg-config cc ];
           env = {
             BIP157_PATCHES_CHECKED = "${bip157Check "x86_64-linux"}";
+            BDK_KYOTO_PATCHES_CHECKED = "${bdkKyotoCheck "x86_64-linux"}";
             CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${cc}/bin/${cc.targetPrefix}cc";
             CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${wpkgs.windows.pthreads}/lib";
             CC_x86_64_pc_windows_gnu = "${cc}/bin/${cc.targetPrefix}cc";
@@ -134,9 +152,12 @@
           src = ./.;
           configFile = ./metadata.json;
           flakeInputs = inputs;
-          rustEnv = { BIP157_PATCHES_CHECKED = "${bip157Check (buildSystem system)}"; };
+          rustEnv = {
+            BIP157_PATCHES_CHECKED = "${bip157Check (buildSystem system)}";
+            BDK_KYOTO_PATCHES_CHECKED = "${bdkKyotoCheck (buildSystem system)}";
+          };
         }).packages.${system}
-        // { bip157-check = bip157Check (buildSystem system); }
+        // { bip157-check = bip157Check (buildSystem system); bdk_kyoto-check = bdkKyotoCheck (buildSystem system); }
         // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; esplora-electrs = esploraElectrs system; }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-windows") { test-bin = testBinWindows; });
     };

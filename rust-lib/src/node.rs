@@ -127,6 +127,10 @@ pub struct NodeStatus {
     pub matched: u32,
     pub from_peers: u32,
     pub pruned_gap: Option<PrunedGap>,
+    /// Scans started over from the birthday with a wider window, and the highest index the scan
+    /// watches per keychain (external, internal).
+    pub rescans: u32,
+    pub window: [u32; 2],
 }
 
 /// Matched blocks below a pruned node's prune height that neither it nor its peers gave.
@@ -209,6 +213,24 @@ const PEER_WAIT: Duration = Duration::from_secs(20);
 /// The scripts a filter is matched against: every one the index derived, the lookahead included.
 fn watched(index: &KeychainTxOutIndex<KeychainKind>) -> Vec<ScriptBuf> {
     index.inner().all_spks().values().cloned().collect()
+}
+
+/// The wallet's index, deriving each keychain's scripts up to its revealed index plus `lookahead`
+/// (the first `lookahead` when none is revealed): a scan watches every one of them.
+pub fn widened(index: &KeychainTxOutIndex<KeychainKind>, lookahead: u32) -> KeychainTxOutIndex<KeychainKind> {
+    let mut wide = index.clone();
+    let revealed = wide.last_revealed_indices();
+    for k in [KeychainKind::External, KeychainKind::Internal] {
+        let top = revealed.get(&k).map_or(lookahead.saturating_sub(1), |r| r.saturating_add(lookahead));
+        let _ = wide.lookahead_to_target(k, top);
+    }
+    wide
+}
+
+/// The highest index of each keychain (external, internal) that `index` derived.
+pub fn window(index: &KeychainTxOutIndex<KeychainKind>) -> [u32; 2] {
+    let top = |k: KeychainKind| index.inner().all_spks().range((k, 0)..=(k, u32::MAX)).next_back().map_or(0, |((_, i), _)| *i);
+    [top(KeychainKind::External), top(KeychainKind::Internal)]
 }
 
 /// Peers that serve old blocks: NETWORK, not only NETWORK_LIMITED's last 288.
@@ -621,7 +643,7 @@ mod tests {
             .create_wallet_no_persist()
             .unwrap();
         let headers = chain.blocks.iter().enumerate().skip(1).map(|(h, b)| (h as u32, b.header)).collect();
-        (w.spk_index().clone(), ChainAuthority::restore(BNetwork::Regtest, headers, vec![], 2_000_000_000))
+        (w.spk_index().clone(), ChainAuthority::restore(BNetwork::Regtest, BNetwork::Regtest.checkpoint(), headers, vec![], 2_000_000_000))
     }
 
     fn wallet_script() -> ScriptBuf {
@@ -665,6 +687,26 @@ mod tests {
         let (_, other) = wallet_and_authority(&Pruned::new(12, 0, wallet_script(), 0, false));
         f.rewind(&other);
         assert!(f.scanned.is_none_or(|(h, _)| h < 12), "{:?}", f.scanned);
+    }
+
+    #[test]
+    fn a_payment_past_the_lookahead_is_found_once_the_scan_watches_further() {
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let w = bdk_wallet::Wallet::create(format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"))
+            .network(bitcoin::Network::Regtest)
+            .create_wallet_no_persist()
+            .unwrap();
+        let far = w.peek_address(KeychainKind::External, 40).script_pubkey();
+        let chain = Arc::new(Pruned::new(12, 3, far, 0, true));
+        let (index, authority) = wallet_and_authority(&chain);
+        assert_eq!(window(&index), [24, 24], "a fresh wallet derives its first 25 of each keychain");
+        let found = Follower::new(Arc::new(NodeClient::new(chain.clone())), None).scan(&authority, &index, vec![], 1, None, &AtomicBool::new(false)).unwrap();
+        assert!(found.tx_update.txs.is_empty(), "index 40 is past what the wallet watches");
+        let wide = widened(&index, 60);
+        assert_eq!(window(&wide), [59, 59]);
+        let found = Follower::new(Arc::new(NodeClient::new(chain.clone())), None).scan(&authority, &wide, vec![], 1, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(found.tx_update.txs.len(), 1, "a wider scan finds it");
+        assert_eq!(found.last_active.get(&KeychainKind::External), Some(&40));
     }
 
     #[test]

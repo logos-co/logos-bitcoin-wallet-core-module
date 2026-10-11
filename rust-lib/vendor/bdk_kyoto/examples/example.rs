@@ -1,0 +1,84 @@
+use bdk_kyoto::builder::{Builder, BuilderExt};
+use bdk_kyoto::{HashCheckpoint, Info, Receiver, SyncConfig, UnboundedReceiver, Warning};
+use bdk_wallet::bitcoin::Network;
+use bdk_wallet::{KeychainKind, Wallet};
+use tokio::select;
+
+const RECV: &str = "wpkh([9122d9e0/84'/1'/0']tpubDCYVtmaSaDzTxcgvoP5AHZNbZKZzrvoNH9KARep88vESc6MxRqAp4LmePc2eeGX6XUxBcdhAmkthWTDqygPz2wLAyHWisD299Lkdrj5egY6/0/*)";
+const CHANGE: &str = "wpkh([9122d9e0/84'/1'/0']tpubDCYVtmaSaDzTxcgvoP5AHZNbZKZzrvoNH9KARep88vESc6MxRqAp4LmePc2eeGX6XUxBcdhAmkthWTDqygPz2wLAyHWisD299Lkdrj5egY6/1/*)";
+const NETWORK: Network = Network::Signet;
+const USER_SCRIPTS_USED: u32 = 1_000;
+
+/* Sync a bdk wallet */
+
+async fn traces(
+    mut info_subscriber: Receiver<Info>,
+    mut warning_subscriber: UnboundedReceiver<Warning>,
+) {
+    loop {
+        select! {
+            info = info_subscriber.recv() => {
+                if let Some(info) = info {
+                    match info {
+                        Info::Progress(p) => {
+                            tracing::info!("chain height: {}, filter download progress: {}%", p.chain_height(), p.percentage_complete());
+                        },
+                        Info::BlockReceived(b) => {
+                            tracing::info!("downloaded block: {b}");
+                        },
+                        _ => (),
+                    }
+                }
+            }
+            warn = warning_subscriber.recv() => {
+                if let Some(warn) = warn {
+                    tracing::warn!("{warn}")
+                }
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    let mut wallet = Wallet::create(RECV, CHANGE)
+        .network(NETWORK)
+        .create_wallet_no_persist()?;
+
+    let sync_config =
+        SyncConfig::wallet_recovery_sync(HashCheckpoint::from_genesis(NETWORK), USER_SCRIPTS_USED)
+            .build();
+
+    // The light client builder handles the logic of inserting the SPKs
+    let client = Builder::new(NETWORK)
+        .build_with_wallet(&wallet, sync_config)
+        .unwrap();
+    let (client, logging, mut update_subscriber) = client.subscribe();
+    tokio::task::spawn(
+        async move { traces(logging.info_subscriber, logging.warning_subscriber).await },
+    );
+    let client = client.start();
+    let requester = client.requester();
+
+    // Sync and apply updates. We can do this in a continual loop while the "application" is running.
+    // Often this would occur on a separate thread than the underlying application user interface.
+    let update = update_subscriber.update().await?;
+    wallet.apply_update(update)?;
+    tracing::info!("Tx count: {}", wallet.transactions().count());
+    tracing::info!("Balance: {:#}", wallet.balance().total());
+    let last_revealed = wallet.derivation_index(KeychainKind::External);
+    tracing::info!("Last revealed External: {:?}", last_revealed);
+    tracing::info!(
+        "Last revealed Internal: {:?}",
+        wallet.derivation_index(KeychainKind::Internal)
+    );
+    tracing::info!("Local chain tip: {}", wallet.local_chain().tip().height());
+    let next = wallet.reveal_next_address(KeychainKind::External).address;
+    tracing::info!("Next receiving address: {next}");
+    let fee_filter = requester.broadcast_min_feerate().await.unwrap();
+    tracing::info!("Broadcast minimum fee rate: {:#}", fee_filter);
+    return Ok(());
+}

@@ -2,7 +2,7 @@
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
 bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.0, `bdk_esplora` 0.22.2, `bdk_kyoto` 0.18.0
-on `bip157` 0.7.0 with four patches, `bdk_bitcoind_rpc` 0.22.0), running as a Rust module inside
+with three patches on `bip157` 0.7.0 with four, `bdk_bitcoind_rpc` 0.22.0), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -36,10 +36,17 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
 
 Only the authority moves the wallet's chain, in this order: the local node while it is enabled and
 synced, then Kyoto, then the Electrum header chain. Whichever it is feeds one validated header
-chain, stored in the encrypted database, from a checkpoint per network (`network.rs`): mainnet
+chain, stored in the encrypted database, from a checkpoint (`network.rs`). Each network has
+several, each a full header: genesis; on mainnet also 481,823 and 709,631, the blocks before
+segwit's and taproot's activation (bip157's own checkpoints, hashes checked in the tests), and
 935,424 (a retarget boundary whose headers link down to Bitcoin Core 31.1's assumeutxo block
-935,000), signet 290,000 and testnet4 120,000 (Core 31.1's assumeutxo blocks), regtest's genesis.
-Every header passes the same checks wherever it comes from:
+935,000); signet 290,000 and testnet4 120,000 (Core 31.1's assumeutxo blocks). A wallet's chain
+starts at the highest one at or below where its scans start, the block before the birthday
+(`chain_base` in `core_meta`, `status.authority.base`), so the chain holds every block a restore can
+find: a signet restore from 196,000 starts at genesis, a new mainnet wallet at 935,424. A chain
+stored from a higher checkpoint, or a birthday set below its start, starts it again from the lower
+one, and Kyoto and the node scan again. `regtest.json` may add a checkpoint (`checkpoint: { height,
+header }`) for the tests. Every header passes the same checks wherever it comes from:
 
 - each header must link to the one below it, meet its own target, stay under the network's limit, be
   later than the median of the 11 before it and no more than two hours ahead. On mainnet the bits
@@ -56,8 +63,10 @@ Every header passes the same checks wherever it comes from:
 - the valid chain with the most work wins; a server that hides blocks loses to one that doesn't;
 - BDK's local chain is restated only from it (`authority::chain_update`): every height BDK holds
   from the top down to the first that agrees, the anchor heights, and the tip;
-- heights below the checkpoint count once a server's headers link up to a known hash, or when
-  Kyoto, started below the checkpoint, names them.
+- heights below the chain's start count once a server's headers link up to a known hash, or when
+  Kyoto names them. Esplora has no header ranges to link with: what it reports there is held, shown
+  `unchecked`, and named in a `sourceAlert` (`unchecked_anchor`), never dropped; an earlier
+  birthday then checks it.
 
 The authority changes as the route table and the node's state change; the header chain carries
 over, and `status.authority.kind` says which feeds it: `local_node`, `kyoto` or `electrum_headers`.
@@ -78,6 +87,12 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   and its finds applied as it goes. Then bdk_bitcoind_rpc's Emitter follows the tip and, there,
   the mempool; a node without a filter index has every block read by the Emitter. After a reorg
   under the last block scanned, the scan resumes from the newest scanned block still on the chain.
+- Blocks are applied in height order, so a spend always meets the coin it spends. A scan from the
+  birthday keeps the fewest indices it watched (`node_window`); when it reaches the tip and the
+  wallet used an address within the gap limit (20) of them, earlier blocks may pay addresses it
+  never watched, so it scans again from the birthday watching about twice the highest used index,
+  until the window holds (`status.node.rescans`); as for Kyoto, only addresses a gap-limit scan
+  reaches count.
 - A pruned node: a matched block it no longer holds is asked of one of its peers that serve old
   blocks (`getpeerinfo`'s `NETWORK`) with `getblockfrompeer`, and read once it arrives (20 s a
   peer). The node asks a peer it is already connected to, so its own proxy setting (`-proxy`,
@@ -94,11 +109,13 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   `getblockcount` is answered from `getblockchaininfo` and `getrawtransaction` reads as "not
   found", so the node's mempool then shows only the wallet's own transactions.
 - `status.node`: `{ blocks, headers, initialSync, synced, pruned, pruneHeight, filters, matched,
-  fromPeers, prunedGap }`; `matched` and `fromPeers` count this session's blocks.
+  fromPeers, prunedGap, rescans, window }`; `matched` and `fromPeers` count this session's blocks,
+  `window` is the highest index the scan watches per keychain (external, internal).
 
 ### Kyoto
 
-bdk_kyoto 0.18.0 on bip157 0.7.0 (published from 0169dc3) with four patches, below (`kyoto.rs`):
+bdk_kyoto 0.18.0 with three patches on bip157 0.7.0 (published from 0169dc3) with four, below
+(`kyoto.rs`):
 
 - Peers come from the route table's `peers`: every peer the node module's verified peer list
   makes usable on Kyoto's route, or the user's own, which replace the list. Each start takes a
@@ -108,8 +125,9 @@ bdk_kyoto 0.18.0 on bip157 0.7.0 (published from 0169dc3) with four patches, bel
 - One connection type per client, as the node module routes it: `direct` for peers on the user's
   network (names there resolve locally), else all through Tor's SOCKS port, never a mix. Kyoto
   takes the proxy by IP address only.
-- The quorum (`required_peers`, also the connection count) is 3 on mainnet and 2 elsewhere, never
-  more than the peers dialled. Over Tor a peer has 30 s for the TCP handshake, 15 s per response
+- The quorum (`required_peers`, also the connection count) is 3 on mainnet and 2 on signet, however
+  few peers it may dial; on testnet4, 2, or as many as it may dial down to 1, and then
+  `status.kyoto.onePeerDecides` is true, for the app's one-operator notice. Over Tor a peer has 30 s for the TCP handshake, 15 s per response
   (the version handshake after the SOCKS connect included) and 240 s per filter batch (patch 3);
   directly, 5 s, bip157's default 5 s and 30 s. On bip157's default, one mainnet start in ten
   through 8 listed onion peers ran out of peers in the peer-list crawler's runs; on 15 s, 10 of
@@ -117,12 +135,28 @@ bdk_kyoto 0.18.0 on bip157 0.7.0 (published from 0169dc3) with four patches, bel
 - When Kyoto runs out of peers (`NoReachablePeers`) it restarts on a fresh subset: after 2 s when the
   run got somewhere, else backing off up to 2 minutes.
 - bdk_kyoto copies the wallet's address index when the client is built, so it watches the revealed
-  addresses plus 25. When the wallet reveals past those, the client is rebuilt.
-- A start begins 8 blocks below the last height whose filters were scanned. A first start begins at
-  the block before the birthday when the header chain reaches it; otherwise it syncs headers from
-  the chain's tip first, then scans filters from the birthday (`rescan_from`). A birthday below the
-  checkpoint starts from Kyoto's own taproot or segwit checkpoint (mainnet) or genesis, and Kyoto's
-  chain must then pass through the wallet's checkpoint.
+  addresses plus 25, or more after a rescan. When the wallet reveals past those, the client is
+  rebuilt. Matched blocks are applied in height order (patch 1), so a spend meets its coin.
+- A scan from the birthday keeps the fewest indices any of its clients watched (`kyoto_window`).
+  When it reaches the tip and the wallet used an address within the gap limit (20) of them, earlier
+  blocks may pay addresses it never watched: it scans again from the birthday, watching about twice
+  the highest used index (patch 3 indexes every one), until the window holds
+  (`status.kyoto.rescans`); the regtest restores below, to index 150 out of order, take two. Only
+  used addresses a gap-limit scan reaches count, from index 0 and never past 20 unused in a row:
+  the public test phrase also has payments far beyond (testnet4 index 313 after 151), which a
+  window happens to hold now and then, and which would otherwise widen it again and again.
+- A start begins 8 blocks below the last height whose filters were scanned. A first sync hands over
+  what it found every 2,016 filters (patch 2), and that height is stored, so a run that loses its
+  peers goes on from there. A first start begins at the block before the birthday when the header
+  chain reaches it; otherwise Kyoto syncs headers from the chain's tip first, taken into the chain
+  2,016 or more at a time as they come, so a restart starts from the stored chain, then scans
+  filters from the birthday (`rescan_from`). The chain starts at or below the birthday, so Kyoto
+  always starts on it.
+- A filter-header conflict between peers (bip157 can't tell which lies, and disconnects one): the
+  peers connected then are skipped for 24 hours and a fresh subset starts at once
+  (`status.kyoto.lastConflict: { at, peers }`). bip157's own resolution, fetching the block to
+  find the liar, is not needed for safety, as no filter header is taken without the quorum; with
+  verified peers only, conflicts should be rare, and skipping both sides costs a peer a day.
 - Each update's headers are read back from Kyoto (`get_header`), checked against the hashes the
   update names, and taken into the header chain with the same checks as any source. Its
   transactions pass the anchor checks too, then reach BDK with a checkpoint at each anchor.
@@ -135,10 +169,11 @@ bdk_kyoto 0.18.0 on bip157 0.7.0 (published from 0169dc3) with four patches, bel
 - Each client runs on a tokio runtime of its own, shut down when it stops: bip157 spawns a task per
   peer, and once its node is dropped those tasks spin on a closed channel for up to the two-hour
   connection limit (135% CPU after one rebuild, before this).
-- `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, headers, progress,
-  connected, dialled, skipped, restarts, rebuilds, lastWarning, lastStop }`. Kyoto counts progress by
-  finished batches, so a catch-up within one batch reads `syncing` until its filters are in;
-  `headers` is Kyoto's best header.
+- `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, quorum, onePeerDecides,
+  headers, progress, connected, dialled, skipped, restarts, rebuilds, rescans, window, lastWarning,
+  lastStop, lastConflict }`. Kyoto counts progress by finished batches, so a catch-up within one
+  batch reads `syncing` until its filters are in; `headers` is Kyoto's best header; `window` is the
+  highest index the client watches per keychain.
 
 ### Kyoto patches
 
@@ -161,6 +196,22 @@ and the module's Rust build depends on that check; `tools/kyoto/check-bip157.sh`
 without Nix (`--update` rewrites the vendored tree). Run against the published crate, the quorum
 and tip tests fail: that is the bug. Nothing has been sent upstream.
 
+`patches/bdk_kyoto/` holds three on bdk_kyoto 0.18.0, all in `src/lib.rs`, the one file
+`tools/kyoto/patch-bdk_kyoto.sh` allows:
+
+1. matched blocks applied oldest first: the published crate drains them newest first
+   (`queued_blocks.last()`, `pop()`), and bdk_chain counts a spend only once its coin is indexed,
+   so a restore lost every spend whose coin came in the same update;
+2. `UpdateSubscriber::checkpoint_every(n)`: an update every n filters as well as at the tip, with
+   `scanned()` (the last filter's height) and `synced()` (at the tip or not);
+3. every script the filters are checked against is indexed (`lookahead_to_target`): with a
+   recovery lookahead past the wallet's own 25, a matched block's transaction read as irrelevant
+   and was dropped.
+
+`rust-lib/vendor/bdk_kyoto` is the result, checked the same way (`nix build .#bdk_kyoto-check`,
+`tools/kyoto/check-bdk_kyoto.sh`); the regtest restores below fail without patches 1 and 3. Nothing
+has been sent upstream.
+
 ## Before a server's answer is applied
 
 Requests carry no chain tip (`SyncRequest::builder_at`, `FullScanRequest::builder_at`), and answers
@@ -172,8 +223,9 @@ are applied with `chain: None`. Then (`checks.rs`):
   out too (the Esplora path's check).
 - **Anchors** against the authority: kept on a match; held above its tip and rechecked as it moves
   (pending meanwhile); dropped on a mismatch, with the source marked suspect and a `sourceAlert`;
-  below the checkpoint, kept only once the headers link up. An anchor in a block a reorg just
-  replaced means the server is behind, not lying: it is dropped without blame.
+  below the chain's start, kept once the headers link up, else held, shown `unchecked` and named
+  in an `unchecked_anchor` alert. An anchor in a block a reorg just replaced means the server is
+  behind, not lying: it is dropped without blame.
 - **Merkle proofs.** Electrum: the proof is checked again against the authority's header, and its
   length against the block's depth, taken from a coinbase proof that must reach the same merkle
   root (the 64-byte-transaction trick makes a proof one level off). Esplora: `get_merkle_proof`
@@ -232,10 +284,10 @@ Amounts are decimal strings of satoshis.
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below. Malformed parameters are refused at once with `{ ok: false, error, code: "invalid" }` |
 | `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
-| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
-| `balance()` | `{ confirmed, waiting, pending, sent, immature, tooSmall: { count, sat } }`; empty strings while busy |
+| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
+| `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat } }`; `unchecked` is what unchecked rows pay the wallet; empty strings while busy |
 | `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once 20 stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
-| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState }`; `blockHash` is the confirming block's, on confirmed and waiting rows; `sendState` is the wallet's own send record's state |
+| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, confirmedVia }`; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `unchecked` is a block a server reported below the chain's start, which nothing checked; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState` is the wallet's own send record's state |
 | `fee_rates()` | `{ fast, normal, slow, minimum, sources }` sat/vB: the median of the fee sources, never below the highest minimum relay fee |
 | `address_valid(text, network)` | An address or BIP21 URI: `{ valid, address, type, amountSat?, label?, message? }` |
 | `sources_status()`, `exposure()` | `{ chainBy, local, kyoto: { id, route, peers, down }, sources }`: who feeds the chain and per server health and verdicts, with `encrypted` false for plain text outside Tor (the app marks those servers); the servers that learned the addresses |
@@ -258,8 +310,9 @@ Amounts are decimal strings of satoshis.
 
 Events: `walletStateChanged` (status's shape; also when the authority's kind changes, a reorg
 moves a payment, a birthday is set and its rescan starts and ends), `jobFinished(jobId, state)`, and
-`sourceAlert` (`{ source, kind: suspect|stale|authority_behind|anchor_mismatch|authority_suspect, detail,
-at }`); `authority_suspect` is Kyoto naming a chain the checks refuse, with `source: "kyoto"`.
+`sourceAlert` (`{ source, kind: suspect|stale|authority_behind|anchor_mismatch|authority_suspect|unchecked_anchor,
+detail, at }`); `authority_suspect` is Kyoto naming a chain the checks refuse, with `source: "kyoto"`;
+`unchecked_anchor` names transactions reported below the chain's start that nothing could check.
 
 The core never takes a password, phrase or key; a unit test reads the contract and fails on a
 parameter named like one. Callers other than `bitcoin_wallet_backend` are refused on the
@@ -303,11 +356,14 @@ the plain-text rule run end to end on regtest (`tools/e2e/pins.sh`).
 
 `<instance>/core.log`, and `<instance>/wallets/` (0700), with per wallet
 `<network>/<group>/wallet.json` (group, family, network, created; 0600) and `wallet.db` (SQLCipher,
-0600): BDK's tables plus `core_headers`, `core_old_hashes`, `core_held` (anchors above the tip),
-`core_exposure`, `core_suspects`, `core_reported`, `core_sends` (state `broadcasting`, `sent`,
-`replaced`, `confirmed`, `conflicted`, `abandoned` or `failed`) and `core_meta`, which keeps the
-birthday, the last heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`), a pruned
-node's gap (`node_gap`) and Kyoto's peer failures (`kyoto_peers`). A send whose record says it may
+0600): BDK's tables plus `core_headers`, `core_old_hashes`, `core_held` (anchors above the tip,
+and unchecked ones below the chain's start), `core_exposure`, `core_suspects`, `core_reported`,
+`core_sends` (state `broadcasting`, `sent`, `replaced`, `confirmed`, `conflicted`, `abandoned` or
+`failed`) and `core_meta`, which keeps the birthday, the chain's checkpoint (`chain_base`), the last
+heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`), the indices a scan from the
+birthday watched (`kyoto_window`, `node_window`), a pruned node's gap (`node_gap`) and Kyoto's peer
+failures (`kyoto_peers`). `scan_rules` marks the scan rules a wallet was scanned under: a wallet
+from before these (2) scans again once, from its birthday. A send whose record says it may
 have gone out comes back as pending on reopen, even when the store after its broadcast never
 happened, so its coins stay spent and a bump or a rebroadcast finds it; `history` rows of the
 wallet's own sends carry `sendState`.
@@ -352,7 +408,14 @@ REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --fe
   --test node -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
   cargo test --release --no-default-features --features test-hooks --test esplora -- --ignored --nocapture
+ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
+  cargo test --release --no-default-features --features test-hooks --test restore -- --ignored --nocapture
 ```
+
+`chain.sh reorg` pays the replacement blocks to a fresh address each time: right after a burst of
+blocks the chain's clock runs ahead of real time, and a block to the same address could come out
+byte for byte the invalidated one, which bitcoind refuses as a duplicate. Any failed generate
+stops the script.
 
 The tests drive the engine with no Logos runtime. Their signer manager is in process, over
 `logos-signer-interface`'s `MockSigner` keyed from the test phrase (abandon ×11 about, fingerprint
@@ -374,12 +437,17 @@ patch 1; the test connects all three peers. It receives, sends through Kyoto's
 peers and confirms; re-anchors across a reorg; rebuilds the client after 30 addresses are revealed
 (a test hook) and finds a payment to the last; restarts after `NoReachablePeers` when every peer
 goes down, and finds the payment made meanwhile; and holds out against a forging peer that answers
-first: no update ever hides the payment, which confirms once the forger stops. Against bip157
+first: no update ever hides the payment, which confirms once the forger stops. Each forged batch
+is a filter-header conflict, so each restarts the client at once (10 for 10 forged batches). Against bip157
 without patch 1, the same step fails: the wallet reports synced at the block with the payment
 missing. Run alone after it, `kyoto_with_a_history_server` adds an electrs enabled for history:
 the payment shows pending from it, then confirms on Kyoto's chain. `kyoto_first_sync_on_a_long_chain`
-times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_live_signet` syncs signet through Tor from
-`LIVE_PEERS`.
+times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_a_live_network` restores the test phrase
+on signet or testnet4 (`LIVE_NETWORK`, signet by default) with a birthday (`LIVE_BIRTHDAY`) through
+Tor (`LIVE_PROXY`, a `socks5h://` port with IsolateDestAddr) from `LIVE_PEERS` (comma-separated
+`host:port`), and with `LIVE_EXPLORER` (the privacy harness's explorer JSON) every confirmed
+transaction the explorer lists must show at its height, nothing else up to the explorer's tip; the
+summary goes to `LIVE_OUT`.
 
 `node`, with the pruned node as the authority, through a `NodeRpc` that speaks Core's JSON-RPC
 behind bitcoind_module's allowlist: two payments and a send in three blocks, a 70 kB block that
@@ -391,6 +459,21 @@ back, the three matched blocks come from them (`getblockfrompeer`), and only 6 b
 for 406 filters. Then a reorg under a payment followed through the node, and a new birthday that
 reads the filters again.
 
+`restore` builds a history first, as a live network has one, then restores it: a Core wallet
+that imported the test phrase's BIP84 keys (range 0 to 200) pays receive indices 0 to 150, ten
+apart but out of order, spends some coins in the block that funds them, with change, and sweeps
+others the block after, without change, so only the coin ties the sweep to the wallet; its BIP86
+keys get four payments, a spend and a sweep within the first window, so no scan starts over. A
+`regtest.json` checkpoint sits halfway through the segwit history, above the birthday. The phrase
+is restored into fresh wallets under Kyoto alone, the node's filters (through the allowlist),
+Electrum, and Esplora for history with Electrum's headers; each must show every transaction of
+Core's wallet at its height and nothing else, and the same confirmed balance, on a chain that
+starts at genesis, below the birthday. Kyoto scans twice more and the node once more; the taproot
+restore needs one pass. Last, Esplora with a birthday above the checkpoint: the 12 transactions
+below it show as `unchecked` at their own heights, with an `unchecked_anchor` alert. Against
+bdk_kyoto without patch 1 the Kyoto restore misses a sweep of a coin that came the block before;
+without patch 3, payments past the wallet's own lookahead; without both, 8 of 24 transactions.
+
 `esplora`, with Blockstream's electrs (esplora flavour, `--jsonrpc-import`) for history, pending
 payments, broadcast, fees and checks, and the Electrum header chain for the chain: a payment
 pending then confirmed (its anchor checked by Esplora's merkle proof and the block's `tx_count`),
@@ -398,9 +481,9 @@ a send broadcast through Esplora, Esplora's fee estimates (the floor on regtest)
 server behind a TLS front with a self-signed version 1 certificate: its `certSha256` opens it, and
 another pin is refused.
 
-On 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): `regtest` 65 s and 50 s, `kyoto` 94 s and
-64 s, `node` 249 s and 55 s (its restore through the node's peers 11.4 s and 6.0 s; the Mac mines
-slowly), `esplora` 20 s and 18 s.
+On 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): `regtest` 70 s and 50 s, `kyoto` 131 s and
+59 s, `node` 253 s and 54 s (the Mac mines slowly), `esplora` 21 s and 18 s, `restore` 121 s and
+17 s.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.
@@ -499,9 +582,15 @@ bundle, the keystore side and the core run on Windows and reach it directly unde
 
 ## Not yet
 
-- Kyoto reports its progress only as whole batches finish, and bdk_kyoto hands over transactions
-  only once filters reach the tip, so a run that loses its peers before then starts over from the
-  last height scanned. A long first sync over unreliable peers can take several runs.
+- Kyoto reports its progress only as whole batches finish.
+- A scan that starts over, wider, downloads every filter from the birthday again: Kyoto keeps no
+  filters. A history spread far past the first window can take several passes.
+- Mainnet and signet keep their quorum of 3 and 2 however few peers can be dialled, so a single
+  peer of the user's own there never meets it; only testnet4 runs below its quorum.
+- bip157's own answer to a filter-header conflict, fetching the block to find which peer lied, is
+  not done: both sides sit out a day.
+- The header chain is held in memory, about 144 bytes a header: from mainnet's segwit checkpoint
+  some 68 MB, from signet's genesis 47 MB.
 - An authority from Esplora servers alone: without an Electrum server in the `chain` role nothing
   confirms.
 - Unload can't reach the manager, so it skips `close_account`; the grant ends when the manager

@@ -27,6 +27,8 @@ pub struct Summary {
     pub tip_age_secs: Option<u64>,
     /// Sources whose tip is on the authority's chain.
     pub peers: u32,
+    /// The checkpoint the chain starts from: every anchor at or above it is checked against it.
+    pub base: u32,
 }
 
 /// What one refresh changed.
@@ -108,11 +110,20 @@ impl ChainAuthority {
         Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, replaced: Default::default() }
     }
 
-    /// From stored headers and proofs; a stored chain counts as progress, and its age shows.
-    pub fn restore(net: BNetwork, headers: Vec<(u32, Header)>, old: Vec<(u32, BlockHash)>, now: u32) -> Self {
-        let chain = HeaderChain::restore(net, headers, now);
+    /// From stored headers and proofs on `cp`; a stored chain counts as progress, and its age shows.
+    pub fn restore(net: BNetwork, cp: crate::network::Checkpoint, headers: Vec<(u32, Header)>, old: Vec<(u32, BlockHash)>, now: u32) -> Self {
+        let chain = HeaderChain::restore_from(net, cp, headers, now);
         let progressed = chain.tip_height() > chain.base();
         Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, replaced: Default::default() }
+    }
+
+    /// Starts the chain again from `cp`, a lower checkpoint, keeping who feeds it and the hashes
+    /// below proved so far: a birthday moved below the chain's start.
+    pub fn rebase(&mut self, cp: crate::network::Checkpoint) {
+        self.chain = HeaderChain::from_checkpoint(self.chain.network(), cp.height, cp.header);
+        self.old.retain(|h, _| *h < cp.height);
+        (self.progressed, self.replaced) = (false, Default::default());
+        self.agreeing.clear();
     }
 
     /// Who feeds the chain now; the chain itself carries over.
@@ -329,6 +340,7 @@ impl Authority for ChainAuthority {
             hash: self.progressed.then(|| self.chain.tip_hash().to_string()),
             tip_age_secs: self.progressed.then(|| now.saturating_sub(u64::from(self.chain.tip().time))),
             peers: if self.kind == ELECTRUM_HEADERS { self.agreeing.len() as u32 } else { self.peers },
+            base: self.chain.base(),
         }
     }
 
@@ -399,6 +411,25 @@ mod tests {
         let mut c = vec![genesis()];
         c.extend(regtest_branch(&genesis(), n, genesis().time, salt));
         c
+    }
+
+    #[test]
+    fn a_chain_restored_on_a_checkpoint_and_rebased_lower() {
+        let honest = chain_of(30, 1);
+        let at = |h: usize| crate::network::Checkpoint { height: h as u32, header: honest[h] };
+        // Stored headers above a checkpoint at 10: kept from there, and nothing below is known.
+        let stored: Vec<(u32, Header)> = (11..=30).map(|h| (h as u32, honest[h])).collect();
+        let mut a = ChainAuthority::restore(BNetwork::Regtest, at(10), stored, vec![(4, honest[4].block_hash())], NOW);
+        assert_eq!((a.base_height(), a.tip_height()), (10, Some(30)));
+        assert_eq!(a.summary(0).base, 10);
+        assert_eq!(crate::checks::judge_anchor(&a, 7, honest[7].block_hash()), crate::checks::AnchorVerdict::NeedsLinkage);
+        // A birthday below 10: the chain starts again at genesis, and every height is judged by it.
+        a.rebase(at(0));
+        assert_eq!((a.base_height(), a.tip_height()), (0, None), "no progress until it is fed again");
+        let full = fake("full", honest.clone());
+        a.refresh(&[&full], NOW);
+        assert_eq!(crate::checks::judge_anchor(&a, 7, honest[7].block_hash()), crate::checks::AnchorVerdict::Keep);
+        assert_eq!(crate::checks::judge_anchor(&a, 7, honest[8].block_hash()), crate::checks::AnchorVerdict::Drop);
     }
 
     #[test]

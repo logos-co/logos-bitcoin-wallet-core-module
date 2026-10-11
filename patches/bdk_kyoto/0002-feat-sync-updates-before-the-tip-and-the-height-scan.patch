@@ -1,0 +1,133 @@
+From 62f74738c13b9e1c72bfc4c0390a8f2bf63283c5 Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Sun, 11 Oct 2026 05:33:02 -0300
+Subject: [PATCH 2/3] feat(sync): updates before the tip, and the height
+ scanned
+
+UpdateSubscriber::checkpoint_every(n) also yields an update after every n
+filters checked, with the blocks they matched applied; scanned() names
+the height of the last filter checked and synced() whether that update
+came at the tip. A long first sync that loses its peers can go on from
+there instead of starting over.
+---
+ src/lib.rs | 66 +++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 55 insertions(+), 11 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index f0f4333..59ca38c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -257,6 +257,12 @@ pub struct UpdateSubscriber<W: Wallets> {
+     queued_blocks: Vec<(u32, BlockHash)>,
+     // queued scripts to check filters
+     spk_cache: HashSet<ScriptBuf>,
++    // the height of the last filter checked against the scripts, and whether that was the tip
++    scanned: Option<u32>,
++    synced: bool,
++    // filters checked since the last update, and how many make an update before the tip
++    filters_since: u32,
++    checkpoint_every: Option<u32>,
+     // processes events for the wallet.
+     single_update_builder: Option<UpdateBuilder>,
+     // process events for multiple wallets.
+@@ -281,6 +287,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             multiple_updates_builder: None,
+             queued_blocks: Vec::new(),
+             spk_cache,
++            scanned: None,
++            synced: false,
++            filters_since: 0,
++            checkpoint_every: None,
+             _marker: core::marker::PhantomData,
+         }
+     }
+@@ -311,6 +321,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             multiple_updates_builder: Some(update_map),
+             queued_blocks: Vec::new(),
+             spk_cache,
++            scanned: None,
++            synced: false,
++            filters_since: 0,
++            checkpoint_every: None,
+             _marker: core::marker::PhantomData,
+         }
+     }
+@@ -323,6 +337,15 @@ impl<W: Wallets> UpdateSubscriber<W> {
+                     if filter.contains_any(self.spk_cache.iter()) {
+                         self.queued_blocks.push((filter.height(), block_hash));
+                     }
++                    self.scanned = Some(filter.height());
++                    self.filters_since += 1;
++                    if self.checkpoint_every.is_some_and(|n| self.filters_since >= n) {
++                        self.apply_queued_blocks().await?;
++                        self.extend_spk_cache();
++                        self.filters_since = 0;
++                        self.synced = false;
++                        return Ok(());
++                    }
+                 }
+                 Event::ChainUpdate(changeset) => {
+                     if let Some(single) = self.single_update_builder.as_mut() {
+@@ -335,20 +358,14 @@ impl<W: Wallets> UpdateSubscriber<W> {
+                     }
+                 }
+                 Event::FiltersSynced(SyncUpdate {
+-                    tip: _,
++                    tip,
+                     recent_history: _,
+                 }) => {
+                     self.apply_queued_blocks().await?;
+-                    if let Some(single) = self.single_update_builder.as_mut() {
+-                        self.spk_cache
+-                            .extend(single.peek_script_to_keychain_lookahead());
+-                    }
+-                    if let Some(multiple) = self.multiple_updates_builder.as_mut() {
+-                        for builder in multiple.values() {
+-                            self.spk_cache
+-                                .extend(builder.peek_script_to_keychain_lookahead());
+-                        }
+-                    }
++                    self.extend_spk_cache();
++                    self.filters_since = 0;
++                    self.scanned = Some(tip.height);
++                    self.synced = true;
+                     return Ok(());
+                 }
+             }
+@@ -358,6 +375,33 @@ impl<W: Wallets> UpdateSubscriber<W> {
+ }
+ 
+ impl<W: Wallets> UpdateSubscriber<W> {
++    /// Also yield an update every `filters` filters checked, not only at the tip, so a long first
++    /// sync can go on from [`Self::scanned`] after the node stops.
++    pub fn checkpoint_every(&mut self, filters: u32) {
++        self.checkpoint_every = Some(filters.max(1));
++    }
++
++    /// The height of the last filter checked against the wallet's scripts, as of the last update.
++    pub fn scanned(&self) -> Option<u32> {
++        self.scanned
++    }
++
++    /// Whether the last update came with filters synced to the tip, not at a checkpoint.
++    pub fn synced(&self) -> bool {
++        self.synced
++    }
++
++    fn extend_spk_cache(&mut self) {
++        if let Some(single) = self.single_update_builder.as_ref() {
++            self.spk_cache.extend(single.peek_script_to_keychain_lookahead());
++        }
++        if let Some(multiple) = self.multiple_updates_builder.as_ref() {
++            for builder in multiple.values() {
++                self.spk_cache.extend(builder.peek_script_to_keychain_lookahead());
++            }
++        }
++    }
++
+     // Oldest first: a spend is relevant to the graph only once the output it spends is indexed,
+     // so a block applied before the block that funds it would lose the spend.
+     async fn apply_queued_blocks(&mut self) -> Result<(), UpdateError> {
+-- 
+2.54.0 (Apple Git-157)
+

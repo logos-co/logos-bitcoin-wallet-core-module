@@ -498,12 +498,29 @@ impl Engine {
         let (pw, created) = wallet::load_or_create(&mut conn, &grant.external, &grant.internal, network)?;
         let mut cell = Cell { wallet: pw, conn, network, family: grant.family };
         let now = now_secs();
-        let authority = ChainAuthority::restore(network, cell.load_headers()?, cell.load_old()?, now as u32);
+        let base = meta_get(&cell.conn, sync::CHAIN_BASE).map_err(|e| e.to_string())?.and_then(|s| s.parse::<u32>().ok()).and_then(|h| network.checkpoint_at(h));
+        let cp = base.unwrap_or_else(|| network.checkpoint());
+        let mut authority = ChainAuthority::restore(network, cp, cell.load_headers()?, cell.load_old()?, now as u32);
         let stored = meta_get(&cell.conn, "birthday").map_err(|e| e.to_string())?.and_then(|s| s.parse::<u32>().ok());
         let stored_src = meta_get(&cell.conn, "birthday_source").map_err(|e| e.to_string())?;
         let (bday, source) = resolve_birthday(birthday, grant.birthday.as_deref(), stored.zip(stored_src), authority.chain(), network, grant.family);
         meta_set(&cell.conn, "birthday", &bday.to_string()).map_err(|e| e.to_string())?;
         meta_set(&cell.conn, "birthday_source", &source).map_err(|e| e.to_string())?;
+        // The chain starts at the checkpoint below where scans start, so it holds every block
+        // they can find; a chain stored from a higher one starts again, and so do the scans.
+        let want = network.checkpoint_below(bday.saturating_sub(1));
+        if want.height < cp.height {
+            tracing::info!(target: "bitcoin", "the chain starts at {} for a birthday at {bday}, was {}", want.height, cp.height);
+            authority.rebase(want);
+            cell.clear_headers()?;
+            sync::forget_scans(&cell.conn)?;
+        }
+        meta_set(&cell.conn, sync::CHAIN_BASE, &authority.chain().base().to_string()).map_err(|e| e.to_string())?;
+        // Restores before these scan rules missed spends and addresses past the lookahead: once.
+        if meta_get(&cell.conn, sync::SCAN_RULES_KEY).map_err(|e| e.to_string())?.as_deref() != Some(sync::SCAN_RULES) {
+            sync::forget_scans(&cell.conn)?;
+            meta_set(&cell.conn, sync::SCAN_RULES_KEY, sync::SCAN_RULES).map_err(|e| e.to_string())?;
+        }
         if let Some(o) = &grant.origin {
             meta_set(&cell.conn, "origin", o).map_err(|e| e.to_string())?;
         }
@@ -699,7 +716,8 @@ impl Engine {
             let from = match &b {
                 Birthday::Height(h) => h.saturating_sub(wallet::DATE_MARGIN_BLOCKS).max(net.activation_height(family)),
                 Birthday::Day(d) => {
-                    let chain = crate::headers::HeaderChain::restore(net, cell.load_headers()?, now_secs() as u32);
+                    let cp = net.checkpoint_at(cell.chain_base()).unwrap_or_else(|| net.checkpoint());
+                    let chain = crate::headers::HeaderChain::restore_from(net, cp, cell.load_headers()?, now_secs() as u32);
                     wallet::height_for_day(d, net, family, &chain).ok_or("invalid birthday: no height for that day")?
                 }
             };

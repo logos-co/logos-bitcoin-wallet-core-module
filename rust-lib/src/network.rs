@@ -1,4 +1,4 @@
-//! Networks the wallet runs on, with the header checkpoint each one's chain authority starts from.
+//! Networks the wallet runs on, with the header checkpoints a wallet's chain authority starts from.
 
 use std::sync::OnceLock;
 
@@ -52,6 +52,7 @@ impl Family {
 }
 
 /// A trusted header: the chain authority accepts only chains that contain it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Checkpoint {
     pub height: u32,
     pub header: Header,
@@ -66,6 +67,16 @@ const MAINNET_CHECKPOINT: (u32, &str) = (
 const SIGNET_CHECKPOINT: (u32, &str) = (
     290_000,
     "00000020d262f01c3f408ea06500f4eb0916a6d13923fe37b766840f3c689504090000000b74c8fd89373c96aab9488850a7c016baa4fafa2bf4c6c5bdf9f686d0e37a3ebe8e82699b7c151d454b0526",
+);
+/// The blocks before segwit's and taproot's activation, bip157's own checkpoints there; their
+/// hashes are checked against bip157's in the tests.
+const MAINNET_SEGWIT: (u32, &str) = (
+    481_823,
+    "02000020ca03823ead70b2a2449e591c1c3bebd8eb0bbab788ec3b000000000000000000c923486e8a03e68504dd59c81a3b942a431eb0c6298592b0000986409f6722ff73319e59e0300118194e0e38",
+);
+const MAINNET_TAPROOT: (u32, &str) = (
+    709_631,
+    "0400002065599564ed457e14bfebfcc1cc10f2e379cdf2f903350400000000000000000067656e12001e5ca785a486868b0af7e5fbb561fbb091492fcad0ceda2db663872a979061cffe0c17b2d340ce",
 );
 const TESTNET4_CHECKPOINT: (u32, &str) = (
     120_000,
@@ -95,6 +106,16 @@ pub struct RegtestConfig {
     /// The servers only cross-check and estimate fees: nothing syncs history from them.
     #[serde(default)]
     pub check_only: bool,
+    /// A checkpoint above genesis, as mainnet's are: `{ height, header }`, the header in hex.
+    #[serde(default)]
+    pub checkpoint: Option<RegtestCheckpoint>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegtestCheckpoint {
+    pub height: u32,
+    pub header: String,
 }
 
 static REGTEST: OnceLock<RegtestConfig> = OnceLock::new();
@@ -157,14 +178,36 @@ impl BNetwork {
         self == BNetwork::Mainnet
     }
 
+    /// The highest checkpoint: where a new wallet's chain starts.
     pub fn checkpoint(self) -> Checkpoint {
+        *self.checkpoints().last().expect("genesis at least")
+    }
+
+    /// Every checkpoint a wallet's chain may start from, lowest first: genesis, then on mainnet the
+    /// blocks before segwit and taproot, then Core 31.1's assumeutxo blocks (README, "Chain").
+    pub fn checkpoints(self) -> Vec<Checkpoint> {
         let at = |(height, hex): (u32, &str)| Checkpoint { height, header: deserialize_hex(hex).expect("checkpoint header") };
+        let genesis = Checkpoint { height: 0, header: bitcoin::constants::genesis_block(self.bitcoin()).header };
         match self {
-            BNetwork::Mainnet => at(MAINNET_CHECKPOINT),
-            BNetwork::Testnet4 => at(TESTNET4_CHECKPOINT),
-            BNetwork::Signet => at(SIGNET_CHECKPOINT),
-            BNetwork::Regtest => Checkpoint { height: 0, header: bitcoin::constants::genesis_block(Network::Regtest).header },
+            BNetwork::Mainnet => vec![genesis, at(MAINNET_SEGWIT), at(MAINNET_TAPROOT), at(MAINNET_CHECKPOINT)],
+            BNetwork::Testnet4 => vec![genesis, at(TESTNET4_CHECKPOINT)],
+            BNetwork::Signet => vec![genesis, at(SIGNET_CHECKPOINT)],
+            BNetwork::Regtest => {
+                let extra = regtest_config().and_then(|c| c.checkpoint.as_ref()).and_then(|c| Some(Checkpoint { height: c.height, header: deserialize_hex(&c.header).ok()? }));
+                std::iter::once(genesis).chain(extra.filter(|c| c.height > 0)).collect()
+            }
         }
+    }
+
+    /// The highest checkpoint at or below `height`: a wallet whose scans start after `height`
+    /// has its chain start there, so the chain holds every block a scan can find.
+    pub fn checkpoint_below(self, height: u32) -> Checkpoint {
+        *self.checkpoints().iter().rev().find(|c| c.height <= height).expect("genesis is at 0")
+    }
+
+    /// The checkpoint at exactly `height`, if there is one.
+    pub fn checkpoint_at(self, height: u32) -> Option<Checkpoint> {
+        self.checkpoints().into_iter().find(|c| c.height == height)
     }
 
     /// The first block that could hold a coin of this family: no wallet can be older.
@@ -200,6 +243,29 @@ mod tests {
         let t4 = BNetwork::Testnet4.checkpoint();
         assert_eq!(t4.header.block_hash().to_string(), "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8");
         assert_eq!(BNetwork::Regtest.checkpoint().height, 0);
+        // The activation checkpoints are bip157's own blocks, whose hashes it carries.
+        let [segwit, taproot] = [&MAINNET_SEGWIT, &MAINNET_TAPROOT].map(|c| BNetwork::Mainnet.checkpoint_at(c.0).unwrap());
+        let (s, t) = (bdk_kyoto::bip157::HashCheckpoint::segwit_activation(), bdk_kyoto::bip157::HashCheckpoint::taproot_activation());
+        assert_eq!((segwit.height, segwit.header.block_hash()), (s.height, s.hash));
+        assert_eq!((taproot.height, taproot.header.block_hash()), (t.height, t.hash));
+    }
+
+    #[test]
+    fn a_wallet_chain_starts_at_the_checkpoint_below_its_scans() {
+        let at = |net: BNetwork, h: u32| net.checkpoint_below(h).height;
+        assert_eq!(at(BNetwork::Signet, 195_999), 0, "signet: below 290,000 the chain starts at genesis");
+        assert_eq!(at(BNetwork::Signet, 290_000), 290_000);
+        assert_eq!(at(BNetwork::Testnet4, 25_999), 0);
+        assert_eq!(at(BNetwork::Mainnet, 481_823), 481_823, "a BIP84 wallet's floor");
+        assert_eq!(at(BNetwork::Mainnet, 709_631), 709_631, "a BIP86 wallet's floor");
+        assert_eq!(at(BNetwork::Mainnet, 900_000), 709_631);
+        assert_eq!(at(BNetwork::Mainnet, 950_000), 935_424);
+        for net in [BNetwork::Mainnet, BNetwork::Testnet4, BNetwork::Signet] {
+            let cps = net.checkpoints();
+            assert_eq!(cps[0].header.block_hash(), bitcoin::constants::genesis_block(net.bitcoin()).block_hash());
+            assert!(cps.windows(2).all(|w| w[0].height < w[1].height));
+            assert_eq!(net.checkpoint(), *cps.last().unwrap());
+        }
     }
 
     #[test]

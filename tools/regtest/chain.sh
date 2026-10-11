@@ -77,7 +77,9 @@ miner_addr() {
   [ -s "$C/miner.addr" ] || rpc getnewaddress '["miner","bech32"]' miner | json_str result > "$C/miner.addr"
   cat "$C/miner.addr"
 }
-mine() { local n="$1" to="${2:-$(miner_addr)}"; rpc generatetoaddress "[$n,\"$to\"]" > /dev/null; }
+# A failed generate stops the script: a block that was never mined must not pass for one.
+generated() { local out; out="$("$@")"; case "$out" in *'"error":null'*) ;; *) echo "generate failed: $out" >&2; exit 1;; esac; }
+mine() { local n="$1" to="${2:-$(miner_addr)}"; generated rpc generatetoaddress "[$n,\"$to\"]"; }
 # Kills by PID and waits for the exit, so a restart never talks to the old process.
 stop_pid() {
   [ -f "$C/$1.pid" ] || return 0
@@ -164,10 +166,12 @@ reorg)
   for _ in $(seq 1 100); do [ "$(fork_best)" = "$old" ] && break; sleep 0.1; done
   [ "$(fork_best)" = "$old" ] || { echo "the fork node did not follow the tip"; exit 1; }
   # Offline, the fork node replaces the tip with a longer branch; the main node keeps the old
-  # block, valid, as a stale fork.
+  # block, valid, as a stale fork. A fresh address each time: with the clock behind the chain's
+  # after a burst, a block to the same address would come out byte for byte the invalidated one.
+  to="$(rpc getnewaddress '["fork","bech32"]' miner | json_str result)"
   frpc setnetworkactive '[false]' > /dev/null
   frpc invalidateblock "[\"$old\"]" > /dev/null
-  frpc generatetoaddress "[$(( depth + 1 )),\"$(miner_addr)\"]" > /dev/null
+  generated frpc generatetoaddress "[$(( depth + 1 )),\"$to\"]"
   frpc setnetworkactive '[true]' > /dev/null
   want="$(fork_best)"
   for _ in $(seq 1 300); do [ "$(best)" = "$want" ] && break; sleep 0.1; done

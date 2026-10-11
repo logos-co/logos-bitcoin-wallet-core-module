@@ -154,9 +154,14 @@ impl HeaderChain {
         Self { net, base: height, hashes: vec![header.block_hash()], work: vec![header.work()], headers: vec![header] }
     }
 
-    /// Rebuilds a stored chain, keeping only the valid prefix from the checkpoint.
+    /// Rebuilds a stored chain, keeping only the valid prefix from the network's checkpoint.
     pub fn restore(net: BNetwork, stored: impl IntoIterator<Item = (u32, Header)>, now: u32) -> Self {
-        let mut chain = Self::new(net);
+        Self::restore_from(net, net.checkpoint(), stored, now)
+    }
+
+    /// Rebuilds a stored chain from `cp`, keeping only the valid prefix.
+    pub fn restore_from(net: BNetwork, cp: crate::network::Checkpoint, stored: impl IntoIterator<Item = (u32, Header)>, now: u32) -> Self {
+        let mut chain = Self::from_checkpoint(net, cp.height, cp.header);
         let mut branch = vec![];
         for (h, header) in stored {
             if h <= chain.base {

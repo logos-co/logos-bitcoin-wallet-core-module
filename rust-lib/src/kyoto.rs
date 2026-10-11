@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use bdk_kyoto::bip157::{self, AddrV2, Builder, HashCheckpoint, Header, Info, ServiceFlags, TrustedPeer, Warning};
 use bdk_kyoto::builder::BuilderExt;
 use bdk_kyoto::{Requester, SyncConfig};
+use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
 use bdk_wallet::{KeychainKind, Update, Wallet};
 use bitcoin::BlockHash;
 use rand::seq::SliceRandom;
@@ -27,6 +28,8 @@ pub const FAILS_TO_SKIP: u32 = 3;
 pub const SKIP_SECS: u64 = 24 * 3600;
 /// bdk_wallet's lookahead: bdk_kyoto watches the revealed addresses plus this many, fixed at build.
 pub const LOOKAHEAD: u32 = 25;
+/// A first sync hands over what it found every this many filters, so a lost peer set resumes there.
+pub const CHECKPOINT_FILTERS: u32 = 2_016;
 /// Kyoto restarts this far below the last height it scanned, for a reorg since.
 pub const RESTART_DEPTH: u32 = 8;
 
@@ -166,19 +169,27 @@ impl PeerBook {
         self.peers.remove(peer);
     }
 
+    /// Skips `peer` for a day at once: it took part in a filter-header conflict.
+    pub fn skip(&mut self, peer: &str, now: u64) {
+        let h = self.peers.entry(peer.to_string()).or_default();
+        (h.fails, h.skip_until) = (0, now + SKIP_SECS);
+    }
+
     pub fn skipped(&self, now: u64) -> usize {
         self.peers.values().filter(|h| h.skip_until > now).count()
     }
 }
 
-/// Kyoto's quorum: 3 peers on mainnet, 2 elsewhere; never more than the peers it may dial.
+/// Kyoto's quorum: 3 peers on mainnet and 2 on signet, however few it may dial; on testnet4 and
+/// regtest, 2 (regtest: as configured) or as many as it may dial, down to 1.
 pub fn required(net: BNetwork, regtest: Option<u8>, peers: usize) -> u8 {
-    let want = match net {
+    let dialable = peers.clamp(1, u8::MAX as usize) as u8;
+    match net {
         BNetwork::Mainnet => 3,
-        BNetwork::Regtest => regtest.unwrap_or(2),
-        _ => 2,
-    };
-    want.min(peers.clamp(1, u8::MAX as usize) as u8).max(1)
+        BNetwork::Signet => 2,
+        BNetwork::Testnet4 => 2.min(dialable),
+        BNetwork::Regtest => regtest.unwrap_or(2).min(dialable).max(1),
+    }
 }
 
 /// How long a peer has, per step: Tor circuits take seconds where a LAN takes milliseconds.
@@ -218,11 +229,14 @@ pub struct Start {
 
 /// What a running client reports to the sync thread.
 pub enum Feed {
-    /// Filters are synced: the wallet's transactions since the last update, and Kyoto's chain.
-    Update(Box<Update>),
+    /// The wallet's transactions since the last update and Kyoto's chain, with the height of the
+    /// last filter checked, and whether that is the tip or a checkpoint on the way there.
+    Update { update: Box<Update>, scanned: Option<u32>, synced: bool },
     /// The share of filter headers and filters done, and Kyoto's header height.
     Progress { fraction: f32, height: u32 },
     Warning(String),
+    /// Peers sent conflicting filter headers; bip157 disconnected one of them and can't say which lied.
+    Conflict,
     /// The node stopped: it ran out of peers, or was told to.
     Stopped(Option<String>),
 }
@@ -246,26 +260,33 @@ pub struct Client {
     pub requester: Requester,
     feed: Receiver<Feed>,
     rt: Option<tokio::runtime::Runtime>,
-    /// The subset this start dials, those named on the user's network, and those seen connected.
+    /// The subset this start dials, those named on the user's network, those seen connected, and
+    /// those connected at the last look.
     pub peers: Vec<String>,
     lan: HashSet<String>,
     seen: Arc<Mutex<HashSet<String>>>,
+    now: Arc<Mutex<Vec<String>>>,
     connected: Arc<Mutex<usize>>,
     best_header: Arc<Mutex<u32>>,
     /// The wallet's last revealed indices when the client cloned its address index.
     pub revealed: [Option<u32>; 2],
+    /// The highest index of each keychain this client watched from its first filter.
+    pub window: [u32; 2],
     pub start: Start,
     pub started: Instant,
+    /// An update came, at a checkpoint or the tip; one came with filters synced to the tip.
     pub updated: bool,
+    pub synced: bool,
 }
 
 const KEYCHAINS: [KeychainKind; 2] = [KeychainKind::External, KeychainKind::Internal];
 
 impl Client {
     /// Builds and starts a client for `wallet`, dialling `peers` on `route`; `wake` is set when
-    /// an update or a stop waits for the sync thread.
+    /// an update or a stop waits for the sync thread. It watches each keychain's revealed index
+    /// plus `lookahead`.
     #[allow(clippy::too_many_arguments)]
-    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, lookahead: u32, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
         let net = wallet.network();
         let default_port = match net {
             bitcoin::Network::Bitcoin => 8333,
@@ -301,9 +322,11 @@ impl Client {
             b = b.headers_only_sync();
         }
         let cp = HashCheckpoint::new(start.from.0, start.from.1);
-        let config = SyncConfig::wallet_recovery_sync(cp, LOOKAHEAD).build();
+        let lookahead = lookahead.max(LOOKAHEAD);
+        let config = SyncConfig::wallet_recovery_sync(cp, lookahead).build();
         let client = b.build_with_wallet(wallet, config).map_err(|e| e.to_string())?;
         let revealed = KEYCHAINS.map(|k| wallet.derivation_index(k));
+        let window = revealed.map(|r| r.unwrap_or(0) + lookahead - 1);
         let (client, logging, mut updates) = client.subscribe();
         let (client, node) = client.managed_start();
         let requester = client.requester();
@@ -316,9 +339,10 @@ impl Client {
             woken.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         let updated = tx.clone();
+        updates.checkpoint_every(CHECKPOINT_FILTERS);
         rt.spawn(async move {
             while let Ok(u) = updates.update().await {
-                if updated.send(Feed::Update(Box::new(u))).is_err() {
+                if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), synced: updates.synced() }).is_err() {
                     break;
                 }
                 wake.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -326,16 +350,20 @@ impl Client {
         });
         rt.spawn(drain_logs(logging, tx.clone()));
         let (seen, connected, best_header) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)), Arc::new(Mutex::new(start.from.0)));
-        rt.spawn(watch_peers(requester.clone(), dial.clone(), seen.clone(), connected.clone(), best_header.clone()));
+        let now = Arc::new(Mutex::new(vec![]));
+        rt.spawn(watch_peers(requester.clone(), dial.clone(), Watched { seen: seen.clone(), now: now.clone(), connected: connected.clone(), best_header: best_header.clone() }));
         tracing::info!(target: "bitcoin", "kyoto: started after {} with {} peers, quorum {required}{}", start.from.0, dial.len(), if start.headers_only { ", headers first" } else { "" });
         let lan = dial.iter().filter(|(_, p)| matches!(p, Peer::Lan(..))).map(|(t, _)| t.clone()).collect();
-        Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, connected, best_header, revealed, start, started: Instant::now(), updated: false })
+        Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, now, connected, best_header, revealed, window, start, started: Instant::now(), updated: false, synced: false })
     }
 
     pub fn poll(&mut self) -> Vec<Feed> {
         let out: Vec<Feed> = self.feed.try_iter().collect();
-        if out.iter().any(|f| matches!(f, Feed::Update(_))) {
-            self.updated = true;
+        for f in &out {
+            if let Feed::Update { synced, .. } = f {
+                self.updated = true;
+                self.synced |= *synced;
+            }
         }
         out
     }
@@ -360,10 +388,16 @@ impl Client {
         self.seen.lock().unwrap().iter().cloned().collect()
     }
 
+    /// The peers of this start connected at the last look, once a second.
+    pub fn connected_now(&self) -> Vec<String> {
+        self.now.lock().unwrap().clone()
+    }
+
     /// The wallet revealed an address past what the client watches: it must be rebuilt.
     pub fn needs_rebuild(&self, wallet: &Wallet) -> bool {
-        KEYCHAINS.iter().zip(self.revealed).any(|(k, at_build)| past_lookahead(at_build, wallet.derivation_index(*k)))
+        KEYCHAINS.iter().zip(self.window).any(|(k, w)| wallet.derivation_index(*k).is_some_and(|i| i > w))
     }
+
 
     /// Stops the node and every task of its runtime, peers included; nothing waits.
     pub fn stop(mut self) {
@@ -384,13 +418,33 @@ impl Drop for Client {
     }
 }
 
-/// bdk_kyoto watches indices up to the revealed one plus `LOOKAHEAD - 1`, as of its build.
-pub fn past_lookahead(at_build: Option<u32>, now: Option<u32>) -> bool {
-    match now {
-        Some(n) => n > at_build.unwrap_or(0) + LOOKAHEAD - 1,
-        None => false,
+
+/// The highest used index of each keychain a gap-limit scan reaches: from 0, never past `gap`
+/// unused addresses in a row. A payment further out doesn't widen a scan.
+pub fn reachable_used(index: &KeychainTxOutIndex<KeychainKind>, gap: u32) -> BTreeMap<KeychainKind, u32> {
+    let mut out = BTreeMap::new();
+    for k in KEYCHAINS {
+        let (mut last, mut i) = (None::<u32>, 0u32);
+        while i <= last.map_or(gap.saturating_sub(1), |l| l.saturating_add(gap)) {
+            if index.is_used(k, i) {
+                last = Some(i);
+            }
+            i += 1;
+        }
+        out.extend(last.map(|l| (k, l)));
     }
+    out
 }
+
+/// The lookahead for a scan again when a used index comes within `gap` of `window`, the highest
+/// index watched per keychain from the first block (README, "Kyoto"); `None` when it held.
+pub fn rescan_lookahead(window: [u32; 2], used: &BTreeMap<KeychainKind, u32>, gap: u32) -> Option<u32> {
+    let near = KEYCHAINS.iter().zip(window).any(|(k, w)| used.get(k).is_some_and(|u| u + gap > w));
+    near.then(|| used.values().copied().max().unwrap_or(0) + LOOKAHEAD + 1)
+}
+
+/// bip157's warning when two peers' filter headers disagree (node.rs, `CFHeaderChanges::Conflict`).
+const FILTER_HEADER_CONFLICT: &str = "conflict while peers are sending filter headers";
 
 async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>) {
     // A first sync reports progress thousands of times: the latest goes out every 250 ms.
@@ -414,6 +468,12 @@ async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>) {
                 None => return,
             },
             warn = logs.warning_subscriber.recv() => match warn {
+                Some(Warning::UnexpectedSyncError { warning }) if warning.contains(FILTER_HEADER_CONFLICT) => {
+                    tracing::info!(target: "bitcoin", "kyoto: {warning}");
+                    if tx.send(Feed::Conflict).is_err() {
+                        return;
+                    }
+                }
                 Some(w @ (Warning::UnexpectedSyncError { .. } | Warning::PotentialStaleTip | Warning::UnsolicitedMessage | Warning::TransactionRejected { .. })) => {
                     tracing::info!(target: "bitcoin", "kyoto: {w}");
                     if tx.send(Feed::Warning(w.to_string())).is_err() {
@@ -427,11 +487,19 @@ async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>) {
     }
 }
 
-async fn watch_peers(requester: Requester, dial: Vec<(String, Peer)>, seen: Arc<Mutex<HashSet<String>>>, connected: Arc<Mutex<usize>>, best_header: Arc<Mutex<u32>>) {
+/// What `watch_peers` keeps up to date for the sync thread.
+struct Watched {
+    seen: Arc<Mutex<HashSet<String>>>,
+    now: Arc<Mutex<Vec<String>>>,
+    connected: Arc<Mutex<usize>>,
+    best_header: Arc<Mutex<u32>>,
+}
+
+async fn watch_peers(requester: Requester, dial: Vec<(String, Peer)>, w: Watched) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Ok(Ok(tip)) = tokio::time::timeout(Duration::from_secs(2), requester.chain_tip()).await {
-            *best_header.lock().unwrap() = tip.height;
+            *w.best_header.lock().unwrap() = tip.height;
         }
         let Ok(Ok(info)) = tokio::time::timeout(Duration::from_secs(2), requester.peer_info()).await else {
             if !requester.is_running() {
@@ -439,20 +507,43 @@ async fn watch_peers(requester: Requester, dial: Vec<(String, Peer)>, seen: Arc<
             }
             continue;
         };
-        *connected.lock().unwrap() = info.len();
-        let mut s = seen.lock().unwrap();
-        for (addr, _) in &info {
-            for (text, p) in &dial {
-                if p.is(addr) {
-                    s.insert(text.clone());
-                }
-            }
-        }
+        *w.connected.lock().unwrap() = info.len();
+        let now: Vec<String> = dial.iter().filter(|(_, p)| info.iter().any(|(addr, _)| p.is(addr))).map(|(t, _)| t.clone()).collect();
+        w.seen.lock().unwrap().extend(now.iter().cloned());
+        *w.now.lock().unwrap() = now;
     }
 }
 
 /// Headers read from Kyoto per round trip to the runtime; the caller can stop between chunks.
 const HEADERS_PER_CHUNK: usize = 500;
+
+/// Kyoto's headers from `from` through `to`, as its chain holds them now, for the authority to
+/// check while Kyoto is still syncing headers.
+pub fn headers_at(rt: &tokio::runtime::Handle, requester: &Requester, from: u32, to: u32, stop: &std::sync::atomic::AtomicBool) -> Result<Vec<Header>, String> {
+    let mut out = Vec::with_capacity(to.saturating_sub(from) as usize + 1);
+    let mut h = from;
+    while h <= to {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("stopping".into());
+        }
+        let end = to.min(h + HEADERS_PER_CHUNK as u32 - 1);
+        let r = requester.clone();
+        let got = rt.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(30), async move {
+                let mut got = Vec::with_capacity((end - h + 1) as usize);
+                for at in h..=end {
+                    got.push(r.get_header(at).await.map_err(|e| e.to_string())?.ok_or_else(|| format!("Kyoto has no header at {at}"))?.header);
+                }
+                Ok::<_, String>(got)
+            })
+            .await
+            .map_err(|_| "Kyoto took too long to hand over its headers".to_string())?
+        })?;
+        out.extend(got);
+        h = end + 1;
+    }
+    Ok(out)
+}
 
 /// Kyoto's headers at `wanted`, read from its chain; each must hash as named. Stops early, with
 /// an error, when `stop` is set.
@@ -606,7 +697,11 @@ mod tests {
     fn the_quorum_follows_the_network_and_the_peers() {
         assert_eq!(required(BNetwork::Mainnet, None, 8), 3);
         assert_eq!(required(BNetwork::Signet, None, 8), 2);
-        assert_eq!(required(BNetwork::Mainnet, None, 1), 1, "the user's own node alone");
+        assert_eq!(required(BNetwork::Mainnet, None, 1), 3, "mainnet never runs below its quorum");
+        assert_eq!(required(BNetwork::Signet, None, 1), 2);
+        assert_eq!(required(BNetwork::Testnet4, None, 8), 2);
+        assert_eq!(required(BNetwork::Testnet4, None, 1), 1, "testnet4's one listed peer decides alone");
+        assert_eq!(required(BNetwork::Testnet4, None, 0), 1);
         assert_eq!(required(BNetwork::Regtest, Some(3), 3), 3);
         assert_eq!(required(BNetwork::Regtest, None, 0), 1);
         assert_eq!(timeouts(Route::Tor).handshake, Duration::from_secs(30));
@@ -617,14 +712,38 @@ mod tests {
     }
 
     #[test]
-    fn a_rebuild_comes_when_revealed_addresses_pass_the_watched_ones() {
-        // Built on a fresh wallet: indices 0..=24 are watched.
-        assert!(!past_lookahead(None, None));
-        assert!(!past_lookahead(None, Some(24)));
-        assert!(past_lookahead(None, Some(25)));
-        assert!(past_lookahead(Some(0), Some(29)), "30 addresses revealed");
-        assert!(!past_lookahead(Some(10), Some(34)));
-        assert!(past_lookahead(Some(10), Some(35)));
+    fn only_addresses_a_gap_limit_scan_reaches_widen_a_scan() {
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let w = bdk_wallet::Wallet::create(format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"))
+            .network(bitcoin::Network::Regtest)
+            .create_wallet_no_persist()
+            .unwrap();
+        let mut index = w.spk_index().clone();
+        for k in KEYCHAINS {
+            let _ = index.lookahead_to_target(k, 400);
+        }
+        assert!(reachable_used(&index, 20).is_empty());
+        index.mark_used(KeychainKind::External, 25);
+        assert!(reachable_used(&index, 20).is_empty(), "the first 20 hold nothing used: 25 is out of reach");
+        for i in [0, 15, 35, 50, 313] {
+            index.mark_used(KeychainKind::External, i);
+        }
+        index.mark_used(KeychainKind::Internal, 3);
+        let used = reachable_used(&index, 20);
+        assert_eq!((used[&KeychainKind::External], used[&KeychainKind::Internal]), (50, 3), "313 lies past 20 unused after 50");
+        assert_eq!(rescan_lookahead([315, 315], &used, 20), None, "a far payment doesn't widen the scan");
+    }
+
+    #[test]
+    fn a_used_index_near_the_window_starts_the_scan_over() {
+        let used = |e: u32, i: Option<u32>| BTreeMap::from_iter([(KeychainKind::External, e)].into_iter().chain(i.map(|i| (KeychainKind::Internal, i))));
+        // A fresh restore watches 0..=24 of each keychain.
+        assert_eq!(rescan_lookahead([24, 24], &used(4, Some(1)), 20), None, "index 4 plus the gap is still watched");
+        assert_eq!(rescan_lookahead([24, 24], &used(5, None), 20), Some(31), "within the gap: scan again, twice as wide");
+        assert_eq!(rescan_lookahead([24, 24], &used(0, Some(9)), 20), Some(35), "change addresses count too");
+        // The next window, 2 x 38 + 25, holds signet's receive index 38 with room to spare.
+        assert_eq!(rescan_lookahead([38 + 64 - 1, 38 + 64 - 1], &used(38, Some(56)), 20), None);
+        assert_eq!(rescan_lookahead([24, 24], &BTreeMap::new(), 20), None, "nothing used yet");
     }
 
     #[test]
