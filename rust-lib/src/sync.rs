@@ -163,6 +163,8 @@ struct Loop {
     kyoto_status: KyotoStatus,
     /// The headers-only phase of a first start: the rescan from the birthday waits for its headers.
     kyoto_rescan: Option<u32>,
+    /// A rescan was asked for and its update hasn't come yet.
+    kyoto_scanning: bool,
     node: Option<Follower>,
     node_ok: bool,
     node_probe: Option<Instant>,
@@ -485,6 +487,7 @@ impl Loop {
         }
         c.stop();
         self.kyoto_rescan = None;
+        self.kyoto_scanning = false;
         self.kyoto_status.running = false;
         self.kyoto_status.connected = 0;
         self.ctx.netstate.lock().kyoto = None;
@@ -514,7 +517,7 @@ impl Loop {
             let started = {
                 let guard = self.ctx.cell.lock();
                 match guard.as_ref() {
-                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start),
+                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, self.ctx.wake.clone()),
                     None => Err("closed".into()),
                 }
             };
@@ -577,7 +580,8 @@ impl Loop {
         if let Some(c) = &self.kyoto {
             self.kyoto_status.connected = c.connected();
             self.kyoto_status.headers = self.kyoto_status.headers.max(c.best_header());
-            self.kyoto_status.phase = kyoto::phase(c.updated && self.kyoto_rescan.is_none(), self.kyoto_status.progress);
+            let scanned = c.updated && self.kyoto_rescan.is_none() && !self.kyoto_scanning;
+            self.kyoto_status.phase = kyoto::phase(scanned, self.kyoto_status.progress);
             self.authority.set_peers(c.connected() as u32);
         }
         self.kyoto_status.skipped = self.kyoto_book.skipped(now);
@@ -634,6 +638,7 @@ impl Loop {
                 let _ = requester.rescan_from(h);
                 tracing::info!(target: "bitcoin", "kyoto: headers synced; scanning filters after {h}");
                 self.kyoto_rescan = None;
+                self.kyoto_scanning = true;
             }
         } else {
             // Kyoto's blocks below the wallet's checkpoint are named by Kyoto itself.
@@ -645,6 +650,7 @@ impl Loop {
                     }
                 }
             }
+            self.kyoto_scanning = false;
             found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: tip.map(|t| (KYOTO_SCANNED, t)) });
         }
         Ok((change, found))
@@ -730,8 +736,8 @@ impl Loop {
         }
         cell.persist()?;
         drop(guard);
+        // A history server's own full scan still runs: full_scan_done is the servers' flag.
         let mut p = self.ctx.progress.lock();
-        p.full_scan_done = true;
         p.synced_tip = self.authority.tip_height();
         p.last_history_sync = Some(now);
         p.history_server = Some(f.source.to_string());
@@ -1145,14 +1151,10 @@ impl Loop {
         self.last_expiry = Some(Instant::now());
     }
 
-    /// History comes from servers when they feed the chain, or when Kyoto has had no peer for a
-    /// while and a server is enabled for history.
+    /// Servers sync history only when the person enabled one for it: alongside Kyoto or the node,
+    /// for pending payments, their anchors checked against the authority's headers.
     fn servers_hold_history(&self) -> bool {
-        match self.feeder {
-            Feeder::Servers => true,
-            Feeder::Node => false,
-            Feeder::Kyoto => self.kyoto_status.connected == 0 && self.kyoto_status.restarts >= 3,
-        }
+        !self.ctx.netstate.lock().routes.history.is_empty()
     }
 
     fn run(&mut self) {
@@ -1170,8 +1172,6 @@ impl Loop {
                 break;
             }
             let woken = self.ctx.wake.swap(false, Ordering::SeqCst);
-            // Kyoto and the node find the wallet's transactions themselves; servers enabled for
-            // history stand by for when they can't.
             if self.servers_hold_history() && (moved || woken || self.last_history.is_none_or(|t| t.elapsed() >= history_every)) {
                 if let Err(e) = self.sync_history() {
                     tracing::info!(target: "bitcoin", "history: {e}");
@@ -1254,6 +1254,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             kyoto_backoff: Duration::from_secs(2),
             kyoto_status: KyotoStatus::default(),
             kyoto_rescan: None,
+            kyoto_scanning: false,
             node: None,
             node_ok: false,
             node_probe: None,

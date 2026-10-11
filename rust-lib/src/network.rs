@@ -92,6 +92,9 @@ pub struct RegtestConfig {
     /// Kyoto's quorum; 2 by default.
     #[serde(default)]
     pub kyoto_required: Option<u8>,
+    /// The servers only cross-check and estimate fees: nothing syncs history from them.
+    #[serde(default)]
+    pub check_only: bool,
 }
 
 static REGTEST: OnceLock<RegtestConfig> = OnceLock::new();

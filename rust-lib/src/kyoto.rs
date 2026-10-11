@@ -260,8 +260,10 @@ pub struct Client {
 const KEYCHAINS: [KeychainKind; 2] = [KeychainKind::External, KeychainKind::Internal];
 
 impl Client {
-    /// Builds and starts a client for `wallet`, dialling `peers` on `route`.
-    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start) -> Result<Client, String> {
+    /// Builds and starts a client for `wallet`, dialling `peers` on `route`; `wake` is set when
+    /// an update or a stop waits for the sync thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
         let net = wallet.network();
         let default_port = match net {
             bitcoin::Network::Bitcoin => 8333,
@@ -303,10 +305,11 @@ impl Client {
         let requester = client.requester();
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("bitcoin-kyoto").enable_all().build().map_err(|e| e.to_string())?;
         let (tx, feed) = channel::<Feed>();
-        let stopped = tx.clone();
+        let (stopped, woken) = (tx.clone(), wake.clone());
         rt.spawn(async move {
             let why = node.run().await.err().map(|e| e.to_string());
             let _ = stopped.send(Feed::Stopped(why));
+            woken.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         let updated = tx.clone();
         rt.spawn(async move {
@@ -314,6 +317,7 @@ impl Client {
                 if updated.send(Feed::Update(Box::new(u))).is_err() {
                     break;
                 }
+                wake.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
         rt.spawn(drain_logs(logging, tx.clone()));

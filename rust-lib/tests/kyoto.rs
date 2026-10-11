@@ -43,6 +43,7 @@ fn kyoto_is_the_authority_on_regtest() {
         kyoto: proxies.iter().map(|p| p.addr.to_string()).collect(),
         // One electrs only to be checked against Kyoto's headers; Kyoto finds the payments.
         electrum: electrum.into_iter().collect(),
+        check_only: true,
         poll_secs: Some(1),
         // All three peers connected, so the forging one is always asked.
         kyoto_required: Some(3),
@@ -211,7 +212,7 @@ fn kyoto_first_sync_on_a_long_chain() {
     let miner = t.wallet_rpc("getnewaddress", json!(["mine"]));
     let mut left = blocks.saturating_sub(have);
     while left > 0 {
-        let n = left.min(1_000);
+        let n = left.min(200);
         t.rpc("generatetoaddress", json!([n, miner]));
         left -= n;
     }
@@ -224,5 +225,103 @@ fn kyoto_first_sync_on_a_long_chain() {
     t.synced();
     t.wait("the payment found", 600, || t.row(&paid)["state"] == "confirmed");
     println!("KYOTO first sync of {} blocks in {} ms", t.tip(), started.elapsed().as_millis());
+    t.engine.shutdown();
+}
+
+/// Routes as bitcoin_node_module would give them: Kyoto only, through Tor, these peers.
+struct KyotoOnly(String);
+
+impl bitcoin_wallet_core::sync::RouteSource for KyotoOnly {
+    fn route_table(&self, _network: &str) -> Result<String, String> {
+        Ok(self.0.clone())
+    }
+}
+
+/// Kyoto on live signet through Tor, from the peer-list crawler's onion peers: a wallet with a
+/// recent birthday syncs headers from the checkpoint, then scans filters from the birthday.
+/// LIVE_PEERS (comma-separated host:port), LIVE_PROXY (socks5h://, an IsolateDestAddr port),
+/// LIVE_BIRTHDAY (a height).
+#[test]
+#[ignore]
+fn kyoto_on_live_signet() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+    let (Ok(peers), Ok(proxy)) = (std::env::var("LIVE_PEERS"), std::env::var("LIVE_PROXY")) else {
+        eprintln!("skipped: LIVE_PEERS and LIVE_PROXY are not set");
+        return;
+    };
+    let birthday: u32 = std::env::var("LIVE_BIRTHDAY").ok().and_then(|b| b.parse().ok()).unwrap_or(325_000);
+    let peers: Vec<&str> = peers.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let kyoto = json!({"id": "kyoto", "kind": "kyoto", "url": "p2p://peer-list", "operator": "peers", "route": "onion"});
+    let table = json!({"ok": true, "network": "signet", "proxy": proxy, "chain": [kyoto], "history": [kyoto], "broadcast": [kyoto],
+        "pending": [], "fees": [], "check": [], "peers": peers, "crossCheck": false}).to_string();
+    let (sink, _events) = collecting();
+    let manager = Arc::new(MockManager::new(Duration::from_millis(100)));
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::new(root.path().join("wallets"), sink, manager, Some(Arc::new(KyotoOnly(table))));
+    let started = Instant::now();
+    let r = engine.start_job("open_wallet", &json!({"network": "signet", "family": "bitcoin", "birthday": birthday}).to_string());
+    let (id, receipt) = (r["jobId"].as_str().unwrap().to_string(), r["receipt"].as_str().unwrap().to_string());
+    while engine.jobs().status(&id, &receipt)["state"] != "done" {
+        assert!(started.elapsed() < Duration::from_secs(60), "{}", engine.jobs().status(&id, &receipt));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut last = String::new();
+    loop {
+        let st = engine.status();
+        let line = format!("{} kyoto {} headers {} progress {:.2} connected {} restarts {} authority {}",
+            st["state"], st["kyoto"]["phase"], st["kyoto"]["headers"], st["kyoto"]["progress"].as_f64().unwrap_or(0.0),
+            st["kyoto"]["connected"], st["kyoto"]["restarts"], st["authority"]["height"]);
+        if line != last {
+            println!("LIVE {:>5} s: {line}", started.elapsed().as_secs());
+            last = line;
+        }
+        if st["synced"] == true {
+            println!("LIVE synced to {} in {} s", st["authority"]["height"], started.elapsed().as_secs());
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(3 * 3600), "no sync in 3 hours: {st}");
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    engine.shutdown();
+}
+
+/// Kyoto as the authority with an Electrum server enabled for history: pending payments come
+/// from the server, its anchors checked against Kyoto's headers. Run alone, after the main test.
+#[test]
+#[ignore]
+fn kyoto_with_a_history_server() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+    let Some((rpc, cookie)) = common::chain_env() else {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    };
+    let electrum = std::env::var("REGTEST_ELECTRUM").expect("REGTEST_ELECTRUM");
+    let nodes: Vec<String> = chain(&["peers"]).trim().split(',').map(str::to_string).collect();
+    configure_regtest(RegtestConfig {
+        kyoto: nodes,
+        electrum: vec![format!("tcp://{}", electrum.split(',').next().unwrap().trim().trim_start_matches("tcp://"))],
+        poll_secs: Some(1),
+        kyoto_required: Some(2),
+        ..Default::default()
+    });
+    let (sink, events) = collecting();
+    let manager = Arc::new(MockManager::new(Duration::from_millis(100)));
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::new(root.path().join("wallets"), sink, manager.clone(), None);
+    let t = T { engine, rpc, cookie, events, manager };
+    t.job("open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+    t.synced();
+    assert_eq!(t.engine.status()["authority"]["kind"], "kyoto");
+    let addr = t.engine.next_address()["address"].as_str().unwrap().to_string();
+    let paid = t.fund(&addr, 0.07).to_string();
+    t.wait("the payment as pending, from the server", 60, || t.row(&paid)["state"] == "pending");
+    assert_eq!(t.row(&paid)["reportedBy"], "electrum-0");
+    t.mine(1);
+    t.synced();
+    t.wait("the payment confirmed on Kyoto's chain", 90, || t.row(&paid)["state"] == "confirmed");
+    assert_eq!(t.row(&paid)["height"].as_u64(), Some(t.tip()));
+    let exposure = t.engine.exposure();
+    assert!(exposure["servers"].as_array().unwrap().iter().any(|s| s["source"] == "electrum-0"), "{exposure}");
+    println!("KYOTO with a history server: pending from electrum-0, confirmed at {}", t.tip());
     t.engine.shutdown();
 }

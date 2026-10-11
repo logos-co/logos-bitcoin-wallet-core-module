@@ -65,7 +65,8 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   `estimatesmartfee` and `getnetworkinfo`'s relay fee.
 - The module's allowlist lacks two methods the Emitter calls: `getblockcount` is answered from
   `getblockchaininfo`, and `getrawtransaction` reads as "not found". So the node's mempool shows only
-  the wallet's own transactions; pending incoming payments need a server enabled for pending.
+  the wallet's own transactions; pending incoming payments need a server enabled for history, which
+  syncs alongside the node as it does alongside Kyoto.
 
 ### Kyoto
 
@@ -97,8 +98,15 @@ bdk_kyoto 0.18.0 on bip157 0.7.0 (published from 0169dc3) with four patches, bel
   asks for the transaction within 20 s; past that it is `unknown`. The peers' minimum relay fee is the
   fee floor. Kyoto has no fee estimates and no mempool view.
 - Servers in the `check` role are cross-checked against Kyoto's headers: tips, the hash at the
-  lower tip, a random header. Servers enabled for history stand by, asked only once Kyoto has had no
-  peer through 3 restarts.
+  lower tip, a random header. A server the person enabled for history still syncs alongside, which
+  gives pending payments; its anchors are checked against Kyoto's headers, held above Kyoto's tip.
+- Each client runs on a tokio runtime of its own, shut down when it stops: bip157 spawns a task per
+  peer, and once its node is dropped those tasks spin on a closed channel for up to the two-hour
+  connection limit (135% CPU after one rebuild, before this).
+- `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, headers, progress,
+  connected, dialled, skipped, restarts, rebuilds, lastWarning, lastStop }`. Kyoto counts progress by
+  finished batches, so a catch-up within one batch reads `syncing` until its filters are in;
+  `headers` is Kyoto's best header.
 
 ### Kyoto patches
 
@@ -189,13 +197,13 @@ Amounts are decimal strings of satoshis.
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below |
 | `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
-| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind, height, hash, tipAgeSecs, peers }, synced, busy, needsBirthday, birthday, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour |
+| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers }, kyoto, node: { blocks, headers, initialSync, synced }, synced, busy, needsBirthday, birthday, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour |
 | `balance()` | `{ confirmed, waiting, pending, sent, immature, tooSmall: { count, sat } }`; empty strings while busy |
 | `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once 20 stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
-| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, confirmations, time, state: confirmed\|waiting\|pending\|sent\|replaced, replaces, replacedBy, reportedBy }` |
+| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, confirmations, time, state: confirmed\|waiting\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState }`; `sendState` is the wallet's own send record's state |
 | `fee_rates()` | `{ fast, normal, slow, minimum, sources }` sat/vB: the median of the fee sources, never below the highest minimum relay fee |
 | `address_valid(text, network)` | An address or BIP21 URI: `{ valid, address, type, amountSat?, label?, message? }` |
-| `sources_status()`, `exposure()` | Per source health and verdicts; the servers that learned the addresses |
+| `sources_status()`, `exposure()` | `{ chainBy, local, kyoto: { id, route, peers, down }, sources }`: who feeds the chain and per server health and verdicts; the servers that learned the addresses |
 | `preview(previewId)` | The preview, its state and `approvalHandle` |
 | `list_wallets(network)` | The wallets on disk: `{ group, family, network, createdAt }` |
 | `descriptors()` | Backend only: the public descriptors, as the keystore gave them |
@@ -213,7 +221,8 @@ Amounts are decimal strings of satoshis.
 | `abandon_send` | Backend only. `{ txid }` → unlocks a sent transaction's inputs |
 
 Events: `walletStateChanged` (status's shape), `jobFinished(jobId, state)`, and
-`sourceAlert` (`{ source, kind: suspect|stale|authority_behind|anchor_mismatch, detail, at }`).
+`sourceAlert` (`{ source, kind: suspect|stale|authority_behind|anchor_mismatch|authority_suspect, detail,
+at }`); `authority_suspect` is Kyoto naming a chain the checks refuse, with `source: "kyoto"`.
 
 The core never takes a password, phrase or key; a unit test reads the contract and fails on a
 parameter named like one. Callers other than `bitcoin_wallet_backend` are refused on the
@@ -242,7 +251,7 @@ way.
 
 On regtest, `regtest.json` in the persistence directory gives loopback sources instead:
 `{ "electrum": ["tcp://127.0.0.1:60601", ...], "esplora": [], "kyoto": ["127.0.0.1:18544", ...],
-"local": false, "kyotoRequired": 2, "pollSecs": 1 }`.
+"local": false, "kyotoRequired": 2, "checkOnly": false, "pollSecs": 1 }`.
 
 ## Persistence
 
@@ -300,7 +309,7 @@ successful broadcast answers busy five times; the job still answers the txid, th
 record survives a reopen with its coins out of reach, and `rebroadcast` and `bump_fee` both find
 the transaction.
 
-`kyoto`, with Kyoto as the authority and one electrs only cross-checked: Kyoto's peers sit behind
+`kyoto`, with Kyoto as the authority and one electrs only cross-checked (`checkOnly`): Kyoto's peers sit behind
 `examples/p2p_proxy.rs`, which forwards, delays answers, goes down, or forges one block's filter
 header and filter and sends the forged batch five times, enough for a quorum of three without
 patch 1; the test connects all three peers. It receives, sends through Kyoto's
@@ -309,7 +318,10 @@ peers and confirms; re-anchors across a reorg; rebuilds the client after 30 addr
 goes down, and finds the payment made meanwhile; and holds out against a forging peer that answers
 first: no update ever hides the payment, which confirms once the forger stops. Against bip157
 without patch 1, the same step fails: the wallet reports synced at the block with the payment
-missing. `kyoto_first_sync_on_a_long_chain` (run alone) times a first sync of `KYOTO_BLOCKS` blocks.
+missing. Run alone after it, `kyoto_with_a_history_server` adds an electrs enabled for history:
+the payment shows pending from it, then confirms on Kyoto's chain. `kyoto_first_sync_on_a_long_chain`
+times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_live_signet` syncs signet through Tor from
+`LIVE_PEERS`.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.
@@ -328,8 +340,16 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
 - `local-node.sh`: the real `bitcoind_module` (libbitcoind_c, Core in-process) on regtest as the
   authority: a coinbase received and matured, a send through its `sendrawtransaction`, confirmed.
 
+Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of 20 unloads within
+2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians
+0.27 s) and 0.12–0.13 s on Linux; the module's own `about_to_unload`, 10–130 ms. `local-node.sh`
+opened and synced on the node in 1.2 s, and its send went out through `sendrawtransaction`.
+
 `examples/authority.rs` syncs the Electrum header chain from the checkpoint against live servers,
-headers only: on mainnet over Tor, 35,428 headers (to 970,852) in about 40 s.
+headers only: on mainnet over Tor, 35,428 headers (to 970,852) in about 40 s. Kyoto on live signet
+over Tor, from the checkpoint (290,000) with a birthday at 325,000: headers to 325,838, then the
+birthday's filters, synced in 153 s and in 380 s on two runs, at 54–57 MB peak for the whole
+process. A first sync of 10,001 regtest blocks took 2.3 s at a 30 MB peak (Linux).
 
 ## Not yet
 

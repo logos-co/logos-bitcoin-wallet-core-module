@@ -69,7 +69,7 @@ pub trait BitcoinWalletCoreModuleEvents {
     /// status()'s shape, when what it says changes.
     fn walletStateChanged(&self, payload: String);
     fn jobFinished(&self, job_id: String, state: String);
-    /// `{ source, kind: suspect|stale|authority_behind|anchor_mismatch, detail, at }`.
+    /// `{ source, kind: suspect|stale|authority_behind|anchor_mismatch|authority_suspect, detail, at }`.
     fn sourceAlert(&self, payload: String);
 }
 

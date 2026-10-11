@@ -305,17 +305,18 @@ impl Routes {
             broadcast_by.push(Authority::Kyoto);
         }
         let authority = kyoto.is_some() || local.is_some();
+        let syncing = if cfg.check_only { vec![] } else { sources.clone() };
         Routes {
             proxy: None,
             chain: if authority { vec![] } else { sources.iter().filter(|s| s.kind == Kind::Electrum).cloned().collect() },
             fees_local: local.is_some(),
             local,
             kyoto,
-            history: sources.clone(),
-            pending: sources.clone(),
+            history: syncing.clone(),
+            pending: syncing.clone(),
             fees: sources.clone(),
             broadcast_by,
-            broadcast: sources.clone(),
+            broadcast: syncing,
             check: sources.clone(),
             cross_check: sources.len() > 1 || (authority && !sources.is_empty()),
             poll_secs: cfg.poll_secs.unwrap_or(1),
