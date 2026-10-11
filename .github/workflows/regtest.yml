@@ -1,9 +1,10 @@
 name: Bitcoin regtest
 
-# The engine end to end against tools/regtest/chain.sh: bitcoind, two electrs and a fork node,
-# with an in-process signer manager over logos-signer-interface's mock signer, and a doctoring
-# proxy in front of one electrs. Pinned nixpkgs: Bitcoin Core 31.1 and electrs 0.11.0, as in the
-# signer manager's harness.
+# The engine end to end against tools/regtest/chain.sh: three filter-serving bitcoind and two
+# electrs, with an in-process signer manager over logos-signer-interface's mock signer. One run
+# with the Electrum header chain as the authority and a doctoring proxy in front of one electrs,
+# one with Kyoto as the authority behind P2P proxies the test steers. Pinned nixpkgs: Bitcoin
+# Core 31.1 and electrs 0.11.0, as in the signer manager's harness.
 
 on:
   pull_request:
@@ -17,7 +18,7 @@ concurrency:
 
 jobs:
   regtest:
-    name: open, receive, send, bump, reorg, doctored answers
+    name: open, receive, send, bump, reorg, doctored answers, Kyoto
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,13 +55,23 @@ jobs:
           echo "ELECTRS=$(nix build $pkgs#electrs --no-link --print-out-paths)/bin/electrs" >> "$GITHUB_ENV"
           echo "CHAIN_DIR=$RUNNER_TEMP/chain" >> "$GITHUB_ENV"
 
-      - name: Run the engine on regtest
+      - name: Run the engine on regtest, the Electrum header chain the authority
         run: |
           tools/regtest/chain.sh prepare
           cd rust-lib
           REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE="$CHAIN_DIR/bitcoind/regtest/.cookie" \
           REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
-            cargo test --release --no-default-features --locked --test regtest -- --ignored --nocapture
+            cargo test --release --no-default-features --features test-hooks --locked --test regtest -- --ignored --nocapture
+
+      - name: Run the engine on regtest, Kyoto the authority
+        run: |
+          tools/regtest/chain.sh stop
+          rm -rf "$CHAIN_DIR"
+          tools/regtest/chain.sh prepare
+          cd rust-lib
+          REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE="$CHAIN_DIR/bitcoind/regtest/.cookie" \
+          REGTEST_ELECTRUM=127.0.0.1:60601 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
+            cargo test --release --no-default-features --features test-hooks --locked --test kyoto -- --ignored --nocapture
 
       - name: Stop the chain
         if: always()

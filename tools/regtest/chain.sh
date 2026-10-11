@@ -1,24 +1,28 @@
 #!/bin/bash
 # A local regtest chain for the wallet tests: bitcoind with block filters, two electrs on
-# loopback standing in for two operators, and a second bitcoind that only builds forks.
+# loopback standing in for two operators, a second bitcoind that builds forks, and a third that
+# only follows. All three serve compact block filters, as Kyoto's peers.
 #   chain.sh start               (re)start bitcoind and both electrs; makes the miner wallet
 #   chain.sh prepare             start, then mine 101 blocks so the miner can spend
 #   chain.sh mine <n> [address]  mine n blocks, to the miner or to an address
 #   chain.sh fund <address> <btc> [blocks]   pay an address from the miner, then mine
 #   chain.sh reorg [depth]       replace the tip: the fork node builds depth+1 blocks offline, then
 #                                reconnects, so the main node reorgs as it would on a live network
-#   chain.sh rpc <method> [json-params] | electrum | stop
+#   chain.sh rpc <method> [json-params] | electrum | peers | stop
 # Env: BITCOIND, ELECTRS (binaries; default: on PATH), CHAIN_DIR (state, default ./chain),
-# RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, ELECTRUM_PORTS (two, comma-separated). Ports
-# avoid the regtest defaults, so another regtest node on this machine is left alone.
+# RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, PEER_RPC_PORT, PEER_P2P_PORT, ELECTRUM_PORTS
+# (two, comma-separated). Ports avoid the regtest defaults, so another regtest node is left alone.
 set -u
 C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
 BITCOIND="${BITCOIND:-bitcoind}"; ELECTRS="${ELECTRS:-electrs}"
 RPC_PORT="${RPC_PORT:-18543}"; P2P_PORT="${P2P_PORT:-18544}"
 FORK_RPC_PORT="${FORK_RPC_PORT:-18553}"; FORK_P2P_PORT="${FORK_P2P_PORT:-18554}"
+PEER_RPC_PORT="${PEER_RPC_PORT:-18563}"; PEER_P2P_PORT="${PEER_P2P_PORT:-18564}"
 IFS=, read -r -a EPORTS <<< "${ELECTRUM_PORTS:-60601,60611}"
 DATA="$C/bitcoind"; COOKIE="$DATA/regtest/.cookie"
 FDATA="$C/bitcoind-fork"; FCOOKIE="$FDATA/regtest/.cookie"
+PDATA="$C/bitcoind-peer"; PCOOKIE="$PDATA/regtest/.cookie"
+FILTERS=(-blockfilterindex=1 -peerblockfilters=1)
 json_str() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"; }
 json_num() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"; }
 # Own session, so stopping whatever started the chain does not take it down. perl execs the
@@ -37,6 +41,12 @@ frpc() {
   [ -s "$FCOOKIE" ] || return 0
   curl -s --max-time 120 --user "$(cat "$FCOOKIE" 2>/dev/null)" -H 'content-type: application/json' \
     --data-binary "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" "http://127.0.0.1:$FORK_RPC_PORT/"
+}
+# The follower's RPC.
+prpc() {
+  [ -s "$PCOOKIE" ] || return 0
+  curl -s --max-time 120 --user "$(cat "$PCOOKIE" 2>/dev/null)" -H 'content-type: application/json' \
+    --data-binary "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" "http://127.0.0.1:$PEER_RPC_PORT/"
 }
 height() { rpc getblockcount | json_num result; }
 best() { rpc getbestblockhash | json_str result; }
@@ -67,7 +77,7 @@ start_electrs() {
 }
 case "${1:-}" in
 start)
-  stop_pid electrs0; stop_pid electrs1; stop_pid fork; stop_pid bitcoind
+  stop_pid electrs0; stop_pid electrs1; stop_pid peer; stop_pid fork; stop_pid bitcoind
   mkdir -p "$DATA"
   "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$DATA" -server=1 -listen=1 -bind="127.0.0.1:$P2P_PORT" \
     -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 -rpcport="$RPC_PORT" -port="$P2P_PORT" -txindex=1 \
@@ -82,14 +92,26 @@ start)
   done
   rpc createwallet '["miner"]' > /dev/null; rpc loadwallet '["miner"]' > /dev/null
   [ "$(height)" -ge 1 ] || mine 1
-  # The fork node follows the main node only, and is never seen by electrs.
+  # The fork node dials the main node only, and is never seen by electrs; Kyoto may dial it.
   mkdir -p "$FDATA"
   "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$FDATA" -server=1 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
     -rpcport="$FORK_RPC_PORT" -port="$FORK_P2P_PORT" -bind="127.0.0.1:$FORK_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
+    -listen=1 "${FILTERS[@]}" -whitelist=download,noban@127.0.0.1 \
     -fallbackfee=0.0001 -dnsseed=0 -fixedseeds=0 -printtoconsole=0 < /dev/null >> "$C/fork.out" 2>&1 &
   echo $! > "$C/fork.pid"
   until [ -n "$(frpc getblockcount | json_num result)" ]; do
     kill -0 "$(cat "$C/fork.pid")" 2>/dev/null || { echo "the fork node exited; see $FDATA/regtest/debug.log"; exit 1; }
+    sleep 0.5
+  done
+  # The follower: a third filter-serving peer for Kyoto's quorum.
+  mkdir -p "$PDATA"
+  "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$PDATA" -server=1 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
+    -rpcport="$PEER_RPC_PORT" -port="$PEER_P2P_PORT" -bind="127.0.0.1:$PEER_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
+    -listen=1 "${FILTERS[@]}" -whitelist=download,noban@127.0.0.1 \
+    -fallbackfee=0.0001 -dnsseed=0 -fixedseeds=0 -printtoconsole=0 < /dev/null >> "$C/peer.out" 2>&1 &
+  echo $! > "$C/peer.pid"
+  until [ -n "$(prpc getblockcount | json_num result)" ]; do
+    kill -0 "$(cat "$C/peer.pid")" 2>/dev/null || { echo "the follower exited; see $PDATA/regtest/debug.log"; exit 1; }
     sleep 0.5
   done
   start_electrs 0; start_electrs 1
@@ -102,6 +124,13 @@ start)
 prepare)
   "$0" start > /dev/null || exit 1
   [ "$(height)" -ge 101 ] || mine $(( 101 - $(height) ))
+  # Kyoto's peers serve filters only once their indexes reach the tip.
+  for r in rpc frpc prpc; do
+    for _ in $(seq 1 300); do
+      [ "$($r getindexinfo | sed -n 's/.*"best_block_height"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')" = "$(height)" ] && break
+      sleep 0.2
+    done
+  done
   echo "height $(height)";;
 mine) mine "$2" "${3:-}"; echo "height $(height)";;
 fund)
@@ -124,6 +153,7 @@ reorg)
   echo "replaced $old with $want at height $(height)";;
 rpc) rpc "$2" "${3:-[]}" "${4:-}";;
 electrum) echo "electrum: tcp://127.0.0.1:${EPORTS[0]},tcp://127.0.0.1:${EPORTS[1]}";;
-stop) stop_pid electrs0; stop_pid electrs1; stop_pid fork; stop_pid bitcoind;;
-*) sed -n '2,13p' "$0"; exit 2;;
+peers) echo "127.0.0.1:$P2P_PORT,127.0.0.1:$FORK_P2P_PORT,127.0.0.1:$PEER_P2P_PORT";;
+stop) stop_pid electrs0; stop_pid electrs1; stop_pid peer; stop_pid fork; stop_pid bitcoind;;
+*) sed -n '2,15p' "$0"; exit 2;;
 esac
