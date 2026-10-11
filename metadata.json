@@ -1,0 +1,43 @@
+{
+  "name": "bitcoin_wallet_core_module",
+  "display_name": "Bitcoin Wallet Core",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "description": "Bitcoin wallet engine: BDK, watch-only, its database encrypted under the key the keystore releases on open, signing through signer_manager_module, and a chain authority every server answer is checked against.",
+  "author": "Logos Core Team",
+  "main": "bitcoin_wallet_core_module_plugin",
+  "dependencies": ["signer_manager_module"],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": {
+      "crate": "rust-lib",
+      "trait": "BitcoinWalletCoreModule",
+      "source": "src/glue.rs"
+    }
+  },
+  "nix": {
+    "rust": {
+      "toolchain": "1.96.0",
+      "packages": {
+        "build": [
+          "pkg-config",
+          "perl"
+        ],
+        "runtime": []
+      }
+    },
+    "external_libraries": [],
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "cmake": {
+      "find_packages": [],
+      "extra_include_dirs": []
+    }
+  }
+}

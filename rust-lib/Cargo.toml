@@ -1,0 +1,52 @@
+[package]
+name = "bitcoin_wallet_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+# Standalone crate: keeps cargo from adopting a workspace in a parent directory.
+[workspace]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The BDK cohort: bdk_wallet 3.2.0 pins bdk_chain 0.23.3, whose store pins rusqlite 0.31.
+bdk_wallet = { version = "=3.2.0", features = ["rusqlite"] }
+bdk_electrum = { version = "=0.24.0", default-features = false, features = ["use-rustls-ring"] }
+bdk_esplora = { version = "=0.22.2", default-features = false, features = ["std", "async-https-rustls", "tokio"] }
+bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
+
+# Storage: BDK's rusqlite, switched to SQLCipher for the whole graph.
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+zeroize = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+# Provided by logos-module-builder at build time (staged into ../logos-rust-sdk-src).
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+# Apple uses CommonCrypto for SQLCipher; elsewhere OpenSSL is vendored.
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[dev-dependencies]
+tempfile = "3"
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "a80206330ae18be12710fac83c1b2feb73a96dc9", features = ["mock"] }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[profile.release]
+panic = "unwind"

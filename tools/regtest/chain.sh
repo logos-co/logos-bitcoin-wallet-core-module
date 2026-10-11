@@ -1,0 +1,129 @@
+#!/bin/bash
+# A local regtest chain for the wallet tests: bitcoind with block filters, two electrs on
+# loopback standing in for two operators, and a second bitcoind that only builds forks.
+#   chain.sh start               (re)start bitcoind and both electrs; makes the miner wallet
+#   chain.sh prepare             start, then mine 101 blocks so the miner can spend
+#   chain.sh mine <n> [address]  mine n blocks, to the miner or to an address
+#   chain.sh fund <address> <btc> [blocks]   pay an address from the miner, then mine
+#   chain.sh reorg [depth]       replace the tip: the fork node builds depth+1 blocks offline, then
+#                                reconnects, so the main node reorgs as it would on a live network
+#   chain.sh rpc <method> [json-params] | electrum | stop
+# Env: BITCOIND, ELECTRS (binaries; default: on PATH), CHAIN_DIR (state, default ./chain),
+# RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, ELECTRUM_PORTS (two, comma-separated). Ports
+# avoid the regtest defaults, so another regtest node on this machine is left alone.
+set -u
+C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
+BITCOIND="${BITCOIND:-bitcoind}"; ELECTRS="${ELECTRS:-electrs}"
+RPC_PORT="${RPC_PORT:-18543}"; P2P_PORT="${P2P_PORT:-18544}"
+FORK_RPC_PORT="${FORK_RPC_PORT:-18553}"; FORK_P2P_PORT="${FORK_P2P_PORT:-18554}"
+IFS=, read -r -a EPORTS <<< "${ELECTRUM_PORTS:-60601,60611}"
+DATA="$C/bitcoind"; COOKIE="$DATA/regtest/.cookie"
+FDATA="$C/bitcoind-fork"; FCOOKIE="$FDATA/regtest/.cookie"
+json_str() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"; }
+json_num() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"; }
+# Own session, so stopping whatever started the chain does not take it down. perl execs the
+# daemon, so `$!` is the daemon's own PID.
+DETACH=(perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' --)
+rpc() {
+  local wallet="${3:-}" path="/"
+  [ -n "$wallet" ] && path="/wallet/$wallet"
+  # No cookie yet: bitcoind is still starting, and curl would prompt for a password.
+  [ -s "$COOKIE" ] || return 0
+  curl -s --max-time 120 --user "$(cat "$COOKIE" 2>/dev/null)" -H 'content-type: application/json' \
+    --data-binary "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" "http://127.0.0.1:$RPC_PORT$path"
+}
+# The fork node's RPC, the same way.
+frpc() {
+  [ -s "$FCOOKIE" ] || return 0
+  curl -s --max-time 120 --user "$(cat "$FCOOKIE" 2>/dev/null)" -H 'content-type: application/json' \
+    --data-binary "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" "http://127.0.0.1:$FORK_RPC_PORT/"
+}
+height() { rpc getblockcount | json_num result; }
+best() { rpc getbestblockhash | json_str result; }
+fork_best() { frpc getbestblockhash | json_str result; }
+miner_addr() {
+  [ -s "$C/miner.addr" ] || rpc getnewaddress '["miner","bech32"]' miner | json_str result > "$C/miner.addr"
+  cat "$C/miner.addr"
+}
+mine() { local n="$1" to="${2:-$(miner_addr)}"; rpc generatetoaddress "[$n,\"$to\"]" > /dev/null; }
+# Kills by PID and waits for the exit, so a restart never talks to the old process.
+stop_pid() {
+  [ -f "$C/$1.pid" ] || return 0
+  local pid; pid=$(cat "$C/$1.pid")
+  kill "$pid" 2>/dev/null
+  for _ in $(seq 1 300); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  rm -f "$C/$1.pid"
+}
+listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+start_electrs() {
+  local i="$1" port="${EPORTS[$1]}"
+  stop_pid "electrs$i"
+  mkdir -p "$C/electrs$i"
+  "${DETACH[@]}" "$ELECTRS" --skip-default-conf-files --network regtest --db-dir "$C/electrs$i" \
+    --daemon-dir "$DATA" --cookie-file "$COOKIE" --daemon-rpc-addr "127.0.0.1:$RPC_PORT" \
+    --daemon-p2p-addr "127.0.0.1:$P2P_PORT" --electrum-rpc-addr "127.0.0.1:$port" \
+    --monitoring-addr "127.0.0.1:$(( port + 1 ))" --wait-duration-secs 1 < /dev/null >> "$C/electrs$i.log" 2>&1 &
+  echo $! > "$C/electrs$i.pid"
+}
+case "${1:-}" in
+start)
+  stop_pid electrs0; stop_pid electrs1; stop_pid fork; stop_pid bitcoind
+  mkdir -p "$DATA"
+  "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$DATA" -server=1 -listen=1 -bind="127.0.0.1:$P2P_PORT" \
+    -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 -rpcport="$RPC_PORT" -port="$P2P_PORT" -txindex=1 \
+    -blockfilterindex=1 -peerblockfilters=1 -fallbackfee=0.0001 -dnsseed=0 -fixedseeds=0 \
+    -whitelist=download,noban@127.0.0.1 \
+    -printtoconsole=0 < /dev/null >> "$C/bitcoind.out" 2>&1 &
+  echo $! > "$C/bitcoind.pid"
+  # Warming up, bitcoind answers with an error whose result is null: wait for a height.
+  until [ -n "$(height)" ]; do
+    kill -0 "$(cat "$C/bitcoind.pid")" 2>/dev/null || { echo "bitcoind exited; see $DATA/regtest/debug.log"; exit 1; }
+    sleep 0.5
+  done
+  rpc createwallet '["miner"]' > /dev/null; rpc loadwallet '["miner"]' > /dev/null
+  [ "$(height)" -ge 1 ] || mine 1
+  # The fork node follows the main node only, and is never seen by electrs.
+  mkdir -p "$FDATA"
+  "${DETACH[@]}" "$BITCOIND" -regtest -datadir="$FDATA" -server=1 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
+    -rpcport="$FORK_RPC_PORT" -port="$FORK_P2P_PORT" -bind="127.0.0.1:$FORK_P2P_PORT" -connect="127.0.0.1:$P2P_PORT" \
+    -fallbackfee=0.0001 -dnsseed=0 -fixedseeds=0 -printtoconsole=0 < /dev/null >> "$C/fork.out" 2>&1 &
+  echo $! > "$C/fork.pid"
+  until [ -n "$(frpc getblockcount | json_num result)" ]; do
+    kill -0 "$(cat "$C/fork.pid")" 2>/dev/null || { echo "the fork node exited; see $FDATA/regtest/debug.log"; exit 1; }
+    sleep 0.5
+  done
+  start_electrs 0; start_electrs 1
+  for p in "${EPORTS[@]}"; do
+    for _ in $(seq 1 600); do listening "$p" && break; sleep 0.1; done
+    listening "$p" || { echo "electrs on $p did not start; see $C/electrs*.log"; exit 1; }
+  done
+  "$0" electrum
+  echo "height $(height)";;
+prepare)
+  "$0" start > /dev/null || exit 1
+  [ "$(height)" -ge 101 ] || mine $(( 101 - $(height) ))
+  echo "height $(height)";;
+mine) mine "$2" "${3:-}"; echo "height $(height)";;
+fund)
+  rpc sendtoaddress "[\"$2\",$3]" miner | json_str result
+  [ "${4:-0}" -gt 0 ] && mine "$4"
+  true;;
+reorg)
+  depth="${2:-1}"; old="$(best)"
+  for _ in $(seq 1 100); do [ "$(fork_best)" = "$old" ] && break; sleep 0.1; done
+  [ "$(fork_best)" = "$old" ] || { echo "the fork node did not follow the tip"; exit 1; }
+  # Offline, the fork node replaces the tip with a longer branch; the main node keeps the old
+  # block, valid, as a stale fork.
+  frpc setnetworkactive '[false]' > /dev/null
+  frpc invalidateblock "[\"$old\"]" > /dev/null
+  frpc generatetoaddress "[$(( depth + 1 )),\"$(miner_addr)\"]" > /dev/null
+  frpc setnetworkactive '[true]' > /dev/null
+  want="$(fork_best)"
+  for _ in $(seq 1 300); do [ "$(best)" = "$want" ] && break; sleep 0.1; done
+  [ "$(best)" = "$want" ] || { echo "the main node did not take the fork"; exit 1; }
+  echo "replaced $old with $want at height $(height)";;
+rpc) rpc "$2" "${3:-[]}" "${4:-}";;
+electrum) echo "electrum: tcp://127.0.0.1:${EPORTS[0]},tcp://127.0.0.1:${EPORTS[1]}";;
+stop) stop_pid electrs0; stop_pid electrs1; stop_pid fork; stop_pid bitcoind;;
+*) sed -n '2,13p' "$0"; exit 2;;
+esac
