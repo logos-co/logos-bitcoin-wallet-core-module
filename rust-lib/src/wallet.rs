@@ -25,6 +25,11 @@ pub struct Cell {
     pub family: Family,
 }
 
+/// A send that may have left the wallet: its inputs stay locked until it confirms or is abandoned.
+pub fn live(state: &str) -> bool {
+    matches!(state, "broadcasting" | "sent")
+}
+
 /// An anchor above the authority's tip, waiting for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
@@ -245,6 +250,14 @@ impl Cell {
         Ok(())
     }
 
+    pub fn set_send_broadcast(&self, txid: &Txid, state: &str, via: &str, outcome: &str) -> Result<(), String> {
+        sql(self.conn.execute(
+            "UPDATE core_sends SET state = ?2, via = ?3, broadcast = ?4 WHERE txid = ?1",
+            params![txid.to_string(), state, via, outcome],
+        ))?;
+        Ok(())
+    }
+
     /// A send that confirmed releases its inputs' locks; one that lost to a confirmed conflict is
     /// marked conflicted and releases them too.
     pub fn settle_sends(&mut self) -> Result<(), String> {
@@ -256,13 +269,13 @@ impl Cell {
             .flat_map(|t| t.tx_node.tx.input.iter().map(|i| i.previous_output).collect::<Vec<_>>())
             .collect();
         for s in self.sends()? {
-            if s.state != "sent" && s.state != "replaced" {
+            if !live(&s.state) && s.state != "replaced" {
                 continue;
             }
             // A replaced send stays replaced unless it is the one that confirmed.
             let next = match (canonical.get(&s.txid), s.state.as_str()) {
                 (Some(true), _) => Some("confirmed"),
-                (None, "sent") if s.inputs.iter().any(|o| spent_by_confirmed.contains(o)) => Some("conflicted"),
+                (None, st) if live(st) && s.inputs.iter().any(|o| spent_by_confirmed.contains(o)) => Some("conflicted"),
                 _ => None,
             };
             if let Some(state) = next {

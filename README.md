@@ -95,8 +95,13 @@ the app can raise `evm.signing.approve` with `{ handle }`. An offer nobody ackno
 settles `expired_no_ack`; the job fails with the reason and the preview stays, so a new request can be
 made. On approval it fetches the PSBT, copies only the signatures onto the PSBT it built after
 checking the unsigned transaction is the same, verifies every signature over the sighash computed
-here, has BDK finalize, broadcasts through the `broadcast` role and acknowledges. A sent
-transaction's inputs stay locked until it confirms or `abandon_send` gives it up.
+here, and has BDK finalize. Before anything leaves, the signed transaction and its send record
+are stored (state `broadcasting`), retried while the wallet is busy. Then it broadcasts through the
+`broadcast` role and acknowledges. Once a broadcast may have happened the job never fails: it
+answers the txid with `broadcast: seen|requested|unknown`, and a refusal after a source that may
+have taken it is `unknown` too. A sent transaction's inputs stay locked until it confirms or
+`abandon_send` gives it up; a reopen releases only the locks of previews that never reached
+`broadcasting`.
 
 ## API
 
@@ -106,7 +111,7 @@ Amounts are decimal strings of satoshis.
 | Method | Returns |
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below |
-| `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt |
+| `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
 | `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind, height, hash, tipAgeSecs, peers }, synced, busy, needsBirthday, birthday, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour |
 | `balance()` | `{ confirmed, waiting, pending, sent, immature, tooSmall: { count, sat } }`; empty strings while busy |
 | `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once 20 stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
@@ -155,7 +160,8 @@ On regtest, `regtest.json` in the persistence directory gives loopback servers i
 `<instance>/core.log`, and `<instance>/wallets/` (0700), with per wallet
 `<network>/<group>/wallet.json` (group, family, network, created; 0600) and `wallet.db` (SQLCipher,
 0600): BDK's tables plus `core_headers`, `core_old_hashes`, `core_held` (anchors above the tip),
-`core_exposure`, `core_suspects`, `core_reported` and `core_sends`.
+`core_exposure`, `core_suspects`, `core_reported` and `core_sends` (state `broadcasting`, `sent`,
+`replaced`, `confirmed`, `conflicted`, `abandoned` or `failed`).
 
 ## Development
 

@@ -29,6 +29,8 @@ struct Record {
     result: Value,
     acked: bool,
     cancelled: bool,
+    /// How the person decides: approved, or what the test asked for.
+    reason: &'static str,
 }
 
 /// Answers as signer_manager_module does: handles, receipts, a decision after a delay, and PSBTs
@@ -40,13 +42,15 @@ struct MockManager {
     delay: Duration,
     keys: Mutex<HashMap<String, String>>,
     log: Mutex<Vec<String>>,
+    /// The next approval settles this way instead of approved.
+    next_reason: Mutex<Option<&'static str>>,
 }
 
 impl MockManager {
     fn new(delay: Duration) -> Self {
         let mut signer = MockSigner::new(MockOptions { phrase: PHRASE.into(), ..Default::default() });
         signer.set_request_kinds(vec![RequestKind::BtcPsbt]);
-        Self { signer: Mutex::new(signer), next: AtomicU64::new(0), records: Mutex::default(), delay, keys: Mutex::default(), log: Mutex::default() }
+        Self { signer: Mutex::new(signer), next: AtomicU64::new(0), records: Mutex::default(), delay, keys: Mutex::default(), log: Mutex::default(), next_reason: Mutex::default() }
     }
 
     fn account(&self, id: &str) -> (String, String, String) {
@@ -68,11 +72,12 @@ impl MockManager {
         (d(0), d(1))
     }
 
-    fn issue(&self, prefix: &str, result: Value) -> String {
+    fn issue(&self, prefix: &str, result: Value, reason: &'static str) -> String {
         let n = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         let handle = format!("{prefix}_{n:08x}");
         let receipt = format!("r{n:032x}");
-        self.records.lock().unwrap().insert(handle.clone(), Record { receipt: receipt.clone(), ready_at: Instant::now() + self.delay, result, acked: false, cancelled: false });
+        let rec = Record { receipt: receipt.clone(), ready_at: Instant::now() + self.delay, result, acked: false, cancelled: false, reason };
+        self.records.lock().unwrap().insert(handle.clone(), rec);
         json!({"ok": true, "handle": handle, "receipt": receipt, "state": "offered"}).to_string()
     }
 
@@ -144,7 +149,7 @@ impl SignerManager for MockManager {
         let (external, internal) = self.descriptors(family);
         self.log.lock().unwrap().push(format!("open {family}"));
         Ok(self.issue("sma", json!({"group": group, "family": family, "chain": "test", "network": v["network"], "external": external,
-            "internal": internal, "fingerprint": "73c5da0a", "databaseKey": key, "origin": "restored", "birthday": null, "unlocked": null})))
+            "internal": internal, "fingerprint": "73c5da0a", "databaseKey": key, "origin": "restored", "birthday": null, "unlocked": null}), "approved"))
     }
 
     fn request_approval(&self, intent: &str) -> Result<String, String> {
@@ -154,17 +159,18 @@ impl SignerManager for MockManager {
         assert_eq!(legs[0]["kind"], "psbt");
         assert!(intent.len() <= 64 * 1024);
         self.log.lock().unwrap().push(format!("approval {}", v["purpose"]));
+        let reason = self.next_reason.lock().unwrap().take().unwrap_or("approved");
         match self.sign(legs[0]["psbt"].as_str().unwrap()) {
-            Ok(signed) => Ok(self.issue("smh", json!({"signed": [signed]}))),
+            Ok(signed) => Ok(self.issue("smh", json!({"signed": [signed]}), reason)),
             Err(e) => Ok(json!({"ok": false, "error": format!("invalid parameters: psbt: {e}")}).to_string()),
         }
     }
 
     fn approval_status(&self, h: &str, r: &str) -> Result<String, String> {
-        Ok(match self.with(h, r, |rec| (rec.cancelled, Instant::now() >= rec.ready_at)) {
-            Ok((true, _)) => json!({"ok": true, "state": "settled", "reason": "cancelled"}),
-            Ok((false, true)) => json!({"ok": true, "state": "settled", "reason": "approved"}),
-            Ok((false, false)) => json!({"ok": true, "state": "rendered", "reason": null}),
+        Ok(match self.with(h, r, |rec| (rec.cancelled, Instant::now() >= rec.ready_at, rec.reason)) {
+            Ok((true, _, _)) => json!({"ok": true, "state": "settled", "reason": "cancelled"}),
+            Ok((false, true, reason)) => json!({"ok": true, "state": "settled", "reason": reason}),
+            Ok((false, false, _)) => json!({"ok": true, "state": "rendered", "reason": null}),
             Err(e) => json!({"ok": false, "error": e}),
         }
         .to_string())
@@ -334,6 +340,23 @@ impl T {
         }
     }
 
+    /// A job expected to fail: its error.
+    fn job_err(&self, kind: &str, params: Value) -> String {
+        let r = self.engine.start_job(kind, &params.to_string());
+        let (id, receipt) = (r["jobId"].as_str().unwrap().to_string(), r["receipt"].as_str().unwrap().to_string());
+        let t0 = Instant::now();
+        loop {
+            let s = self.engine.jobs().status(&id, &receipt);
+            match s["state"].as_str().unwrap() {
+                "failed" => return s["error"].as_str().unwrap_or("").to_string(),
+                "done" => panic!("{kind} should have failed: {s}"),
+                _ => {}
+            }
+            assert!(t0.elapsed() < Duration::from_secs(120), "{kind} timed out");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn wait(&self, what: &str, secs: u64, mut f: impl FnMut() -> bool) {
         let t0 = Instant::now();
         while !f() {
@@ -482,6 +505,22 @@ fn bitcoin_wallet_on_regtest() {
     assert_eq!(t.row(&txid)["intent"], "send");
     assert_eq!(t.sats("confirmed"), 100_000_000 - 10_000_000 - fee);
     println!("segwit send {txid}: fee {fee} sat, vsize {}", preview["vsize"]);
+
+    // A declined approval fails the job with the reason; the preview and its locks stay until cancelled.
+    let balance_before = t.sats("confirmed");
+    for reason in ["rejected", "expired_no_ack"] {
+        *t.manager.next_reason.lock().unwrap() = Some(reason);
+        let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "1000000"}]}));
+        let id = p["previewId"].as_str().unwrap().to_string();
+        let e = t.job_err("sign_and_broadcast", json!({"previewId": id}));
+        assert!(e.starts_with(reason), "{e}");
+        assert!(t.engine.preview(&id)["state"].as_str().unwrap().starts_with("failed"));
+        assert!(t.engine.utxos()["utxos"].as_array().unwrap().iter().any(|u| u["locked"] == true), "inputs stay locked");
+        let c = t.job("cancel_send", json!({"previewId": id}));
+        assert!(!c["unlocked"].as_array().unwrap().is_empty(), "{c}");
+        assert!(t.engine.utxos()["utxos"].as_array().unwrap().iter().all(|u| u["locked"] == false));
+    }
+    assert_eq!(t.sats("confirmed"), balance_before, "nothing left the wallet");
 
     // Bump a low-fee send through build_fee_bump; the replacement confirms, the original doesn't.
     let (_, slow) = t.send(&theirs, 5_000_000, Some(1.0));

@@ -679,7 +679,7 @@ impl Engine {
     fn bump_fee(&self, txid: Txid, fee_rate: f64) -> Result<Value, String> {
         let rate = fee_rate.max(self.fee_rates().minimum);
         self.cell_job(Duration::from_secs(60), |cell| {
-            if !cell.sends()?.iter().any(|s| s.txid == txid && s.state == "sent") {
+            if !cell.sends()?.iter().any(|s| s.txid == txid && wallet::live(&s.state)) {
                 return Err("only an unconfirmed send of this wallet can be bumped".into());
             }
             let psbt = send::build_bump(cell, txid, rate)?;
@@ -770,29 +770,54 @@ impl Engine {
         });
         let _ = self.manager.ack_result(&ticket.handle, &ticket.receipt);
         let tx = outcome?;
-        self.update_preview(id, |p| p.state = "broadcasting".into());
         let txid = tx.compute_txid();
-        let (out, via) = self.broadcast(&tx)?;
-        self.cell_job(Duration::from_secs(60), |cell| {
-            cell.store_send(&SendRecord {
-                txid,
-                tx: tx.clone(),
-                inputs: inputs.clone(),
-                state: "sent".into(),
-                created: now_secs(),
-                replaces,
-                via: Some(via.clone()),
-                broadcast: Some(out.as_str().into()),
-            })?;
+        // Write-ahead: the signed transaction and its record are stored before it can leave, so a
+        // busy wallet afterwards can't lose it, and a reopen keeps its inputs locked.
+        let record = SendRecord { txid, tx: tx.clone(), inputs: inputs.clone(), state: "broadcasting".into(), created: now_secs(), replaces, via: None, broadcast: None };
+        self.store_retry(|cell| {
+            cell.store_send(&record)?;
+            cell.persist()
+        })?;
+        self.update_preview(id, |p| p.state = "broadcasting".into());
+        let (out, via) = match self.broadcast(&tx) {
+            Ok(x) => x,
+            // Refused, or nowhere to send it: nothing left. The preview keeps its inputs.
+            Err(e) => {
+                let _ = self.store_retry(|cell| cell.set_send_state(&txid, "failed"));
+                return Err(e);
+            }
+        };
+        // From here the transaction may be out: whatever happens, the answer is its txid.
+        let stored = self.store_retry(|cell| {
+            cell.set_send_broadcast(&txid, "sent", &via, out.as_str())?;
             if let Some(old) = replaces {
                 cell.set_send_state(&old, "replaced")?;
             }
             cell.wallet.apply_unconfirmed_txs([(tx.clone(), now_secs())]);
             cell.persist()
-        })?;
+        });
+        if let Err(e) = &stored {
+            tracing::warn!(target: "bitcoin", "{txid} went out; its record stays broadcasting: {e}");
+        }
         self.wake();
         tracing::info!(target: "bitcoin", "broadcast {txid}: {} via {via}", out.as_str());
         Ok(json!({"txid": txid.to_string(), "broadcast": out.as_str(), "via": via}))
+    }
+
+    /// A store that waits out a busy wallet: up to five tries of a minute each.
+    fn store_retry<T>(&self, mut f: impl FnMut(&mut Cell) -> Result<T, String>) -> Result<T, String> {
+        let mut last = String::new();
+        for attempt in 0..5u32 {
+            match self.cell_job(Duration::from_secs(60), &mut f) {
+                Ok(v) => return Ok(v),
+                Err(e) if e.contains("busy") => {
+                    last = e;
+                    std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
     }
 
     /// Sends through the broadcast route: the first enabled source that takes it.
@@ -830,7 +855,8 @@ impl Engine {
             match sent {
                 Ok(o) => return Ok((o, s.id)),
                 Err(e) if send::already_known(&e) => return Ok((Outcome::Seen, s.id)),
-                Err(e) if send::refused(&e) => return Err(format!("{} refused the transaction: {e}", s.id)),
+                // A refusal after a source that may have taken it says nothing about that one.
+                Err(e) if send::refused(&e) && maybe_left.is_none() => return Err(format!("{} refused the transaction: {e}", s.id)),
                 Err(e) => {
                     tracing::info!(target: "bitcoin", "broadcast via {}: {e}", s.id);
                     maybe_left = Some(s.id);
@@ -857,7 +883,7 @@ impl Engine {
             let _ = self.manager.cancel_approval(&t.handle, &t.receipt);
         }
         let unlocked = self.cell_job(Duration::from_secs(60), |cell| {
-            let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| s.state == "sent").flat_map(|s| s.inputs.clone()).collect();
+            let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| wallet::live(&s.state)).flat_map(|s| s.inputs.clone()).collect();
             let mut out = vec![];
             for op in &p.inputs {
                 if !live.contains(op) {
@@ -889,7 +915,7 @@ impl Engine {
 
     fn abandon(&self, txid: Txid) -> Result<Value, String> {
         self.cell_job(Duration::from_secs(60), |cell| {
-            let s = cell.sends()?.into_iter().find(|s| s.txid == txid && s.state == "sent").ok_or("no unconfirmed send with that txid")?;
+            let s = cell.sends()?.into_iter().find(|s| s.txid == txid && wallet::live(&s.state)).ok_or("no unconfirmed send with that txid")?;
             for op in &s.inputs {
                 cell.wallet.unlock_outpoint(*op);
             }
@@ -1120,9 +1146,10 @@ pub fn resolve_birthday(
     }
 }
 
-/// Locks that belong to no live send: previews die with the session that built them.
+/// Locks of previews that never reached broadcasting: they died with the session that built them.
+/// A send that may have left keeps its inputs locked until it confirms or is abandoned.
 fn release_stale_locks(cell: &mut Cell) -> Result<(), String> {
-    let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| s.state == "sent").flat_map(|s| s.inputs.clone()).collect();
+    let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| wallet::live(&s.state)).flat_map(|s| s.inputs.clone()).collect();
     let stale: Vec<OutPoint> = cell.wallet.list_locked_outpoints().filter(|o| !live.contains(o)).collect();
     for o in stale {
         cell.wallet.unlock_outpoint(o);
@@ -1219,6 +1246,31 @@ mod tests {
         let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().contains("unreadable")).collect();
         assert!(!aside.is_empty(), "the old database is kept aside");
         e.shutdown();
+    }
+
+    #[test]
+    fn a_reopen_releases_only_locks_of_previews_that_never_went_out() {
+        use bitcoin::hashes::Hash;
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[3; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        crate::network::configure_regtest(Default::default());
+        let (w, _) = wallet::load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let op = |n: u8| OutPoint { txid: Txid::from_byte_array([n; 32]), vout: 0 };
+        let tx = bitcoin::Transaction { version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO, input: vec![], output: vec![] };
+        for (n, state) in [(1u8, "broadcasting"), (2, "sent"), (3, "failed")] {
+            cell.store_send(&SendRecord { txid: Txid::from_byte_array([100 + n; 32]), tx: tx.clone(), inputs: vec![op(n)], state: state.into(), created: 0, replaces: None, via: None, broadcast: None }).unwrap();
+        }
+        for n in 1..=4 {
+            cell.wallet.lock_outpoint(op(n));
+        }
+        release_stale_locks(&mut cell).unwrap();
+        assert!(cell.wallet.is_outpoint_locked(op(1)), "it may have gone out before the store after it");
+        assert!(cell.wallet.is_outpoint_locked(op(2)));
+        assert!(!cell.wallet.is_outpoint_locked(op(3)), "refused: nothing left");
+        assert!(!cell.wallet.is_outpoint_locked(op(4)), "a preview that never reached broadcasting");
     }
 
     #[test]
