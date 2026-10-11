@@ -504,6 +504,8 @@ fn bitcoin_wallet_on_regtest() {
     t.wait("the send confirmed", 60, || t.row(&txid)["state"] == "confirmed");
     assert_eq!(t.row(&txid)["intent"], "send");
     assert_eq!(t.sats("confirmed"), 100_000_000 - 10_000_000 - fee);
+    // A rebroadcast of a transaction the node already holds is seen, not an error.
+    assert_eq!(t.job("rebroadcast", json!({"txid": txid}))["broadcast"], "seen");
     println!("segwit send {txid}: fee {fee} sat, vsize {}", preview["vsize"]);
 
     // A declined approval fails the job with the reason; the preview and its locks stay until cancelled.
