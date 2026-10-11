@@ -288,7 +288,17 @@ impl Loop {
 
     fn reload_routes(&mut self) {
         let Some(src) = &self.ctx.routes_src else { return };
-        match src.route_table(self.ctx.net.name()).and_then(|r| Routes::from_table(&r)) {
+        let table = src.route_table(self.ctx.net.name()).and_then(|r| Routes::from_table(&r));
+        // Regtest keeps regtest.json's servers while the node module routes nothing there.
+        let table = match table {
+            Ok(r) if self.ctx.net == BNetwork::Regtest && !r.has_entries() => {
+                self.last_routes = Instant::now();
+                return;
+            }
+            Ok(r) if self.ctx.net == BNetwork::Regtest => Ok(Routes::for_regtest(Some(r), crate::network::regtest_config())),
+            other => other,
+        };
+        match table {
             Ok(r) => {
                 let mut ns = self.ctx.netstate.lock();
                 if ns.routes != r {

@@ -139,8 +139,12 @@ fn bitcoin_wallet_on_regtest() {
 
     // A birthday for the restore: refused past the first payment, then set; the full scan runs again.
     let first_height = t.row(&funded.to_string())["height"].as_u64().unwrap();
-    let e = t.job_err("set_birthday", json!({"height": first_height + 1}));
-    assert!(e.contains("before a birthday"), "{e}");
+    let (code, e) = t.job_fail("set_birthday", json!({"height": first_height + 1}));
+    assert!(code == "invalid" && e.contains("before a birthday"), "{code}: {e}");
+    let (code, e) = t.job_fail("set_birthday", json!({"date": "2999-01-01"}));
+    assert!(code == "invalid" && e.contains("still to come"), "{code}: {e}");
+    let malformed = t.engine.start_job("set_birthday", r#"{"day":"2024-01-01"}"#);
+    assert_eq!((malformed["ok"].clone(), malformed["code"].clone()), (json!(false), json!("invalid")), "{malformed}");
     let set = t.job("set_birthday", json!({"height": first_height}));
     assert_eq!(set["birthday"]["source"], "set", "{set}");
     t.wait("the rescan", 60, || t.engine.status()["rescanFrom"].is_null());

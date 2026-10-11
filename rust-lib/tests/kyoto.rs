@@ -133,6 +133,14 @@ fn kyoto_is_the_authority_on_regtest() {
         assert_eq!(t.row(id)["state"], "confirmed", "{id} after the rescan");
     }
 
+    // A burst of 100 blocks: the cross-checked electrs lags behind Kyoto for a moment, which
+    // raises nothing; only a lag that lasts does.
+    let stale = t.alerts("stale", "electrum-0");
+    t.mine(100);
+    t.synced();
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(t.alerts("stale", "electrum-0"), stale, "a burst raised a stale alert");
+
     // Addresses revealed past what the client watches: it is rebuilt, and finds a payment there.
     let rebuilds = kyoto(&t)["rebuilds"].as_u64().unwrap();
     let last = t.engine.reveal_for_test(30).unwrap();

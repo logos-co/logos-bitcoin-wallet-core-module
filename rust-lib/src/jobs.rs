@@ -195,7 +195,7 @@ pub fn code_of(e: &str) -> &'static str {
         "no_wallet"
     } else if l.starts_with("signer_manager_module:") || l.contains("signer manager") {
         "signer_unavailable"
-    } else if l.starts_with("params") || l.contains("unknown field") || l.contains("is required") || l.contains("must be") || l.contains("unknown or") {
+    } else if l.starts_with("invalid") || l.starts_with("params") || l.contains("unknown field") || l.contains("is required") || l.contains("must be") || l.contains("unknown or") {
         "invalid"
     } else {
         "failed"

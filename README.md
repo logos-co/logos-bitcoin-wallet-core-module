@@ -195,9 +195,10 @@ which servers learned the addresses, and since when.
 Cross-checks, on every new tip and every 10 minutes with jitter: each source in the `check` role is
 asked its tip, the hash at the lower of the two tips, and a header at a random height between the
 birthday and the tip, never a height of the wallet's own transactions. Within 2 blocks with matching
-hashes it agrees; more than 2 behind is stale (no history or pending from it); more than 2 ahead for
-30 minutes says the authority is behind (an alert, never adoption); another hash that survives the
-next block is suspect.
+hashes it agrees; more than 2 behind in two checks in a row a minute or more apart is stale (an
+alert, and no history or pending from it), so a burst of blocks that leaves an honest server behind
+for a moment raises nothing; more than 2 ahead for 30 minutes says the authority is behind (an
+alert, never adoption); another hash that survives the next block is suspect.
 
 ## Sends
 
@@ -229,7 +230,7 @@ Amounts are decimal strings of satoshis.
 
 | Method | Returns |
 |---|---|
-| `start_job(kind, params)` | `{ jobId, receipt }`; kinds below |
+| `start_job(kind, params)` | `{ jobId, receipt }`; kinds below. Malformed parameters are refused at once with `{ ok: false, error, code: "invalid" }` |
 | `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
 | `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
 | `balance()` | `{ confirmed, waiting, pending, sent, immature, tooSmall: { count, sat } }`; empty strings while busy |
@@ -253,7 +254,7 @@ Amounts are decimal strings of satoshis.
 | `cancel_send` | Backend only. `{ previewId }` → cancels a pending approval and unlocks the inputs |
 | `rebroadcast` | `{ txid }` → as `sign_and_broadcast` |
 | `abandon_send` | Backend only. `{ txid }` → unlocks a sent transaction's inputs |
-| `set_birthday` | Backend only. `{ date }` or `{ height }` → `{ birthday: { height, source: "set" }, rescanFrom }` |
+| `set_birthday` | Backend only. `{ date }` or `{ height }` → `{ birthday: { height, source: "set" }, rescanFrom }`; a birthday after the first transaction or a day still to come fails with code `invalid` |
 
 Events: `walletStateChanged` (status's shape; also when the authority's kind changes, a reorg
 moves a payment, a birthday is set and its rescan starts and ends), `jobFinished(jobId, state)`, and
@@ -290,9 +291,13 @@ from a server that holds the certificate's key; `examples/pin_probe.rs` reads on
 connects with it. Two community servers with version 1 certificates, refused before, answer that
 way.
 
-On regtest, `regtest.json` in the persistence directory gives loopback sources instead:
+On regtest, `regtest.json` in the persistence directory turns regtest on. The routes come from
+the node module's `route_table("regtest")` when it routes anything there, servers and Kyoto's
+peers alike, with `regtest.json`'s `pollSecs` and `kyotoRequired`; only when it routes nothing do
+`regtest.json`'s own loopback sources serve:
 `{ "electrum": ["tcp://127.0.0.1:60601", ...], "esplora": [], "kyoto": ["127.0.0.1:18544", ...],
-"local": false, "kyotoRequired": 2, "checkOnly": false, "pollSecs": 1 }`.
+"local": false, "kyotoRequired": 2, "checkOnly": false, "pollSecs": 1 }`. So pins, `userAdded` and
+the plain-text rule run end to end on regtest (`tools/e2e/pins.sh`).
 
 ## Persistence
 
@@ -414,7 +419,14 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
 - `local-node.sh`: the real `bitcoind_module` (libbitcoind_c, Core in-process) on regtest as the
   authority: a coinbase received and matured, a send through its `sendrawtransaction`, confirmed,
   then `set_birthday`, whose rescan reads the node's block filters over IPC and fetches only the
-  blocks they match.
+  blocks they match;
+- `pins.sh`: the real `bitcoin_node_module` routing regtest: Kyoto's peers through
+  `set_own_peers`, and through `set_sources` a self-signed `ssl://` front for electrs
+  (`examples/tls_front.rs`, a version 1 certificate) pinned with `certSha256`, plus a plain
+  `tcp://` electrs on loopback. The core's `regtest.json` names no server. A payment shows pending
+  from the front, reached by its pin, and confirms; `sources_status` marks the front encrypted and
+  the plain one not. Once `set_source` pins another certificate the core refuses the front, and
+  takes it back with the right pin.
 
 Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of 20 unloads within
 2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians

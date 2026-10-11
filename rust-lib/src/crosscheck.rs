@@ -11,12 +11,17 @@ pub const TIP_SLACK: u32 = 2;
 pub const AHEAD_ALERT_SECS: u64 = 30 * 60;
 /// Checks run on every new authority tip and at least this often, with jitter.
 pub const INTERVAL_SECS: u64 = 10 * 60;
+/// A server is stale once it lags in this many checks in a row, the first this long ago: a burst
+/// of blocks leaves an honest server behind for a moment.
+pub const STALE_CHECKS: u32 = 2;
+pub const STALE_AFTER_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Agrees,
-    /// Behind by more than the slack: not used for history or pending until it catches up.
+    /// Behind by more than the slack, in checks over a minute apart: not used for history or
+    /// pending until it catches up.
     Stale,
     /// Ahead by more than the slack for half an hour. Its chain is never adopted.
     AuthorityBehind,
@@ -38,6 +43,9 @@ pub struct Answer {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Track {
     pub ahead_since: Option<u64>,
+    /// When the server was first seen behind, and in how many checks in a row since.
+    pub behind_since: Option<u64>,
+    pub behind_checks: u32,
     /// The authority tip when a mismatch was first seen.
     pub mismatch_at: Option<u32>,
     pub verdict: Option<Verdict>,
@@ -61,7 +69,9 @@ pub fn judge(track: &mut Track, auth_tip: u32, auth_hash: &dyn Fn(u32) -> Option
     } else {
         track.mismatch_at = None;
         if answer.tip + TIP_SLACK < auth_tip {
-            Verdict::Stale
+            let since = *track.behind_since.get_or_insert(now);
+            track.behind_checks += 1;
+            if track.behind_checks >= STALE_CHECKS && now.saturating_sub(since) >= STALE_AFTER_SECS { Verdict::Stale } else { Verdict::Agrees }
         } else if answer.tip > auth_tip + TIP_SLACK {
             let since = *track.ahead_since.get_or_insert(now);
             if now.saturating_sub(since) >= AHEAD_ALERT_SECS { Verdict::AuthorityBehind } else { Verdict::Agrees }
@@ -71,6 +81,9 @@ pub fn judge(track: &mut Track, auth_tip: u32, auth_hash: &dyn Fn(u32) -> Option
     };
     if answer.tip <= auth_tip + TIP_SLACK {
         track.ahead_since = None;
+    }
+    if answer.tip + TIP_SLACK >= auth_tip {
+        (track.behind_since, track.behind_checks) = (None, 0);
     }
     // A suspect stays suspect until the backend clears it.
     if track.verdict == Some(Verdict::Suspect) {
@@ -123,10 +136,26 @@ mod tests {
     }
 
     #[test]
-    fn three_behind_is_stale_until_it_catches_up() {
+    fn three_behind_is_stale_once_it_lasts_until_it_catches_up() {
         let mut t = Track::default();
-        assert_eq!(judge(&mut t, 100, &ours, &answer(97, 100), 0), Verdict::Stale);
-        assert_eq!(judge(&mut t, 100, &ours, &answer(99, 100), 60), Verdict::Agrees);
+        assert_eq!(judge(&mut t, 100, &ours, &answer(97, 100), 0), Verdict::Agrees, "one check is not a lag");
+        assert_eq!(judge(&mut t, 100, &ours, &answer(97, 100), 59), Verdict::Agrees, "two, within a minute");
+        assert_eq!(judge(&mut t, 100, &ours, &answer(97, 100), 60), Verdict::Stale);
+        assert_eq!(judge(&mut t, 100, &ours, &answer(99, 100), 120), Verdict::Agrees);
+        assert_eq!((t.behind_since, t.behind_checks), (None, 0));
+    }
+
+    #[test]
+    fn a_burst_of_blocks_raises_nothing() {
+        // 100 blocks at once: each new tip is checked at once, and the server catches up in seconds.
+        let mut t = Track::default();
+        for (i, tip) in (110..=200).step_by(10).enumerate() {
+            let behind = if tip == 200 { 194 } else { tip - 6 };
+            assert_eq!(judge(&mut t, tip, &ours, &answer(behind, tip), i as u64), Verdict::Agrees, "tip {tip}");
+        }
+        assert_eq!(judge(&mut t, 200, &ours, &answer(200, 200), 15), Verdict::Agrees);
+        // Behind again later, once: still nothing.
+        assert_eq!(judge(&mut t, 210, &ours, &answer(204, 210), 600), Verdict::Agrees);
     }
 
     #[test]

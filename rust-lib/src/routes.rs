@@ -337,6 +337,26 @@ impl Routes {
         }
     }
 
+    /// Whether the table routes anything: a server, Kyoto or the local node.
+    pub fn has_entries(&self) -> bool {
+        !self.every().is_empty() || self.kyoto.is_some() || self.local.is_some()
+    }
+
+    /// Regtest: the node module's table when it holds entries, with regtest.json's poll and
+    /// quorum; regtest.json's own servers when it holds none.
+    pub fn for_regtest(table: Option<Routes>, cfg: Option<&RegtestConfig>) -> Routes {
+        match table.filter(Routes::has_entries) {
+            Some(mut r) => {
+                if let Some(c) = cfg {
+                    r.poll_secs = c.poll_secs.unwrap_or(1);
+                    r.kyoto_required = c.kyoto_required.or(r.kyoto_required);
+                }
+                r
+            }
+            None => cfg.map(Routes::regtest).unwrap_or_default(),
+        }
+    }
+
     pub fn every(&self) -> Vec<&Source> {
         let mut seen = std::collections::BTreeSet::new();
         [&self.chain, &self.history, &self.pending, &self.fees, &self.broadcast, &self.check]
@@ -483,6 +503,19 @@ mod tests {
         assert!(resolve(&e("http://192.168.1.5/api", &pin), None).unwrap().down.unwrap().contains("https://"), "not plain http");
         assert!(resolve(&e("ssl://192.168.1.5:50002", "abcd"), None).unwrap().down.unwrap().contains("hex"));
         assert_eq!(resolve(&e("ssl://192.168.1.5:50002", ""), None).unwrap().pin, None, "an empty pin is none");
+    }
+
+    #[test]
+    fn regtest_takes_the_node_modules_routes_when_it_has_any() {
+        let cfg = RegtestConfig { electrum: vec!["tcp://127.0.0.1:60601".into()], poll_secs: Some(1), kyoto_required: Some(3), ..Default::default() };
+        let table = Routes::from_table(&table(None)).unwrap();
+        let r = Routes::for_regtest(Some(table), Some(&cfg));
+        assert_eq!((r.kyoto.is_some(), r.poll_secs, r.kyoto_required), (true, 1, Some(3)), "the table, regtest.json's poll and quorum");
+        let empty = Routes::from_table(&json!({"ok": true, "proxy": null}).to_string()).unwrap();
+        assert!(!empty.has_entries());
+        let r = Routes::for_regtest(Some(empty), Some(&cfg));
+        assert_eq!(r.chain[0].url, "tcp://127.0.0.1:60601", "nothing routed: regtest.json's servers");
+        assert_eq!(Routes::for_regtest(None, Some(&cfg)).history.len(), 1);
     }
 
     #[test]

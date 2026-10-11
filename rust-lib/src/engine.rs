@@ -243,7 +243,7 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
         "set_birthday" => Task::SetBirthday(match (&v["date"], &v["height"]) {
             (Value::String(d), Value::Null) if wallet::day_to_unix(d).is_some() => Birthday::Day(d.trim().to_string()),
             (Value::Null, Value::Number(n)) => Birthday::Height(n.as_u64().filter(|h| *h <= u32::MAX as u64).ok_or("height must be a whole number")? as u32),
-            _ => return Err("set_birthday takes { date: YYYY-MM-DD } or { height }".into()),
+            _ => return Err("invalid birthday: give { date: YYYY-MM-DD } or { height }".into()),
         }),
         _ => unreachable!(),
     })
@@ -315,7 +315,7 @@ impl Engine {
         }
         let task = match parse_task(kind, params) {
             Ok(t) => t,
-            Err(e) => return json!({"ok": false, "error": e}),
+            Err(e) => return json!({"ok": false, "error": e, "code": crate::jobs::code_of(&e)}),
         };
         let (id, receipt, cancel) = self.jobs.lock().unwrap().add(kind);
         match task {
@@ -540,7 +540,7 @@ impl Engine {
             reload_routes: reload.clone(),
             notify: self.notify(),
             rt: self.rt_handle.clone(),
-            routes_src: self.routes_src.clone().filter(|_| network != BNetwork::Regtest),
+            routes_src: self.routes_src.clone(),
             node_src: self.node_src.get().cloned(),
         };
         let thread = sync::spawn(ctx, authority).map_err(|e| e.to_string())?;
@@ -582,7 +582,8 @@ impl Engine {
             if let Some(r) = self.test_routes.lock().clone() {
                 return (r, None);
             }
-            return (regtest_config().map(Routes::regtest).unwrap_or_default(), None);
+            let table = self.routes_src.as_ref().and_then(|src| src.route_table(network.name()).and_then(|r| Routes::from_table(&r)).ok());
+            return (Routes::for_regtest(table, regtest_config()), None);
         }
         match &self.routes_src {
             None => (Routes::default(), Some("no route source: bitcoin_node_module is not available".into())),
@@ -699,7 +700,7 @@ impl Engine {
                 Birthday::Height(h) => h.saturating_sub(wallet::DATE_MARGIN_BLOCKS).max(net.activation_height(family)),
                 Birthday::Day(d) => {
                     let chain = crate::headers::HeaderChain::restore(net, cell.load_headers()?, now_secs() as u32);
-                    wallet::height_for_day(d, net, family, &chain).ok_or("no height for that day")?
+                    wallet::height_for_day(d, net, family, &chain).ok_or("invalid birthday: no height for that day")?
                 }
             };
             meta_set(&cell.conn, "birthday", &from.to_string()).map_err(|e| e.to_string())?;
@@ -1277,14 +1278,14 @@ pub fn resolve_birthday(
 fn refuse_birthday(b: &Birthday, first: Option<(u32, u64)>, now: u64) -> Result<(), String> {
     match b {
         Birthday::Height(h) => match first {
-            Some((fh, _)) if *h > fh => Err(format!("the wallet has a transaction at height {fh}, before a birthday at {h}")),
+            Some((fh, _)) if *h > fh => Err(format!("invalid birthday: the wallet has a transaction at height {fh}, before a birthday at {h}")),
             _ => Ok(()),
         },
         Birthday::Day(d) => {
-            let t = wallet::day_to_unix(d).ok_or("not a YYYY-MM-DD day")?;
+            let t = wallet::day_to_unix(d).ok_or("invalid birthday: not a YYYY-MM-DD day")?;
             match first {
-                _ if t > now as i64 => Err("the birthday is in the future".into()),
-                Some((fh, ft)) if t > ft as i64 => Err(format!("the wallet has a transaction from before {d}, at height {fh}")),
+                _ if t > now as i64 => Err("invalid birthday: the day is still to come".into()),
+                Some((fh, ft)) if t > ft as i64 => Err(format!("invalid birthday: the wallet has a transaction from before {d}, at height {fh}")),
                 _ => Ok(()),
             }
         }
@@ -1377,7 +1378,11 @@ mod tests {
         assert!(refuse_birthday(&day("2025-06-01"), first, now).is_ok(), "the same day");
         assert!(refuse_birthday(&day("2025-06-02"), first, now).is_err());
         assert!(refuse_birthday(&day("2026-10-10"), None, now).is_ok(), "today, with nothing known");
-        assert!(refuse_birthday(&day("2026-10-11"), None, now).unwrap_err().contains("future"));
+        assert!(refuse_birthday(&day("2026-10-11"), None, now).unwrap_err().contains("still to come"));
+        for e in [refuse_birthday(&Birthday::Height(900_001), first, now), refuse_birthday(&day("2026-10-11"), None, now)] {
+            assert_eq!(crate::jobs::code_of(&e.unwrap_err()), "invalid");
+        }
+        assert_eq!(crate::jobs::code_of(&parse_task("set_birthday", "{}").err().unwrap()), "invalid", "malformed");
         assert!(refuse_birthday(&Birthday::Height(u32::MAX), None, now).is_ok(), "nothing known: any height");
     }
 

@@ -265,6 +265,23 @@ impl T {
         }
     }
 
+    /// A job expected to fail: its code and error.
+    pub fn job_fail(&self, kind: &str, params: Value) -> (String, String) {
+        let r = self.engine.start_job(kind, &params.to_string());
+        let (id, receipt) = (r["jobId"].as_str().unwrap().to_string(), r["receipt"].as_str().unwrap().to_string());
+        let t0 = Instant::now();
+        loop {
+            let s = self.engine.jobs().status(&id, &receipt);
+            match s["state"].as_str().unwrap() {
+                "failed" => return (s["code"].as_str().unwrap_or("").to_string(), s["error"].as_str().unwrap_or("").to_string()),
+                "done" => panic!("{kind} should have failed: {s}"),
+                _ => {}
+            }
+            assert!(t0.elapsed() < Duration::from_secs(120), "{kind} timed out");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// A job expected to fail: its error.
     pub fn job_err(&self, kind: &str, params: Value) -> String {
         let r = self.engine.start_job(kind, &params.to_string());
