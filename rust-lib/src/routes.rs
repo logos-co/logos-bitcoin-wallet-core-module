@@ -26,10 +26,17 @@ pub enum Kind {
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
     pub id: String,
+    #[serde(default)]
     pub url: String,
     #[serde(default)]
     pub operator: String,
     pub route: Route,
+    /// kyoto, electrum, esplora or local; read from the URL when absent.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The source needs credentials, fetched with the node module's source_credentials.
+    #[serde(default)]
+    pub credentials: bool,
 }
 
 /// One reachable source with how to reach it.
@@ -42,6 +49,7 @@ pub struct Source {
     pub kind: Kind,
     /// Why it can't be used, if it can't: a Tor route with no proxy, a bad URL.
     pub down: Option<String>,
+    pub credentials: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +94,8 @@ impl Isolation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Routes {
     pub proxy: Option<Proxy>,
+    /// Chain entries of kinds this pass doesn't speak, such as Kyoto: the authority waits for them.
+    pub unsupported_chain: Vec<String>,
     pub chain: Vec<Source>,
     pub history: Vec<Source>,
     pub pending: Vec<Source>,
@@ -141,7 +151,13 @@ fn plaintext(url: &str) -> bool {
 /// Decides whether and how an entry is reachable. Plain text crosses only Tor to an onion service
 /// or the user's own network; everything else is TLS.
 pub fn resolve(e: &Entry, proxy: Option<&Proxy>) -> Option<Source> {
-    let kind = kind_of(&e.url)?;
+    let kind = match e.kind.as_deref() {
+        Some("electrum") => Kind::Electrum,
+        Some("esplora") => Kind::Esplora,
+        // Kyoto and the local node come in later passes.
+        Some(_) => return None,
+        None => kind_of(&e.url)?,
+    };
     let host = host_of(&e.url).unwrap_or_default().to_string();
     let onion = is_onion(&host);
     let down = match e.route {
@@ -155,7 +171,7 @@ pub fn resolve(e: &Entry, proxy: Option<&Proxy>) -> Option<Source> {
         _ if host.is_empty() => Some("no host in the URL".to_string()),
         _ => None,
     };
-    Some(Source { id: e.id.clone(), url: e.url.clone(), operator: e.operator.clone(), route: e.route, kind, down })
+    Some(Source { id: e.id.clone(), url: e.url.clone(), operator: e.operator.clone(), route: e.route, kind, down, credentials: e.credentials })
 }
 
 impl Routes {
@@ -177,7 +193,16 @@ impl Routes {
             };
             Ok(entries.iter().filter_map(|e| resolve(e, proxy.as_ref())).collect())
         };
+        let unsupported_chain: Vec<String> = match v.get("chain") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter(|e| matches!(e["kind"].as_str(), Some("kyoto") | Some("local")))
+                .filter_map(|e| e["id"].as_str().map(str::to_string))
+                .collect(),
+            _ => vec![],
+        };
         Ok(Routes {
+            unsupported_chain,
             chain: role("chain")?.into_iter().filter(|s| s.kind == Kind::Electrum).collect(),
             history: role("history")?,
             pending: role("pending")?,
@@ -194,10 +219,10 @@ impl Routes {
     pub fn regtest(cfg: &RegtestConfig) -> Self {
         let mut all = vec![];
         for (i, url) in cfg.electrum.iter().enumerate() {
-            all.push(Entry { id: format!("electrum-{i}"), url: url.clone(), operator: format!("regtest-{i}"), route: Route::Direct });
+            all.push(Entry { id: format!("electrum-{i}"), url: url.clone(), operator: format!("regtest-{i}"), route: Route::Direct, kind: None, credentials: false });
         }
         for (i, url) in cfg.esplora.iter().enumerate() {
-            all.push(Entry { id: format!("esplora-{i}"), url: url.clone(), operator: format!("regtest-esplora-{i}"), route: Route::Direct });
+            all.push(Entry { id: format!("esplora-{i}"), url: url.clone(), operator: format!("regtest-esplora-{i}"), route: Route::Direct, kind: None, credentials: false });
         }
         let sources: Vec<Source> = all.iter().filter_map(|e| resolve(e, None)).collect();
         Routes {
@@ -210,6 +235,7 @@ impl Routes {
             check: sources.clone(),
             cross_check: sources.len() > 1,
             poll_secs: cfg.poll_secs.unwrap_or(1),
+            unsupported_chain: vec![],
         }
     }
 
@@ -245,7 +271,7 @@ mod tests {
         json!({
             "ok": true,
             "proxy": proxy,
-            "chain": [e("a", "ssl://electrum.example:50002".into(), "tor"), e("k", "kyoto://peers".into(), "tor")],
+            "chain": [e("a", "ssl://electrum.example:50002".into(), "tor"), {"id": "kyoto", "kind": "kyoto", "url": "", "operator": "kyoto", "route": "onion"}],
             "history": [e("a", "ssl://electrum.example:50002".into(), "tor"), e("o", format!("tcp://{}:50001", onion()), "onion")],
             "fees": [e("f", "https://esplora.example/api".into(), "tor")],
             "broadcast": [e("a", "ssl://electrum.example:50002".into(), "tor")],
@@ -260,6 +286,7 @@ mod tests {
         let r = Routes::from_table(&table(Some("socks5h://127.0.0.1:9050"))).unwrap();
         assert_eq!(r.proxy, Some(Proxy { host: "127.0.0.1".into(), port: 9050 }));
         assert_eq!(r.chain.len(), 1, "Kyoto entries wait for the Kyoto pass");
+        assert_eq!(r.unsupported_chain, vec!["kyoto".to_string()]);
         assert!(r.history.iter().all(|s| s.down.is_none()));
         assert_eq!(r.history[1].kind, Kind::Electrum);
         assert_eq!(r.fees[0].kind, Kind::Esplora);
@@ -280,7 +307,7 @@ mod tests {
     #[test]
     fn plain_text_only_to_onions_and_our_own_network() {
         let p = Proxy::parse("socks5h://127.0.0.1:9050").unwrap();
-        let e = |url: &str, route| Entry { id: "x".into(), url: url.into(), operator: String::new(), route };
+        let e = |url: &str, route| Entry { id: "x".into(), url: url.into(), operator: String::new(), route, kind: None, credentials: false };
         assert!(resolve(&e("tcp://electrum.example:50001", Route::Tor), Some(&p)).unwrap().down.is_some());
         assert!(resolve(&e("tcp://electrum.example:50001", Route::Direct), None).unwrap().down.is_some());
         assert!(resolve(&e("tcp://127.0.0.1:60401", Route::Direct), None).unwrap().down.is_none());
@@ -293,6 +320,21 @@ mod tests {
         assert!(resolve(&e("ftp://x", Route::Direct), None).is_none());
         assert_eq!(host_of("ssl://[fd00::2]:50002"), Some("fd00::2"));
         assert_eq!(host_of("https://esplora.example/api"), Some("esplora.example"));
+    }
+
+    #[test]
+    fn the_node_modules_table_reads_whole() {
+        // bitcoin_node_module's route_table: kinds named, credentials flagged, Kyoto in the chain.
+        let reply = json!({"ok": true, "network": "signet", "proxy": "socks5h://127.0.0.1:9050",
+            "chain": [{"id": "kyoto", "kind": "kyoto", "url": "", "operator": "kyoto", "route": "onion"}],
+            "history": [{"id": "x", "kind": "esplora", "url": "https://esplora.example/api", "operator": "esplora.example", "route": "tor", "credentials": true}],
+            "pending": [], "fees": [{"id": "e1", "kind": "electrum", "url": "ssl://electrum.example.com:50002", "operator": "example.com", "route": "tor"}],
+            "broadcast": [], "check": [], "peers": ["a.onion:38333"], "crossCheck": false, "unrouted": []})
+        .to_string();
+        let r = Routes::from_table(&reply).unwrap();
+        assert!(r.chain.is_empty() && r.unsupported_chain == vec!["kyoto".to_string()]);
+        assert!(r.history[0].credentials && r.history[0].kind == Kind::Esplora && r.history[0].down.is_none());
+        assert_eq!(r.fees[0].kind, Kind::Electrum);
     }
 
     #[test]

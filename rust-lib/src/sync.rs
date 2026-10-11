@@ -44,7 +44,11 @@ pub type Notify = Arc<dyn Fn(Note) + Send + Sync>;
 pub trait RouteSource: Send + Sync {
     fn route_table(&self, network: &str) -> Result<String, String>;
     /// Tells the node module a source served something false. Best effort.
-    fn report_mismatch(&self, _network: &str, _source: &str) {}
+    fn report_mismatch(&self, _network: &str, _source: &str, _kind: &str, _height: Option<u32>) {}
+    /// An Esplora server's `(username, password)`, held by the node module, never stored here.
+    fn source_credentials(&self, _network: &str, _source: &str) -> Result<Option<(String, String)>, String> {
+        Ok(None)
+    }
 }
 
 /// What the sync thread shares with readers and with send jobs.
@@ -147,7 +151,7 @@ impl Loop {
                 let _ = cell.store_suspect(source, reason, self.now());
             }
             if let Some(r) = &self.ctx.routes_src {
-                r.report_mismatch(self.ctx.net.name(), source);
+                r.report_mismatch(self.ctx.net.name(), source, "wallet_core", None);
             }
             self.alert(source, "suspect", reason.to_string());
         }
@@ -188,7 +192,11 @@ impl Loop {
                 let mut ns = self.ctx.netstate.lock();
                 (ns.routes.proxy.clone(), ns.iso(&s.id))
             };
-            let c = net::esplora(s, proxy.as_ref(), &iso)?;
+            let creds = match (&self.ctx.routes_src, s.credentials) {
+                (Some(r), true) => r.source_credentials(self.ctx.net.name(), &s.id)?.map(|(u, p)| zeroize::Zeroizing::new((u, p))),
+                _ => None,
+            };
+            let c = net::esplora(s, proxy.as_ref(), &iso, creds.as_deref())?;
             self.esplora.insert(s.id.clone(), c);
         }
         Ok(&self.esplora[&s.id])
@@ -212,6 +220,16 @@ impl Loop {
                 .cloned()
                 .collect()
         };
+        if sources.is_empty() {
+            let ns = self.ctx.netstate.lock();
+            let why = if !ns.routes.unsupported_chain.is_empty() {
+                format!("the chain is set to {}, which comes in a later pass; enable an Electrum server for it", ns.routes.unsupported_chain.join(", "))
+            } else {
+                "no Electrum server is usable for the chain".to_string()
+            };
+            drop(ns);
+            self.ctx.progress.lock().last_error = Some(why);
+        }
         let mut ready = vec![];
         for s in &sources {
             match self.electrum(s) {
@@ -653,7 +671,10 @@ impl Loop {
         let poll = Duration::from_secs(self.ctx.netstate.lock().routes.poll_secs.max(1));
         let history_every = poll.max(Duration::from_secs(if poll <= Duration::from_secs(5) { 1 } else { 60 }));
         while !self.stopped() {
-            if self.ctx.reload_routes.swap(false, Ordering::SeqCst) || self.last_routes.elapsed() >= ROUTES_EVERY {
+            // Without routes, as when the node module wasn't up at open, ask again soon.
+            let none = self.ctx.routes_src.is_some() && self.ctx.netstate.lock().routes.every().is_empty();
+            let due = if none { Duration::from_secs(15) } else { ROUTES_EVERY };
+            if self.ctx.reload_routes.swap(false, Ordering::SeqCst) || self.last_routes.elapsed() >= due {
                 self.reload_routes();
             }
             let moved = self.refresh_authority();

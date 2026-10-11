@@ -69,7 +69,8 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
 
-#[allow(non_snake_case)]
+// Read by logos-lidl-gen, which generates the emitters.
+#[allow(dead_code, non_snake_case)]
 pub trait BitcoinWalletCoreModuleEvents {
     /// status()'s shape, when what it says changes.
     fn walletStateChanged(&self, payload: String);
@@ -372,8 +373,28 @@ impl RouteSource for NodeIpc {
         Ok(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
     }
 
-    fn report_mismatch(&self, network: &str, source: &str) {
-        self.p().call_json_async_with_timeout("report_mismatch", &json!([network, source]), BUDGET, |_| {});
+    fn report_mismatch(&self, network: &str, source: &str, kind: &str, height: Option<u32>) {
+        let h = height.map(|h| h.to_string()).unwrap_or_default();
+        self.p().call_json_async_with_timeout("report_mismatch", &json!([network, source, kind, h]), BUDGET, |_| {});
+    }
+
+    fn source_credentials(&self, network: &str, source: &str) -> Result<Option<(String, String)>, String> {
+        let (tx, rx) = sync_channel(1);
+        self.p().call_json_async_with_timeout("source_credentials", &json!([network, source]), BUDGET, move |r| {
+            let _ = tx.send(r);
+        });
+        let v = wait(rx)?;
+        let reply: Value = match v.as_str() {
+            Some(s) => serde_json::from_str(s).map_err(|e| e.to_string())?,
+            None => v,
+        };
+        if reply["ok"] != true {
+            return Err(reply["error"].as_str().unwrap_or("source_credentials refused").to_string());
+        }
+        Ok(match (reply["username"].as_str(), reply["password"].as_str()) {
+            (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+            _ => None,
+        })
     }
 }
 

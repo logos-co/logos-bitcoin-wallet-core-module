@@ -39,12 +39,18 @@ pub fn electrum(src: &Source, proxy: Option<&Proxy>, iso: &Isolation) -> Result<
     electrum_client::Client::from_config(&src.url, b.build()).map_err(|e| format!("{}: {e}", src.id))
 }
 
-/// An Esplora client on the source's route, with a generic user agent.
-pub fn esplora(src: &Source, proxy: Option<&Proxy>, iso: &Isolation) -> Result<esplora_client::AsyncClient, String> {
+/// An Esplora client on the source's route, with a generic user agent and, where the source
+/// needs them, the credentials the node module holds.
+pub fn esplora(src: &Source, proxy: Option<&Proxy>, iso: &Isolation, credentials: Option<&(String, String)>) -> Result<esplora_client::AsyncClient, String> {
     if let Some(d) = &src.down {
         return Err(format!("{}: {d}", src.id));
     }
     let mut b = esplora_client::Builder::new(src.url.trim_end_matches('/')).timeout(timeout_for(src).as_secs());
+    if let Some((user, pass)) = credentials {
+        use base64::Engine;
+        let token = zeroize::Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
+        b = b.header("Authorization", &format!("Basic {}", token.as_str()));
+    }
     if matches!(src.route, Route::Tor | Route::Onion) {
         let p = proxy.ok_or_else(|| format!("{}: routed through Tor, and no proxy is set", src.id))?;
         b = b.proxy(&format!("socks5h://{}:{}@{}", iso.user, iso.pass, p.addr()));
@@ -252,7 +258,7 @@ mod tests {
     use crate::routes::{Kind, Route};
 
     fn src(url: &str, route: Route, down: Option<&str>) -> Source {
-        Source { id: "s".into(), url: url.into(), operator: "op".into(), route, kind: Kind::Electrum, down: down.map(str::to_string) }
+        Source { id: "s".into(), url: url.into(), operator: "op".into(), route, kind: Kind::Electrum, down: down.map(str::to_string), credentials: false }
     }
 
     #[test]
@@ -260,7 +266,7 @@ mod tests {
         let iso = Isolation::fresh();
         let e = electrum(&src("ssl://electrum.example:50002", Route::Tor, None), None, &iso).err().unwrap();
         assert!(e.contains("no proxy"), "{e}");
-        let e = esplora(&src("https://esplora.example/api", Route::Tor, None), None, &iso).err().unwrap();
+        let e = esplora(&src("https://esplora.example/api", Route::Tor, None), None, &iso, None).err().unwrap();
         assert!(e.contains("no proxy"), "{e}");
         let e = electrum(&src("tcp://x:1", Route::Direct, Some("down for a reason")), None, &iso).err().unwrap();
         assert!(e.contains("down for a reason"));

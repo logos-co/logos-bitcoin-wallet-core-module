@@ -661,8 +661,11 @@ impl Engine {
     }
 
     fn build_send(&self, v: &Value) -> Result<Value, String> {
-        let net = self.with_open(|w| Ok(w.network))?;
+        let (net, known) = self.with_open(|w| Ok((w.network, w.progress.lock().fees.is_some())))?;
         let input = send::parse_input(v, net)?;
+        if input.fee_rate.is_none() && !known {
+            return Err("no fee estimate yet: give feeRate, or wait for the fee sources".into());
+        }
         let rate = send::rate_for(input.fee_rate, input.target.as_deref(), &self.fee_rates())?;
         self.cell_job(Duration::from_secs(60), |cell| {
             let psbt = send::build(cell, &input, rate)?;
@@ -811,7 +814,11 @@ impl Engine {
                     Err(e) => Err(e.to_string()),
                 }),
                 Kind::Esplora => {
-                    let c = crate::net::esplora(&s, proxy.as_ref(), &iso)?;
+                    let creds = match (&self.routes_src, s.credentials) {
+                        (Some(r), true) => r.source_credentials(&self.light.lock().network.map(|n| n.name()).unwrap_or_default(), &s.id)?.map(Zeroizing::new),
+                        _ => None,
+                    };
+                    let c = crate::net::esplora(&s, proxy.as_ref(), &iso, creds.as_deref())?;
                     match self.rt_handle.block_on(c.broadcast(tx)) {
                         Ok(()) => Ok(if self.rt_handle.block_on(c.get_tx(&txid)).ok().flatten().is_some() { Outcome::Seen } else { Outcome::Requested }),
                         Err(e) => Err(e.to_string()),
@@ -1018,7 +1025,8 @@ impl Engine {
     pub fn sources_status(&self) -> Value {
         match self.with_open(|w| {
             let ns = w.netstate.lock();
-            Ok(json!({"ok": true, "proxy": ns.routes.proxy.as_ref().map(|p| p.addr()), "crossCheck": ns.routes.cross_check, "sources": ns.ledger.status(&ns.routes)}))
+            Ok(json!({"ok": true, "proxy": ns.routes.proxy.as_ref().map(|p| p.addr()), "crossCheck": ns.routes.cross_check,
+                      "unsupportedChain": ns.routes.unsupported_chain, "sources": ns.ledger.status(&ns.routes)}))
         }) {
             Ok(v) => v,
             Err(e) => json!({"ok": false, "error": e}),
