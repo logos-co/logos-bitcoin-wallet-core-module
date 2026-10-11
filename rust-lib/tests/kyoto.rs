@@ -44,7 +44,8 @@ fn kyoto_is_the_authority_on_regtest() {
         // One electrs only to be checked against Kyoto's headers; Kyoto finds the payments.
         electrum: electrum.into_iter().collect(),
         poll_secs: Some(1),
-        kyoto_required: Some(2),
+        // All three peers connected, so the forging one is always asked.
+        kyoto_required: Some(3),
         ..Default::default()
     });
     let (sink, events) = collecting();
@@ -61,7 +62,7 @@ fn kyoto_is_the_authority_on_regtest() {
     let st = t.engine.status();
     assert_eq!(st["authority"]["kind"], "kyoto", "{st}");
     assert_eq!(st["kyoto"]["phase"], "synced", "{st}");
-    t.wait("a quorum of two peers", 15, || kyoto(&t)["connected"].as_u64().unwrap_or(0) >= 2);
+    t.wait("a quorum of three peers", 15, || kyoto(&t)["connected"].as_u64().unwrap_or(0) >= 3);
     println!("KYOTO first sync to {} in {} ms", t.tip(), started.elapsed().as_millis());
     assert_eq!(t.engine.history(0)["total"], 0, "start from a fresh `chain.sh prepare`");
 
@@ -146,8 +147,9 @@ fn kyoto_is_the_authority_on_regtest() {
     println!("KYOTO restarts: {} after NoReachablePeers; last stop: {}", k["restarts"], k["lastStop"]);
     assert!(k["lastStop"].as_str().unwrap_or("").contains("exhausted"), "{k}");
 
-    // A peer forging filter headers: it answers first, three times over; the honest peers later.
-    // Patch 1 counts it once, so its batch never stands alone: no update hides the payment.
+    // A peer forging filter headers: it answers first, five times over, enough for a quorum of
+    // three without patch 1; the honest peers answer later. Patch 1 counts it once: no update
+    // hides the payment.
     let addr4 = t.engine.next_address()["address"].as_str().unwrap().to_string();
     let raw = t.wallet_rpc("createrawtransaction", json!([[], {addr4.clone(): 0.05}]));
     let funded_raw = t.wallet_rpc("fundrawtransaction", json!([raw]))["hex"].clone();
@@ -157,7 +159,7 @@ fn kyoto_is_the_authority_on_regtest() {
     let miner = t.wallet_rpc("getnewaddress", json!(["mine"]));
     let block = t.rpc("generateblock", json!([miner, [signed], false]));
     let target: bitcoin::BlockHash = block["hash"].as_str().unwrap().parse().unwrap();
-    proxies[0].set(Mode::Forge { block: target, copies: 3 });
+    proxies[0].set(Mode::Forge { block: target, copies: 5 });
     proxies[1].set(delay("cfheaders", 2_000));
     proxies[2].set(delay("cfheaders", 2_000));
     let restarts = kyoto(&t)["restarts"].as_u64().unwrap();
@@ -186,4 +188,41 @@ fn kyoto_is_the_authority_on_regtest() {
     let unload_ms = t0.elapsed().as_millis();
     println!("KYOTO shutdown in {unload_ms} ms; whole run {} s", started.elapsed().as_secs());
     assert!(unload_ms < 2000, "unload took {unload_ms} ms");
+}
+
+/// A first sync through Kyoto on a long regtest chain, for time and memory: run alone, with
+/// KYOTO_BLOCKS blocks mined first (default 5,000), under /usr/bin/time for the peak.
+#[test]
+#[ignore]
+fn kyoto_first_sync_on_a_long_chain() {
+    let Some((rpc, cookie)) = common::chain_env() else {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    };
+    let nodes: Vec<String> = chain(&["peers"]).trim().split(',').map(str::to_string).collect();
+    configure_regtest(RegtestConfig { kyoto: nodes, poll_secs: Some(1), kyoto_required: Some(2), ..Default::default() });
+    let (sink, events) = collecting();
+    let manager = Arc::new(MockManager::new(Duration::from_millis(100)));
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::new(root.path().join("wallets"), sink, manager.clone(), None);
+    let t = T { engine, rpc, cookie, events, manager };
+    let blocks: u32 = std::env::var("KYOTO_BLOCKS").ok().and_then(|b| b.parse().ok()).unwrap_or(5_000);
+    let have = t.tip() as u32;
+    let miner = t.wallet_rpc("getnewaddress", json!(["mine"]));
+    let mut left = blocks.saturating_sub(have);
+    while left > 0 {
+        let n = left.min(1_000);
+        t.rpc("generatetoaddress", json!([n, miner]));
+        left -= n;
+    }
+    // A payment near the tip, for the filters to find.
+    let started = Instant::now();
+    t.job("open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+    let addr = t.engine.next_address()["address"].as_str().unwrap().to_string();
+    let paid = t.fund(&addr, 0.5).to_string();
+    t.mine(1);
+    t.synced();
+    t.wait("the payment found", 600, || t.row(&paid)["state"] == "confirmed");
+    println!("KYOTO first sync of {} blocks in {} ms", t.tip(), started.elapsed().as_millis());
+    t.engine.shutdown();
 }

@@ -127,6 +127,67 @@ pub fn spki_of(cert: &[u8]) -> Option<&[u8]> {
     (spki_tag == 0x30).then(|| &rest[..rest.len() - after.len()])
 }
 
+/// Accepts any certificate that signs the handshake with its own key, and keeps its SHA-256:
+/// what a probe would offer the person to pin, trusting it on first use.
+#[derive(Debug)]
+struct Capture {
+    seen: std::sync::Mutex<Option<[u8; 32]>>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for Capture {
+    fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        *self.seen.lock().unwrap() = Some(Sha256::digest(end_entity.as_ref()).into());
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify(message, cert, dss, &self.provider, false)
+    }
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify(message, cert, dss, &self.provider, true)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn tcp(host: &str, port: u16, proxy: Option<(&Proxy, &Isolation)>, timeout: Duration) -> Result<TcpStream, String> {
+    let tcp = match proxy {
+        Some((p, iso)) => Socks5Stream::connect_with_password(p.addr(), (host, port), &iso.user, &iso.pass, Some(timeout)).map_err(|e| e.to_string())?.into_inner(),
+        None => {
+            let addr = (host, port).to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("the server's name resolves to nothing")?;
+            TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?
+        }
+    };
+    tcp.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    Ok(tcp)
+}
+
+/// The SHA-256 of the end-entity certificate `url` presents, read in a handshake that proves
+/// the server holds its key. A pin taken this way trusts the first answer.
+pub fn certificate_sha256(url: &str, proxy: Option<(&Proxy, &Isolation)>, timeout: Duration) -> Result<[u8; 32], String> {
+    use std::io::Write;
+    let (host, port) = host_port(url)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let capture = Arc::new(Capture { seen: Default::default(), provider: provider.clone() });
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(capture.clone())
+        .with_no_client_auth();
+    let name = ServerName::try_from(host.clone()).map_err(|_| format!("{host} is not a server name"))?;
+    let session = ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
+    let mut stream = StreamOwned::new(session, tcp(&host, port, proxy, timeout)?);
+    stream.flush().map_err(|e| e.to_string())?;
+    while stream.conn.is_handshaking() {
+        stream.conn.complete_io(&mut stream.sock).map_err(|e| e.to_string())?;
+    }
+    let seen = *capture.seen.lock().unwrap();
+    seen.ok_or_else(|| "the server presented no certificate".into())
+}
+
 fn host_port(url: &str) -> Result<(String, u16), String> {
     let rest = url.strip_prefix("ssl://").ok_or("a pinned certificate is for an ssl:// server")?;
     let rest = rest.split(['/', '?']).next().unwrap_or(rest);
@@ -139,15 +200,7 @@ fn host_port(url: &str) -> Result<(String, u16), String> {
 /// proxy with its own circuit when `proxy` is given.
 pub fn connect(url: &str, pin: [u8; 32], proxy: Option<(&Proxy, &Isolation)>, timeout: Duration) -> Result<RawClient<ElectrumSslStream>, String> {
     let (host, port) = host_port(url)?;
-    let tcp = match proxy {
-        Some((p, iso)) => Socks5Stream::connect_with_password(p.addr(), (host.as_str(), port), &iso.user, &iso.pass, Some(timeout)).map_err(|e| e.to_string())?.into_inner(),
-        None => {
-            let addr = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("the server's name resolves to nothing")?;
-            TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?
-        }
-    };
-    tcp.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
-    tcp.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    let tcp = tcp(&host, port, proxy, timeout)?;
     let verifier = Arc::new(Pinned::new(pin));
     let config = ClientConfig::builder_with_provider(verifier.provider.clone())
         .with_safe_default_protocol_versions()
@@ -255,6 +308,19 @@ mod tests {
             let other = connect(&url, pin_of(V3_KEY), None, Duration::from_secs(5)).err().expect("another pin is refused");
             assert!(other.contains("not the pinned one"), "{other}");
         }
+    }
+
+    #[test]
+    fn a_probe_reads_the_pin_a_connection_then_accepts() {
+        for (cert, key) in [(V1, V1_KEY), (V3, V3_KEY)] {
+            let port = server(cert, key, false);
+            let url = format!("ssl://127.0.0.1:{port}");
+            let pin = certificate_sha256(&url, None, Duration::from_secs(5)).unwrap();
+            assert_eq!(pin, pin_of(cert));
+            connect(&url, pin, None, Duration::from_secs(5)).unwrap();
+        }
+        let port = server(V3, V1_KEY, false);
+        assert!(certificate_sha256(&format!("ssl://127.0.0.1:{port}"), None, Duration::from_secs(5)).is_err(), "no pin from a server without the key");
     }
 
     #[test]

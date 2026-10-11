@@ -480,6 +480,34 @@ mod tests {
     }
 
     #[test]
+    fn kyoto_and_the_node_feed_the_same_checks() {
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
+        a.set_kind(KYOTO);
+        let honest = chain_of(20, 7);
+        let c = a.adopt(0, &honest[1..], NOW);
+        assert!(c.tip_moved && c.suspects.is_empty(), "{c:?}");
+        assert_eq!((a.tip_height(), a.kind()), (Some(20), KYOTO));
+        // A heavier branch from 15 reorganizes; an empty branch at the tip only confirms it.
+        let mut fork = honest[..16].to_vec();
+        fork.extend(regtest_branch(&honest[15], 7, honest[15].time + 1, 8));
+        let c = a.adopt(15, &fork[16..], NOW);
+        assert_eq!((c.reorg_depth, c.changed_from), (5, Some(16)));
+        assert!(a.replaced(18, honest[18].block_hash()));
+        assert!(!a.adopt(22, &[], NOW).tip_moved);
+        // A header that fails the checks is the feeder's fault, named by kind.
+        let mut bad = regtest_branch(&fork[22], 2, fork[22].time, 9);
+        bad[1].prev_blockhash = BlockHash::all_zeros();
+        let c = a.adopt(22, &bad, NOW);
+        assert_eq!(c.suspects.len(), 1);
+        assert_eq!(c.suspects[0].0, KYOTO);
+        assert_eq!(a.tip_height(), Some(23), "the valid prefix still counts");
+        a.set_peers(3);
+        assert_eq!(a.summary(u64::from(NOW)).peers, 3);
+        a.note_old(3, honest[3].block_hash());
+        assert_eq!(a.hash_at(3), Some(honest[3].block_hash()), "above the checkpoint the chain answers");
+    }
+
+    #[test]
     fn heights_below_the_checkpoint_are_proved_by_linkage() {
         let full = chain_of(20, 6);
         // Trust height 10 as if it were the checkpoint.

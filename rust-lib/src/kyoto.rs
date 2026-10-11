@@ -225,26 +225,31 @@ pub enum Feed {
     Stopped(Option<String>),
 }
 
-/// The phase a client is in, for status.
+/// The phase a client is in, for status. Kyoto reports progress only as whole batches finish, so
+/// a catch-up within one batch reads `syncing` until its filters are in; `headers` in status
+/// is Kyoto's best header, to compare with a peer's tip.
 pub fn phase(updated: bool, fraction: f32) -> &'static str {
     // Filter headers count a quarter of the work; past it, filters are downloading.
     match (updated, fraction) {
         (true, _) => "synced",
-        (false, f) if f <= 0.0 => "headers",
+        (false, f) if f <= 0.0 => "syncing",
         (false, f) if f < 0.25 => "filter_headers",
         _ => "filters",
     }
 }
 
-/// One running light client: its tasks run on the engine's runtime.
+/// One running light client, on a runtime of its own: bip157 spawns a task per peer, and
+/// dropping the node leaves them spinning on a closed channel, so a stop shuts the runtime down.
 pub struct Client {
     pub requester: Requester,
     feed: Receiver<Feed>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// The subset this start dials, and those seen connected.
+    rt: Option<tokio::runtime::Runtime>,
+    /// The subset this start dials, those named on the user's network, and those seen connected.
     pub peers: Vec<String>,
+    lan: HashSet<String>,
     seen: Arc<Mutex<HashSet<String>>>,
     connected: Arc<Mutex<usize>>,
+    best_header: Arc<Mutex<u32>>,
     /// The wallet's last revealed indices when the client cloned its address index.
     pub revealed: [Option<u32>; 2],
     pub start: Start,
@@ -255,8 +260,8 @@ pub struct Client {
 const KEYCHAINS: [KeychainKind; 2] = [KeychainKind::External, KeychainKind::Internal];
 
 impl Client {
-    /// Builds and starts a client on `rt` for `wallet`, dialling `peers` on `route`.
-    pub fn start(rt: &tokio::runtime::Handle, wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start) -> Result<Client, String> {
+    /// Builds and starts a client for `wallet`, dialling `peers` on `route`.
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start) -> Result<Client, String> {
         let net = wallet.network();
         let default_port = match net {
             bitcoin::Network::Bitcoin => 8333,
@@ -296,26 +301,27 @@ impl Client {
         let (client, logging, mut updates) = client.subscribe();
         let (client, node) = client.managed_start();
         let requester = client.requester();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("bitcoin-kyoto").enable_all().build().map_err(|e| e.to_string())?;
         let (tx, feed) = channel::<Feed>();
-        let mut tasks = vec![];
         let stopped = tx.clone();
-        tasks.push(rt.spawn(async move {
+        rt.spawn(async move {
             let why = node.run().await.err().map(|e| e.to_string());
             let _ = stopped.send(Feed::Stopped(why));
-        }));
+        });
         let updated = tx.clone();
-        tasks.push(rt.spawn(async move {
+        rt.spawn(async move {
             while let Ok(u) = updates.update().await {
                 if updated.send(Feed::Update(Box::new(u))).is_err() {
                     break;
                 }
             }
-        }));
-        tasks.push(rt.spawn(drain_logs(logging, tx.clone())));
-        let (seen, connected) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)));
-        tasks.push(rt.spawn(watch_peers(requester.clone(), dial.clone(), seen.clone(), connected.clone())));
+        });
+        rt.spawn(drain_logs(logging, tx.clone()));
+        let (seen, connected, best_header) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)), Arc::new(Mutex::new(start.from.0)));
+        rt.spawn(watch_peers(requester.clone(), dial.clone(), seen.clone(), connected.clone(), best_header.clone()));
         tracing::info!(target: "bitcoin", "kyoto: started after {} with {} peers, quorum {required}{}", start.from.0, dial.len(), if start.headers_only { ", headers first" } else { "" });
-        Ok(Client { requester, feed, tasks, peers: dial.into_iter().map(|(p, _)| p).collect(), seen, connected, revealed, start, started: Instant::now(), updated: false })
+        let lan = dial.iter().filter(|(_, p)| matches!(p, Peer::Lan(..))).map(|(t, _)| t.clone()).collect();
+        Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, connected, best_header, revealed, start, started: Instant::now(), updated: false })
     }
 
     pub fn poll(&mut self) -> Vec<Feed> {
@@ -330,10 +336,16 @@ impl Client {
         *self.connected.lock().unwrap()
     }
 
-    /// The peers of this start never seen connected.
+    /// Kyoto's best header height, as last asked.
+    pub fn best_header(&self) -> u32 {
+        *self.best_header.lock().unwrap()
+    }
+
+    /// The peers of this start never seen connected; names on the user's network resolve to
+    /// addresses that can't be told apart, so they don't count.
     pub fn unseen(&self) -> Vec<String> {
         let seen = self.seen.lock().unwrap();
-        self.peers.iter().filter(|p| !seen.contains(*p)).cloned().collect()
+        self.peers.iter().filter(|p| !seen.contains(*p) && !self.lan.contains(*p)).cloned().collect()
     }
 
     pub fn seen(&self) -> Vec<String> {
@@ -345,12 +357,22 @@ impl Client {
         KEYCHAINS.iter().zip(self.revealed).any(|(k, at_build)| past_lookahead(at_build, wallet.derivation_index(*k)))
     }
 
-    /// Stops the node and its tasks; nothing waits on the network.
-    pub fn stop(self) {
+    /// Stops the node and every task of its runtime, peers included; nothing waits.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
         let _ = self.requester.shutdown();
-        for t in self.tasks {
-            t.abort();
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
         }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -397,9 +419,12 @@ async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>) {
     }
 }
 
-async fn watch_peers(requester: Requester, dial: Vec<(String, Peer)>, seen: Arc<Mutex<HashSet<String>>>, connected: Arc<Mutex<usize>>) {
+async fn watch_peers(requester: Requester, dial: Vec<(String, Peer)>, seen: Arc<Mutex<HashSet<String>>>, connected: Arc<Mutex<usize>>, best_header: Arc<Mutex<u32>>) {
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(Ok(tip)) = tokio::time::timeout(Duration::from_secs(2), requester.chain_tip()).await {
+            *best_header.lock().unwrap() = tip.height;
+        }
         let Ok(Ok(info)) = tokio::time::timeout(Duration::from_secs(2), requester.peer_info()).await else {
             if !requester.is_running() {
                 return;
@@ -594,7 +619,7 @@ mod tests {
 
     #[test]
     fn phases_for_status() {
-        assert_eq!(phase(false, 0.0), "headers");
+        assert_eq!(phase(false, 0.0), "syncing");
         assert_eq!(phase(false, 0.1), "filter_headers");
         assert_eq!(phase(false, 0.25), "filters", "filter headers done, filters pending");
         assert_eq!(phase(false, 0.6), "filters");

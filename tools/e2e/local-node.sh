@@ -26,8 +26,8 @@ keystore_side
 step "bitcoind_module on regtest; logosctl may mine there as the host"
 ctl module load bitcoind_module
 sleep 2
-NODE_DIR="$(dirname "$(find session home -name bitcoind.json -path '*bitcoind_module*' 2>/dev/null | head -1)")"
-[ -n "$NODE_DIR" ] && [ "$NODE_DIR" != "." ] || NODE_DIR="$(find session home -type d -name bitcoind_module | grep -v modules | head -1)"
+NODE_DIR="$(ls -d session/data/bitcoind_module/*/ | head -1)"
+echo "bitcoind_module persistence: $NODE_DIR"
 printf '%s\n' '{"modules":["bitcoin_wallet_core_module","bitcoin_node_module"],"allowHost":true}' > "$NODE_DIR/callers.json"
 ctl module unload bitcoind_module; sleep 1; ctl module load bitcoind_module; sleep 1
 call bitcoind_module start regtest; echo

@@ -64,10 +64,12 @@ cycle() {
     || { echo "the database did not reopen intact: $opened" >&2; exit 1; }
   until_for 60 'any(r["txid"] == "'"$FUNDED"'" for r in v.get("rows", []))' "$CORE" history 0 > /dev/null \
     || { echo "the first payment is missing after a reopen" >&2; exit 1; }
-  local want
+  # Kyoto counts progress by finished batches, so the states are told by its best header
+  # against the node's tip: below it, headers are syncing; at it but not synced, filters are.
+  local want tip; tip="$("$CHAIN" rpc getblockcount | js 'v["result"]')"
   case "$1" in
-    headers) want='v.get("kyoto") and v["kyoto"]["running"] and v["kyoto"]["phase"] == "headers" and v["kyoto"]["connected"] >= 1' ;;
-    filters) want='v.get("kyoto") and v["kyoto"]["running"] and v["kyoto"]["phase"] == "filters"' ;;
+    headers) want='v.get("kyoto") and v["kyoto"]["running"] and v["kyoto"]["connected"] >= 1 and v["kyoto"]["headers"] < '"$tip" ;;
+    filters) want='v.get("kyoto") and v["kyoto"]["running"] and v["kyoto"]["connected"] >= 1 and v["kyoto"]["headers"] == '"$tip"' and v["synced"] is False' ;;
     idle) want='v["synced"] is True and v["kyoto"]["phase"] == "synced"' ;;
   esac
   until_for 90 "$want" "$CORE" status > /dev/null || { echo "never reached the $1 state" >&2; exit 1; }

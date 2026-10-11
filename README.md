@@ -235,6 +235,10 @@ An Esplora source with `credentials` gets them from the node module's `source_cr
 certificate in place of the CAs and the name check, for servers with self-signed certificates; the
 handshake signature is still verified with the pinned certificate's key, read from the DER, since
 webpki refuses version 1 certificates (`pin.rs`). A pin on another kind of source marks it down.
+`pin::certificate_sha256` reads a server's pin the way a probe would, trusting the first answer
+from a server that holds the certificate's key; `examples/pin_probe.rs` reads one over Tor and
+connects with it. Two community servers with version 1 certificates, refused before, answer that
+way.
 
 On regtest, `regtest.json` in the persistence directory gives loopback sources instead:
 `{ "electrum": ["tcp://127.0.0.1:60601", ...], "esplora": [], "kyoto": ["127.0.0.1:18544", ...],
@@ -262,48 +266,80 @@ nix build .#lgx
 
 ## Regtest
 
-`tools/regtest/chain.sh` runs bitcoind (`-blockfilterindex=1 -peerblockfilters=1`), two electrs on
-loopback standing in for two operators, and a fork node that only builds replacement branches:
-`chain.sh reorg` replaces the tip offline and reconnects, so the node electrs follows reorgs as on a
-live network. `nix build .#regtest-chain` packages the script with bitcoind and electrs.
+`tools/regtest/chain.sh` runs three bitcoind that serve compact block filters
+(`-blockfilterindex=1 -peerblockfilters=1`), Kyoto's peers (`chain.sh peers`): the main node, a
+fork node that builds replacement branches (`chain.sh reorg` replaces the tip offline and
+reconnects, so the nodes follow reorgs as on a live network) and a follower. Two electrs on
+loopback stand in for two operators. `nix build .#regtest-chain` packages the script with
+bitcoind and electrs.
 
 ```bash
 export BITCOIND=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind
 export ELECTRS=$(nix build nixpkgs#electrs --no-link --print-out-paths)/bin/electrs
-export CHAIN_DIR=/tmp/btc-chain
+export CHAIN_DIR=/tmp/btc-chain REGTEST_CHAIN=$PWD/tools/regtest/chain.sh
+export REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE=$CHAIN_DIR/bitcoind/regtest/.cookie
 tools/regtest/chain.sh prepare
 cd rust-lib
-REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE=$CHAIN_DIR/bitcoind/regtest/.cookie \
-REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 REGTEST_CHAIN=../tools/regtest/chain.sh \
-  cargo test --release --no-default-features --test regtest -- --ignored --nocapture
+REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 \
+  cargo test --release --no-default-features --features test-hooks --test regtest -- --ignored --nocapture
+# a fresh chain (stop, remove CHAIN_DIR, prepare), then
+REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
+  --test kyoto -- --ignored --exact kyoto_is_the_authority_on_regtest --nocapture
 ```
 
-The test drives the engine with no Logos runtime. Its signer manager is in process, over
+Both tests drive the engine with no Logos runtime. Their signer manager is in process, over
 `logos-signer-interface`'s `MockSigner` keyed from the test phrase (abandon ×11 about, fingerprint
-73c5da0a), and refuses what the real manager refuses before signing. It opens a native segwit
-wallet, receives, confirms, sends, bumps a send, refuses an anchor whose header a proxy in front of
-one electrs rewrites and a transaction it rewrites, re-anchors a payment across a reorg, then does a
-taproot wallet's receive and send, and reopens by group. It needs a fresh chain: the test phrase's
-wallet must start empty.
+73c5da0a), and refuses what the real manager refuses before signing. They need a fresh chain: the
+test phrase's wallet must start empty. `test-hooks` is a feature for fault injection only.
+
+`regtest`, with the Electrum header chain as the authority: it opens a native segwit wallet,
+receives, confirms, sends, bumps a send, refuses an anchor whose header a proxy in front of one
+electrs rewrites and a transaction it rewrites, re-anchors a payment across a reorg, then does a
+taproot wallet's receive and send, and reopens by group. A lost broadcast: the store after a
+successful broadcast answers busy five times; the job still answers the txid, the `broadcasting`
+record survives a reopen with its coins out of reach, and `rebroadcast` and `bump_fee` both find
+the transaction.
+
+`kyoto`, with Kyoto as the authority and one electrs only cross-checked: Kyoto's peers sit behind
+`examples/p2p_proxy.rs`, which forwards, delays answers, goes down, or forges one block's filter
+header and filter and sends the forged batch five times, enough for a quorum of three without
+patch 1; the test connects all three peers. It receives, sends through Kyoto's
+peers and confirms; re-anchors across a reorg; rebuilds the client after 30 addresses are revealed
+(a test hook) and finds a payment to the last; restarts after `NoReachablePeers` when every peer
+goes down, and finds the payment made meanwhile; and holds out against a forging peer that answers
+first: no update ever hides the payment, which confirms once the forger stops. Against bip157
+without patch 1, the same step fails: the wallet reports synced at the block with the payment
+missing. `kyoto_first_sync_on_a_long_chain` (run alone) times a first sync of `KYOTO_BLOCKS` blocks.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.
 
-`tools/e2e/logosctl.sh` runs the module under a logosctl daemon with the real `keystore_module`,
-`signer_manager_module`, `evm_keystore_cli` (custodian) and `evm_signer_cli` (approver), an
-isolated HOME and a fresh chain: the gate refusing the host, an open decided by the custodian, a
-receive, a send approved by the approver, a close and an unload.
+## Under logosctl
 
-`examples/authority.rs` syncs the authority from the checkpoint against live Electrum servers,
+`tools/e2e/` runs the module under a logosctl daemon with the real `keystore_module`,
+`signer_manager_module`, `evm_keystore_cli` (custodian) and `evm_signer_cli` (approver), an isolated
+HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
+
+- `logosctl.sh`: the gate refusing the host, an open decided by the custodian, a receive, a send
+  approved by the approver, a close and an unload;
+- `unload-spike.sh`: spike 3, `RUNS` unloads (20) each while Kyoto syncs headers, downloads
+  filters, and idles, its peers slowed through `p2p_proxy` mode files; every cycle reopens the
+  database (no reset, the first payment there);
+- `local-node.sh`: the real `bitcoind_module` (libbitcoind_c, Core in-process) on regtest as the
+  authority: a coinbase received and matured, a send through its `sendrawtransaction`, confirmed.
+
+`examples/authority.rs` syncs the Electrum header chain from the checkpoint against live servers,
 headers only: on mainnet over Tor, 35,428 headers (to 970,852) in about 40 s.
 
 ## Not yet
 
-- Kyoto and the local node as the authority; Kyoto and local route entries are skipped.
+- Kyoto reports its progress only as whole batches finish, and bdk_kyoto hands over transactions
+  only once filters reach the tip, so a run that loses its peers before then starts over from the
+  last height scanned. A long first sync over unreliable peers can take several runs.
+- The local node's mempool shows only the wallet's own transactions while `bitcoind_module`
+  refuses `getrawtransaction`; restores scan every block with the Emitter, not the node's filters.
 - An authority from Esplora servers alone: without an Electrum server in the `chain` role nothing
   confirms.
-- Electrum servers with self-signed TLS certificates (common in the community) are refused:
-  `validate_domain` is on and there is no pinning yet. Their onion addresses over Tor work.
 - Unload can't reach the manager, so it skips `close_account`; the grant ends when the manager
   restarts or the wallet is opened again.
 - testnet4 and signet check proof of work against each header's own target only: rust-bitcoin

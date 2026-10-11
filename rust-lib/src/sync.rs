@@ -79,8 +79,8 @@ impl NetState {
 pub struct KyotoStatus {
     pub running: bool,
     pub phase: &'static str,
-    /// Kyoto's header height, and the share of filter headers and filters done.
-    pub height: u32,
+    /// Kyoto's best header, and the share of filter headers and filters its finished batches make.
+    pub headers: u32,
     pub progress: f32,
     pub connected: usize,
     pub dialled: usize,
@@ -514,7 +514,7 @@ impl Loop {
             let started = {
                 let guard = self.ctx.cell.lock();
                 match guard.as_ref() {
-                    Some(cell) => kyoto::Client::start(&self.ctx.rt, &cell.wallet, &route, proxy.as_ref(), required, peers, start),
+                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start),
                     None => Err("closed".into()),
                 }
             };
@@ -524,7 +524,9 @@ impl Loop {
                     self.ctx.netstate.lock().kyoto = Some(c.requester.clone());
                     self.kyoto_status.dialled = c.peers.len();
                     self.kyoto_status.running = true;
-                    self.kyoto_status.phase = "headers";
+                    self.kyoto_status.phase = "syncing";
+                    self.kyoto_status.progress = 0.0;
+                    self.kyoto_status.headers = start.from.0;
                     self.kyoto = Some(c);
                 }
                 Err(e) => {
@@ -541,7 +543,7 @@ impl Loop {
             match f {
                 Feed::Progress { fraction, height } => {
                     self.kyoto_status.progress = fraction;
-                    self.kyoto_status.height = height;
+                    self.kyoto_status.headers = self.kyoto_status.headers.max(height);
                 }
                 Feed::Warning(w) => self.kyoto_status.last_warning = Some(w),
                 Feed::Stopped(why) => stopped = Some(why),
@@ -574,6 +576,7 @@ impl Loop {
         }
         if let Some(c) = &self.kyoto {
             self.kyoto_status.connected = c.connected();
+            self.kyoto_status.headers = self.kyoto_status.headers.max(c.best_header());
             self.kyoto_status.phase = kyoto::phase(c.updated && self.kyoto_rescan.is_none(), self.kyoto_status.progress);
             self.authority.set_peers(c.connected() as u32);
         }
