@@ -1,5 +1,5 @@
-//! The chain authority, the only source that moves the wallet's chain: here the most-work valid
-//! header chain among the enabled Electrum servers; Kyoto and the local node come behind [`Authority`].
+//! The chain authority, the only source that moves the wallet's chain: one validated header chain,
+//! fed by the local node, by Kyoto, or else by the most-work chain among the enabled Electrum servers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -83,28 +83,87 @@ pub trait Authority: ChainView + Send {
 /// Blocks a reorg replaced, remembered so a server that lags it isn't taken for a liar.
 const REPLACED_KEPT: usize = 512;
 
-pub struct ServerAuthority {
+pub const ELECTRUM_HEADERS: &str = "electrum_headers";
+pub const KYOTO: &str = "kyoto";
+pub const LOCAL_NODE: &str = "local_node";
+
+/// The wallet's header chain and who feeds it: `refresh` for Electrum servers, `adopt` for Kyoto
+/// and the local node, whose headers pass the same checks.
+pub struct ChainAuthority {
+    kind: &'static str,
     chain: HeaderChain,
     old: BTreeMap<u32, BlockHash>,
     progressed: bool,
     agreeing: BTreeSet<String>,
+    peers: u32,
     replaced: std::collections::VecDeque<(u32, BlockHash)>,
 }
 
-impl ServerAuthority {
+impl ChainAuthority {
     pub fn new(net: BNetwork) -> Self {
         Self::on(HeaderChain::new(net))
     }
 
     pub fn on(chain: HeaderChain) -> Self {
-        Self { chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, replaced: Default::default() }
     }
 
     /// From stored headers and proofs; a stored chain counts as progress, and its age shows.
     pub fn restore(net: BNetwork, headers: Vec<(u32, Header)>, old: Vec<(u32, BlockHash)>, now: u32) -> Self {
         let chain = HeaderChain::restore(net, headers, now);
         let progressed = chain.tip_height() > chain.base();
-        Self { chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, replaced: Default::default() }
+    }
+
+    /// Who feeds the chain now; the chain itself carries over.
+    pub fn set_kind(&mut self, kind: &'static str) {
+        if self.kind != kind {
+            self.kind = kind;
+            self.agreeing.clear();
+            self.peers = 0;
+        }
+    }
+
+    /// Kyoto's connected peers, or 1 for a reachable node.
+    pub fn set_peers(&mut self, n: u32) {
+        self.peers = n;
+    }
+
+    /// A branch from Kyoto or the node, continuing the chain at `fork`: validated like a server's,
+    /// adopted on more work. An empty branch that agrees at the tip confirms the chain as it is.
+    pub fn adopt(&mut self, fork: u32, branch: &[Header], now: u32) -> Change {
+        let mut change = Change::default();
+        let before = self.chain.tip_hash();
+        let r = self.chain.try_extend(fork, branch, now);
+        if let Some(e) = &r.error {
+            change.suspects.push((self.kind.to_string(), e.to_string()));
+        }
+        if r.adopted {
+            self.remember(r.replaced);
+            change.reorg_depth = r.reorg_depth;
+            change.changed_from = r.changed_from;
+        }
+        if r.error.is_none() && fork + branch.len() as u32 >= self.chain.tip_height() {
+            self.progressed = true;
+        }
+        change.tip_moved = self.chain.tip_hash() != before;
+        change
+    }
+
+    /// A height below the checkpoint, named by Kyoto from its own start or proved by linkage.
+    pub fn note_old(&mut self, height: u32, hash: BlockHash) {
+        if height < self.chain.base() {
+            self.old.insert(height, hash);
+        }
+    }
+
+    fn remember(&mut self, replaced: Vec<(u32, BlockHash)>) {
+        for x in replaced {
+            if self.replaced.len() == REPLACED_KEPT {
+                self.replaced.pop_front();
+            }
+            self.replaced.push_back(x);
+        }
     }
 
     /// The highest height where `src` and the chain agree, searching down from `from`.
@@ -161,12 +220,7 @@ impl ServerAuthority {
             }
         }
         if r.adopted {
-            for x in r.replaced {
-                if self.replaced.len() == REPLACED_KEPT {
-                    self.replaced.pop_front();
-                }
-                self.replaced.push_back(x);
-            }
+            self.remember(r.replaced);
             change.reorg_depth = change.reorg_depth.max(r.reorg_depth);
             change.changed_from = match (change.changed_from, r.changed_from) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -177,7 +231,7 @@ impl ServerAuthority {
     }
 }
 
-impl ChainView for ServerAuthority {
+impl ChainView for ChainAuthority {
     fn tip_height(&self) -> Option<u32> {
         self.progressed.then(|| self.chain.tip_height())
     }
@@ -202,9 +256,9 @@ impl ChainView for ServerAuthority {
     }
 }
 
-impl Authority for ServerAuthority {
+impl Authority for ChainAuthority {
     fn kind(&self) -> &'static str {
-        "electrum_headers"
+        self.kind
     }
 
     fn refresh(&mut self, sources: &[&dyn HeaderSource], now: u32) -> Change {
@@ -274,7 +328,7 @@ impl Authority for ServerAuthority {
             height: self.tip_height(),
             hash: self.progressed.then(|| self.chain.tip_hash().to_string()),
             tip_age_secs: self.progressed.then(|| now.saturating_sub(u64::from(self.chain.tip().time))),
-            peers: self.agreeing.len() as u32,
+            peers: if self.kind == ELECTRUM_HEADERS { self.agreeing.len() as u32 } else { self.peers },
         }
     }
 
@@ -349,14 +403,14 @@ mod tests {
 
     #[test]
     fn no_progress_means_no_tip() {
-        let a = ServerAuthority::new(BNetwork::Regtest);
+        let a = ChainAuthority::new(BNetwork::Regtest);
         assert_eq!(a.tip_height(), None);
         assert_eq!(a.summary(0).height, None);
     }
 
     #[test]
     fn the_most_work_chain_among_servers_wins() {
-        let mut a = ServerAuthority::new(BNetwork::Regtest);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
         let honest = chain_of(30, 1);
         // A server hiding the last 5 blocks loses to one that doesn't.
         let hiding = fake("hiding", honest[..26].to_vec());
@@ -378,7 +432,7 @@ mod tests {
 
     #[test]
     fn invalid_headers_mark_the_source() {
-        let mut a = ServerAuthority::new(BNetwork::Regtest);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
         let honest = chain_of(10, 3);
         a.refresh(&[&fake("h", honest.clone())], NOW);
         let mut bad = honest.clone();
@@ -395,7 +449,7 @@ mod tests {
 
     #[test]
     fn bdk_chain_updates_connect() {
-        let mut a = ServerAuthority::new(BNetwork::Regtest);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
         let honest = chain_of(30, 4);
         a.refresh(&[&fake("h", honest.clone())], NOW);
         let bdk = vec![(0, honest[0].block_hash()), (12, honest[12].block_hash())];
@@ -411,14 +465,14 @@ mod tests {
         // BDK holding a block above the authority's tip waits.
         let ahead = vec![(0, honest[0].block_hash()), (40, honest[0].block_hash())];
         assert_eq!(chain_update(&a, &ahead, &BTreeSet::new()), None);
-        assert_eq!(chain_update(&ServerAuthority::new(BNetwork::Regtest), &bdk, &BTreeSet::new()), None, "no progress, no update");
+        assert_eq!(chain_update(&ChainAuthority::new(BNetwork::Regtest), &bdk, &BTreeSet::new()), None, "no progress, no update");
     }
 
     #[test]
     fn a_checkpointed_chain_restates_bdks_genesis() {
         // Signet's authority starts at its checkpoint; BDK's chain starts at genesis.
         let cp = BNetwork::Signet.checkpoint();
-        let mut a = ServerAuthority::on(HeaderChain::from_checkpoint(BNetwork::Signet, cp.height, cp.header));
+        let mut a = ChainAuthority::on(HeaderChain::from_checkpoint(BNetwork::Signet, cp.height, cp.header));
         a.progressed = true;
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Signet).block_hash();
         let u = chain_update(&a, &[(0, genesis)], &BTreeSet::new()).expect("an update, not a stall");
@@ -429,7 +483,7 @@ mod tests {
     fn heights_below_the_checkpoint_are_proved_by_linkage() {
         let full = chain_of(20, 6);
         // Trust height 10 as if it were the checkpoint.
-        let mut a = ServerAuthority::on(HeaderChain::from_checkpoint(BNetwork::Regtest, 10, full[10]));
+        let mut a = ChainAuthority::on(HeaderChain::from_checkpoint(BNetwork::Regtest, 10, full[10]));
         let honest = fake("h", full.clone());
         let proved = a.prove_below(&[7, 3, 12], &honest).unwrap();
         assert_eq!(proved, vec![(7, full[7].block_hash()), (3, full[3].block_hash())]);
@@ -437,7 +491,7 @@ mod tests {
         // A server whose old header doesn't hash into the chain above is refused.
         let mut lie = full.clone();
         lie[5].nonce ^= 1;
-        let mut b = ServerAuthority::on(HeaderChain::from_checkpoint(BNetwork::Regtest, 10, full[10]));
+        let mut b = ChainAuthority::on(HeaderChain::from_checkpoint(BNetwork::Regtest, 10, full[10]));
         let e = b.prove_below(&[2], &fake("liar", lie)).unwrap_err();
         assert!(e.contains("does not link"), "{e}");
         assert_eq!(b.hash_at(2), None);

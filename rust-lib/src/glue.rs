@@ -118,7 +118,8 @@ impl BitcoinWalletCoreModuleImpl {
 impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
     fn version(&self) -> String {
         json!({"ok": true, "version": env!("CARGO_PKG_VERSION"),
-               "crates": {"bdk_wallet": "3.2.0", "bdk_electrum": "0.24.0", "bdk_esplora": "0.22.2"}})
+               "crates": {"bdk_wallet": "3.2.0", "bdk_electrum": "0.24.0", "bdk_esplora": "0.22.2", "bdk_kyoto": "0.18.0",
+                          "bip157": "0.7.0+logos.4", "bdk_bitcoind_rpc": "0.22.0"}})
         .to_string()
     }
 
@@ -227,6 +228,7 @@ impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
             }
         });
         let engine = Engine::new(dir.join("wallets"), sink, Arc::new(ManagerIpc::default()), Some(Arc::new(NodeIpc::default())));
+        engine.set_node_source(Arc::new(BitcoindIpc::default()));
         listen(&engine);
         tracing::info!(target: "bitcoin", "ready in {}", dir.display());
         let _ = self.engine.set(engine);
@@ -389,6 +391,22 @@ impl RouteSource for NodeIpc {
             (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
             _ => None,
         })
+    }
+}
+
+/// `bitcoind_module`'s rpc, by name: the local node is optional, so not a declared dependency.
+#[derive(Default)]
+struct BitcoindIpc(OnceLock<logos_rust_sdk::PluginProxy>);
+
+impl crate::node::NodeRpc for BitcoindIpc {
+    fn rpc(&self, method: &str, params: &str) -> Result<String, String> {
+        let p = self.0.get_or_init(|| logos_rust_sdk::LogosModuleSDK::new().plugin("bitcoind_module"));
+        let (tx, rx) = sync_channel(1);
+        p.call_json_async_with_timeout("rpc", &json!([method, params]), BUDGET, move |r| {
+            let _ = tx.send(r);
+        });
+        let v = wait(rx)?;
+        Ok(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
     }
 }
 

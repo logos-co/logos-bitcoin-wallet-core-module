@@ -423,6 +423,7 @@ impl Cell {
                 "confirmations": height.map(|h| tip.saturating_sub(h) + 1).unwrap_or(0),
                 "time": time, "state": state,
                 "replaces": sends.iter().find(|s| s.txid == txid).and_then(|s| s.replaces).map(|t| t.to_string()),
+                "sendState": sends.iter().find(|s| s.txid == txid).map(|s| s.state.clone()),
                 "replacedBy": replaced.get(&txid).map(|t| t.to_string()),
                 "reportedBy": reporters.get(&txid),
             })

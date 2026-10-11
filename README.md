@@ -1,8 +1,9 @@
 # logos-bitcoin-wallet-core-module
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
-bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.0, `bdk_esplora` 0.22.2), running as a Rust
-module inside its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
+bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.0, `bdk_esplora` 0.22.2, `bdk_kyoto` 0.18.0
+on `bip157` 0.7.0 with four patches, `bdk_bitcoind_rpc` 0.22.0), running as a Rust module inside
+its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
 ## What it does
@@ -27,22 +28,98 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
 
 ## The chain authority
 
-Only the authority moves the wallet's chain. In this pass it is the server-only one, behind the
-`Authority` trait so Kyoto, and later the local node, can take its place:
+Only the authority moves the wallet's chain, in this order: the local node while it is enabled and
+synced, then Kyoto, then the Electrum header chain. Whichever it is feeds one validated header
+chain, stored in the encrypted database, from a checkpoint per network (`network.rs`): mainnet
+935,424 (a retarget boundary whose headers link down to Bitcoin Core 31.1's assumeutxo block
+935,000), signet 290,000 and testnet4 120,000 (Core 31.1's assumeutxo blocks), regtest's genesis.
+Every header passes the same checks wherever it comes from:
 
-- headers come from the enabled Electrum servers in the `chain` role (`blockchain.block.headers`, up
-  to 2,016 per call), from a checkpoint per network (`network.rs`): mainnet 935,424 (a retarget
-  boundary whose headers link down to Bitcoin Core 31.1's assumeutxo block 935,000), signet 290,000
-  and testnet4 120,000 (Core 31.1's assumeutxo blocks), regtest's genesis;
 - each header must link to the one below it, meet its own target, stay under the network's limit, be
   later than the median of the 11 before it and no more than two hours ahead. On mainnet the bits
   must not change between retargets, and each retarget must be rust-bitcoin's
   `CompactTarget::from_next_work_required` (checked against two real retargets in the tests);
 - the valid chain with the most work wins; a server that hides blocks loses to one that doesn't;
-- the chain is stored in the encrypted database and restated into BDK's local chain only from here
-  (`authority::chain_update`): every height BDK holds from the top down to the first that agrees, the
-  anchor heights, and the tip;
-- heights below the checkpoint count once the server's headers link up to a known hash.
+- BDK's local chain is restated only from it (`authority::chain_update`): every height BDK holds
+  from the top down to the first that agrees, the anchor heights, and the tip;
+- heights below the checkpoint count once a server's headers link up to a known hash, or when
+  Kyoto, started below the checkpoint, names them.
+
+The authority changes as the route table and the node's state change; the header chain carries
+over, and `status.authority.kind` says which feeds it: `local_node`, `kyoto` or `electrum_headers`.
+
+### The local node
+
+`bitcoind_module` runs Bitcoin Core in-process. The core calls its `rpc(method, paramsJson)` over
+Logos IPC, waiting for the reply off the main thread as it does for the manager, behind
+bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `Emitter`:
+
+- It is the authority while `getblockchaininfo` says it runs the wallet's network, is past initial
+  sync and has its blocks at its headers; it is asked every 30 s while it isn't. A node that falls
+  behind or stops answering hands the chain back to Kyoto or the servers.
+- Headers come one by one (`getblockhash`, `getblockheader`) from the fork with the chain held,
+  2,000 a round. Then the Emitter scans the blocks after the last one scanned (from the birthday on
+  a first open) and, at the tip, the mempool; what pays or spends the wallet's scripts (the revealed
+  ones plus the lookahead) is kept.
+- Broadcasts go through `sendrawtransaction` while the node is the authority; fees come from
+  `estimatesmartfee` and `getnetworkinfo`'s relay fee.
+- The module's allowlist lacks two methods the Emitter calls: `getblockcount` is answered from
+  `getblockchaininfo`, and `getrawtransaction` reads as "not found". So the node's mempool shows only
+  the wallet's own transactions; pending incoming payments need a server enabled for pending.
+
+### Kyoto
+
+bdk_kyoto 0.18.0 on bip157 0.7.0 (published from 0169dc3) with four patches, below (`kyoto.rs`):
+
+- Peers come from the route table's `peers`: the node module's curated subset, or the user's own,
+  which replace the list. Each start takes a random 8, `whitelist_only`, as literal addresses, so
+  Kyoto never resolves a public name; onion names are checked (base32, checksum, version 3). A peer
+  that never connects in 3 starts in a row is skipped for 24 hours, unless every peer is.
+- One connection type per client, as the node module routes it: `direct` for peers on the user's
+  network (names there resolve locally), else all through Tor's SOCKS port, never a mix. Kyoto
+  takes the proxy by IP address only.
+- The quorum (`required_peers`, also the connection count) is 3 on mainnet and 2 elsewhere, never
+  more than the peers dialled. Over Tor a peer has 30 s for the handshake, 30 s per response and
+  240 s per filter batch (patch 3); directly, 5, 10 and 30 s.
+- When Kyoto runs out of peers (`NoReachablePeers`) it restarts on a fresh subset: after 2 s when the
+  run got somewhere, else backing off up to 2 minutes.
+- bdk_kyoto copies the wallet's address index when the client is built, so it watches the revealed
+  addresses plus 25. When the wallet reveals past those, the client is rebuilt.
+- A start begins 8 blocks below the last height whose filters were scanned. A first start begins at
+  the block before the birthday when the header chain reaches it; otherwise it syncs headers from
+  the chain's tip first, then scans filters from the birthday (`rescan_from`). A birthday below the
+  checkpoint starts from Kyoto's own taproot or segwit checkpoint (mainnet) or genesis, and Kyoto's
+  chain must then pass through the wallet's checkpoint.
+- Each update's headers are read back from Kyoto (`get_header`), checked against the hashes the
+  update names, and taken into the header chain with the same checks as any source. Its
+  transactions pass the anchor checks too, then reach BDK with a checkpoint at each anchor.
+- A broadcast goes to one random peer, Kyoto's privacy choice, and counts as `requested` when a peer
+  asks for the transaction within 20 s; past that it is `unknown`. The peers' minimum relay fee is the
+  fee floor. Kyoto has no fee estimates and no mempool view.
+- Servers in the `check` role are cross-checked against Kyoto's headers: tips, the hash at the
+  lower tip, a random header. Servers enabled for history stand by, asked only once Kyoto has had no
+  peer through 3 restarts.
+
+### Kyoto patches
+
+`patches/bip157/` holds four patches on bip157 0.7.0 as published, in `git format-patch` form, each
+with unit tests:
+
+1. distinct peers count toward the filter-header quorum, and unsolicited `cfheaders` are dropped
+   (`chain/chain.rs`, `chain/mod.rs`, `network/peer.rs`): one peer repeating a forged batch no longer
+   meets a quorum by itself;
+2. no false conflict when the tip moves between two answers (`chain/chain.rs`);
+3. a configurable deadline for filter batches, `Builder::filter_batch_timeout` (`network/mod.rs`,
+   `network/peer.rs`, `builder.rs`);
+4. a random nonce in each version message (`network/outbound.rs`); the user agent still names Kyoto.
+
+`tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those six files: a patch
+touching any other file fails the build until the file is added there, with a reason.
+`rust-lib/vendor/bip157` is the result, used through `[patch.crates-io]`. `nix build
+.#bip157-check` rebuilds it from the published crate (fetched by hash) and diffs it byte for byte,
+and the module's Rust build depends on that check; `tools/kyoto/check-bip157.sh` does the same
+without Nix (`--update` rewrites the vendored tree). Run against the published crate, the quorum
+and tip tests fail: that is the bug. Nothing has been sent upstream.
 
 ## Before a server's answer is applied
 
@@ -146,22 +223,34 @@ more: `{ "modules": [...], "allowHost": true }`.
 ## Routes
 
 From `bitcoin_node_module`'s `route_table(network)`: `{ proxy, chain, history, pending, fees,
-broadcast, check, crossCheck }`, each role `[{ id, kind, url, operator, route: tor|direct|onion,
-credentials? }]`. Tor and onion routes go through the `socks5h://` proxy with SOCKS credentials per
-source, so each gets its own circuit; with no proxy they are down, never reached directly. Plain
-`tcp://` and `http://` cross only Tor to an onion service or the user's own network. An Esplora
-source with `credentials` gets them from the node module's `source_credentials`. Kyoto and local
-entries are skipped in this pass; a chain of Kyoto alone leaves the authority without a source.
-On regtest, `regtest.json` in the persistence directory gives loopback servers instead:
-`{ "electrum": ["tcp://127.0.0.1:60601", ...], "esplora": [], "pollSecs": 1 }`.
+broadcast, check, peers, crossCheck }`, each role `[{ id, kind, url, operator, route:
+tor|direct|onion, credentials?, certSha256? }]`. A `local` entry in `chain` makes the local node an
+authority, a `kyoto` entry Kyoto, with `peers` as its peers; `local` and `kyoto` in `broadcast` put
+them ahead of the servers there. Tor and onion routes go through the `socks5h://` proxy with SOCKS
+credentials per server, so each gets its own circuit; with no proxy they are down, never reached
+directly. Plain `tcp://` and `http://` cross only Tor to an onion service or the user's own network.
+An Esplora source with `credentials` gets them from the node module's `source_credentials`.
+
+`certSha256` (64 hex digits, colons allowed) pins an `ssl://` Electrum server's end-entity
+certificate in place of the CAs and the name check, for servers with self-signed certificates; the
+handshake signature is still verified with the pinned certificate's key, read from the DER, since
+webpki refuses version 1 certificates (`pin.rs`). A pin on another kind of source marks it down.
+
+On regtest, `regtest.json` in the persistence directory gives loopback sources instead:
+`{ "electrum": ["tcp://127.0.0.1:60601", ...], "esplora": [], "kyoto": ["127.0.0.1:18544", ...],
+"local": false, "kyotoRequired": 2, "pollSecs": 1 }`.
 
 ## Persistence
 
 `<instance>/core.log`, and `<instance>/wallets/` (0700), with per wallet
 `<network>/<group>/wallet.json` (group, family, network, created; 0600) and `wallet.db` (SQLCipher,
 0600): BDK's tables plus `core_headers`, `core_old_hashes`, `core_held` (anchors above the tip),
-`core_exposure`, `core_suspects`, `core_reported` and `core_sends` (state `broadcasting`, `sent`,
-`replaced`, `confirmed`, `conflicted`, `abandoned` or `failed`).
+`core_exposure`, `core_suspects`, `core_reported`, `core_sends` (state `broadcasting`, `sent`,
+`replaced`, `confirmed`, `conflicted`, `abandoned` or `failed`) and `core_meta`, which keeps the
+birthday, the last heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`) and Kyoto's
+peer failures (`kyoto_peers`). A send whose record says it may have gone out comes back as pending
+on reopen, even when the store after its broadcast never happened, so its coins stay spent and a
+bump or a rebroadcast finds it; `history` rows of the wallet's own sends carry `sendState`.
 
 ## Development
 

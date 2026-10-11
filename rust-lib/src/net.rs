@@ -1,5 +1,6 @@
 //! Connections on each source's route, and an Electrum wrapper that re-hashes transactions against
-//! their txids, keeps Merkle proofs for the length check, and bounds address queries.
+//! their txids, keeps Merkle proofs for the length check, and bounds address queries. A server
+//! with a pinned certificate gets its own TLS connection (see `pin`).
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -15,6 +16,8 @@ use electrum_client::{
     MempoolInfoRes, Param, RawHeaderNotification, ScriptStatus, ServerFeaturesRes, TxidFromPosRes,
 };
 
+use electrum_client::raw_client::{ElectrumSslStream, RawClient};
+
 use crate::routes::{Isolation, Proxy, Route, Source};
 
 /// A sync asking about more addresses than this is refused: a server faking history would
@@ -25,17 +28,170 @@ pub fn timeout_for(src: &Source) -> Duration {
     if src.route == Route::Direct { Duration::from_secs(15) } else { Duration::from_secs(45) }
 }
 
+/// An Electrum connection: electrum-client's own, checked against the CAs, or ours with a pin.
+pub enum Conn {
+    Std(electrum_client::Client),
+    Pinned(RawClient<ElectrumSslStream>),
+}
+
 /// An Electrum client on the source's route. A Tor route without a proxy is refused.
-pub fn electrum(src: &Source, proxy: Option<&Proxy>, iso: &Isolation) -> Result<electrum_client::Client, String> {
+pub fn electrum(src: &Source, proxy: Option<&Proxy>, iso: &Isolation) -> Result<Conn, String> {
     if let Some(d) = &src.down {
         return Err(format!("{}: {d}", src.id));
     }
+    let tor = matches!(src.route, Route::Tor | Route::Onion);
+    let proxy = match tor {
+        true => Some(proxy.ok_or_else(|| format!("{}: routed through Tor, and no proxy is set", src.id))?),
+        false => None,
+    };
+    if let Some(pin) = src.pin {
+        return crate::pin::connect(&src.url, pin, proxy.map(|p| (p, iso)), timeout_for(src)).map(Conn::Pinned).map_err(|e| format!("{}: {e}", src.id));
+    }
     let mut b = electrum_client::ConfigBuilder::new().timeout(Some(timeout_for(src))).retry(0).validate_domain(true);
-    if matches!(src.route, Route::Tor | Route::Onion) {
-        let p = proxy.ok_or_else(|| format!("{}: routed through Tor, and no proxy is set", src.id))?;
+    if let Some(p) = proxy {
         b = b.socks5(Some(electrum_client::Socks5Config::with_credentials(p.addr(), iso.user.clone(), iso.pass.clone())));
     }
-    electrum_client::Client::from_config(&src.url, b.build()).map_err(|e| format!("{}: {e}", src.id))
+    electrum_client::Client::from_config(&src.url, b.build()).map(Conn::Std).map_err(|e| format!("{}: {e}", src.id))
+}
+
+macro_rules! either {
+    ($self:ident, $c:ident => $call:expr) => {
+        match $self {
+            Conn::Std($c) => $call,
+            Conn::Pinned($c) => $call,
+        }
+    };
+}
+
+impl ElectrumApi for Conn {
+    fn raw_call(&self, method_name: &str, params: impl IntoIterator<Item = Param>) -> Res<serde_json::Value> {
+        either!(self, c => c.raw_call(method_name, params))
+    }
+    fn batch_call(&self, batch: &Batch) -> Res<Vec<serde_json::Value>> {
+        either!(self, c => c.batch_call(batch))
+    }
+    fn block_headers_subscribe_raw(&self) -> Res<RawHeaderNotification> {
+        either!(self, c => c.block_headers_subscribe_raw())
+    }
+    fn block_headers_pop_raw(&self) -> Res<Option<RawHeaderNotification>> {
+        either!(self, c => c.block_headers_pop_raw())
+    }
+    fn block_header_raw(&self, height: usize) -> Res<Vec<u8>> {
+        either!(self, c => c.block_header_raw(height))
+    }
+    fn block_headers(&self, start_height: usize, count: usize) -> Res<GetHeadersRes> {
+        either!(self, c => c.block_headers(start_height, count))
+    }
+    fn estimate_fee(&self, number: usize, mode: Option<EstimationMode>) -> Res<f64> {
+        either!(self, c => c.estimate_fee(number, mode))
+    }
+    fn relay_fee(&self) -> Res<f64> {
+        either!(self, c => c.relay_fee())
+    }
+    fn script_subscribe(&self, script: &Script) -> Res<Option<ScriptStatus>> {
+        either!(self, c => c.script_subscribe(script))
+    }
+    fn batch_script_subscribe<'s, I>(&self, scripts: I) -> Res<Vec<Option<ScriptStatus>>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        either!(self, c => c.batch_script_subscribe(scripts))
+    }
+    fn script_unsubscribe(&self, script: &Script) -> Res<bool> {
+        either!(self, c => c.script_unsubscribe(script))
+    }
+    fn script_pop(&self, script: &Script) -> Res<Option<ScriptStatus>> {
+        either!(self, c => c.script_pop(script))
+    }
+    fn script_get_balance(&self, script: &Script) -> Res<GetBalanceRes> {
+        either!(self, c => c.script_get_balance(script))
+    }
+    fn batch_script_get_balance<'s, I>(&self, scripts: I) -> Res<Vec<GetBalanceRes>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        either!(self, c => c.batch_script_get_balance(scripts))
+    }
+    fn script_get_history(&self, script: &Script) -> Res<Vec<GetHistoryRes>> {
+        either!(self, c => c.script_get_history(script))
+    }
+    fn batch_script_get_history<'s, I>(&self, scripts: I) -> Res<Vec<Vec<GetHistoryRes>>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        either!(self, c => c.batch_script_get_history(scripts))
+    }
+    fn script_list_unspent(&self, script: &Script) -> Res<Vec<ListUnspentRes>> {
+        either!(self, c => c.script_list_unspent(script))
+    }
+    fn batch_script_list_unspent<'s, I>(&self, scripts: I) -> Res<Vec<Vec<ListUnspentRes>>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        either!(self, c => c.batch_script_list_unspent(scripts))
+    }
+    fn transaction_get_raw(&self, txid: &Txid) -> Res<Vec<u8>> {
+        either!(self, c => c.transaction_get_raw(txid))
+    }
+    fn batch_transaction_get_raw<'t, I>(&self, txids: I) -> Res<Vec<Vec<u8>>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'t Txid>,
+    {
+        either!(self, c => c.batch_transaction_get_raw(txids))
+    }
+    fn batch_block_header_raw<I>(&self, heights: I) -> Res<Vec<Vec<u8>>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<u32>,
+    {
+        either!(self, c => c.batch_block_header_raw(heights))
+    }
+    fn batch_estimate_fee<I>(&self, numbers: I) -> Res<Vec<f64>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<usize>,
+    {
+        either!(self, c => c.batch_estimate_fee(numbers))
+    }
+    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Res<Txid> {
+        either!(self, c => c.transaction_broadcast_raw(raw_tx))
+    }
+    fn transaction_broadcast_package_raw<T: AsRef<[u8]>>(&self, raw_txs: &[T]) -> Res<BroadcastPackageRes> {
+        either!(self, c => c.transaction_broadcast_package_raw(raw_txs))
+    }
+    fn transaction_get_merkle(&self, txid: &Txid, height: usize) -> Res<GetMerkleRes> {
+        either!(self, c => c.transaction_get_merkle(txid, height))
+    }
+    fn batch_transaction_get_merkle<I>(&self, txids_and_heights: I) -> Res<Vec<GetMerkleRes>>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<(Txid, usize)>,
+    {
+        either!(self, c => c.batch_transaction_get_merkle(txids_and_heights))
+    }
+    fn txid_from_pos(&self, height: usize, tx_pos: usize) -> Res<Txid> {
+        either!(self, c => c.txid_from_pos(height, tx_pos))
+    }
+    fn txid_from_pos_with_merkle(&self, height: usize, tx_pos: usize) -> Res<TxidFromPosRes> {
+        either!(self, c => c.txid_from_pos_with_merkle(height, tx_pos))
+    }
+    fn server_features(&self) -> Res<ServerFeaturesRes> {
+        either!(self, c => c.server_features())
+    }
+    fn mempool_get_info(&self) -> Res<MempoolInfoRes> {
+        either!(self, c => c.mempool_get_info())
+    }
+    fn ping(&self) -> Res<()> {
+        either!(self, c => c.ping())
+    }
+    fn calls_made(&self) -> Res<usize> {
+        either!(self, c => c.calls_made())
+    }
 }
 
 /// An Esplora client on the source's route, with a generic user agent and, where the source
@@ -257,7 +413,7 @@ mod tests {
     use crate::routes::{Kind, Route};
 
     fn src(url: &str, route: Route, down: Option<&str>) -> Source {
-        Source { id: "s".into(), url: url.into(), operator: "op".into(), route, kind: Kind::Electrum, down: down.map(str::to_string), credentials: false }
+        Source { id: "s".into(), url: url.into(), operator: "op".into(), route, kind: Kind::Electrum, down: down.map(str::to_string), credentials: false, pin: None }
     }
 
     #[test]

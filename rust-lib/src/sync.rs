@@ -1,5 +1,6 @@
-//! The open wallet's sync thread: it moves the chain from the authority only, and applies what a
-//! history server reports after the checks. Network calls never hold the wallet lock.
+//! The open wallet's sync thread: it moves the chain from the authority only (the local node,
+//! Kyoto, or the Electrum header chain), and applies what the authority finds and what a history
+//! server reports, after the checks. Network calls never hold the wallet lock.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
@@ -7,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bdk_electrum::electrum_client::{self, ElectrumApi};
+use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_electrum::BdkElectrumClient;
 use bdk_esplora::EsploraAsyncExt;
 use bdk_wallet::chain::keychain_txout::{FullScanRequestBuilderExt, SyncRequestBuilderExt};
@@ -19,18 +20,21 @@ use bitcoin::{BlockHash, ScriptBuf, Txid};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use crate::authority::{self, Authority, ElectrumHeaders, HeaderSource};
+use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE};
 use crate::checks::{self, ChainView, ProofVerdict};
 use crate::crosscheck::{self, Answer, Verdict};
 use crate::fees::{self, SourceEstimate};
+use crate::kyoto::{self, Feed, PeerBook, Start};
 use crate::ledger::Ledger;
 use crate::net::{self, Checked};
 use crate::network::{BNetwork, Family};
+use crate::node::{self, Follower, NodeClient, NodeRpc};
 use crate::routes::{Isolation, Kind, Routes, Source};
+use crate::storage::{meta_get, meta_set};
 use crate::wallet::{Cell, Held};
 use crate::walletdir::now_secs;
 
-pub type Electrum = BdkElectrumClient<Checked<electrum_client::Client>>;
+pub type Electrum = BdkElectrumClient<Checked<net::Conn>>;
 
 /// Alerts and state changes the engine turns into events.
 pub enum Note {
@@ -57,12 +61,34 @@ pub struct NetState {
     pub routes: Routes,
     pub ledger: Ledger,
     pub iso: HashMap<String, Isolation>,
+    /// Who feeds the chain: local_node, kyoto or electrum_headers.
+    pub chain_by: &'static str,
+    /// The running Kyoto client, for broadcasts.
+    pub kyoto: Option<bdk_kyoto::Requester>,
 }
 
 impl NetState {
     pub fn iso(&mut self, id: &str) -> Isolation {
         self.iso.entry(id.to_string()).or_insert_with(Isolation::fresh).clone()
     }
+}
+
+/// Kyoto's state for `status`.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KyotoStatus {
+    pub running: bool,
+    pub phase: &'static str,
+    /// Kyoto's header height, and the share of filter headers and filters done.
+    pub height: u32,
+    pub progress: f32,
+    pub connected: usize,
+    pub dialled: usize,
+    pub skipped: usize,
+    pub restarts: u32,
+    pub rebuilds: u32,
+    pub last_warning: Option<String>,
+    pub last_stop: Option<String>,
 }
 
 /// Figures for `status`, written by the sync thread.
@@ -75,6 +101,8 @@ pub struct Progress {
     pub fees: Option<fees::FeeRates>,
     pub last_error: Option<String>,
     pub full_scan_done: bool,
+    pub kyoto: Option<KyotoStatus>,
+    pub node: Option<node::NodeStatus>,
 }
 
 pub struct Ctx {
@@ -90,15 +118,54 @@ pub struct Ctx {
     pub notify: Notify,
     pub rt: tokio::runtime::Handle,
     pub routes_src: Option<Arc<dyn RouteSource>>,
+    /// `bitcoind_module`'s rpc, for the local node.
+    pub node_src: Option<Arc<dyn NodeRpc>>,
 }
 
 const ROUTES_EVERY: Duration = Duration::from_secs(300);
 const FEES_EVERY: Duration = Duration::from_secs(300);
 const EXPIRY_EVERY: Duration = Duration::from_secs(600);
 
+/// Who feeds the chain this round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Feeder {
+    Servers,
+    Kyoto,
+    Node,
+}
+
+/// What Kyoto or the node found for the wallet in blocks and the mempool.
+struct Found {
+    source: &'static str,
+    tx_update: TxUpdate<ConfirmationBlockTime>,
+    last_active: BTreeMap<KeychainKind, u32>,
+    evicted: Vec<(Txid, u64)>,
+    /// The meta key and the last block whose filters or contents were scanned.
+    scanned: Option<(&'static str, (u32, BlockHash))>,
+}
+
+const KYOTO_SCANNED: &str = "kyoto_scanned";
+const NODE_SCANNED: &str = "node_scanned";
+const KYOTO_PEERS: &str = "kyoto_peers";
+/// The local node is asked whether it is synced this often while it isn't the authority.
+const NODE_PROBE_EVERY: Duration = Duration::from_secs(30);
+/// Kyoto's restarts back off up to this, while starts make no progress.
+const KYOTO_RETRY_MAX: Duration = Duration::from_secs(120);
+
 struct Loop {
     ctx: Ctx,
-    authority: Box<dyn Authority>,
+    authority: ChainAuthority,
+    feeder: Feeder,
+    kyoto: Option<kyoto::Client>,
+    kyoto_book: PeerBook,
+    kyoto_retry_at: Instant,
+    kyoto_backoff: Duration,
+    kyoto_status: KyotoStatus,
+    /// The headers-only phase of a first start: the rescan from the birthday waits for its headers.
+    kyoto_rescan: Option<u32>,
+    node: Option<Follower>,
+    node_ok: bool,
+    node_probe: Option<Instant>,
     clients: HashMap<String, Electrum>,
     esplora: HashMap<String, esplora_client_alias::AsyncClient>,
     depths: HashMap<BlockHash, usize>,
@@ -209,8 +276,116 @@ impl Loop {
         tracing::info!(target: "bitcoin", "source {id}: {e}");
     }
 
-    /// Asks the chain sources and moves BDK's chain when the authority's tip moves.
+    /// The local node while it is synced, else Kyoto, else the Electrum header chain.
+    fn choose(&mut self) -> Feeder {
+        let (local, kyoto) = {
+            let ns = self.ctx.netstate.lock();
+            (ns.routes.local.is_some(), ns.routes.kyoto.is_some())
+        };
+        if local && self.ctx.node_src.is_some() {
+            let due = self.feeder == Feeder::Node || self.node_probe.is_none_or(|t| t.elapsed() >= NODE_PROBE_EVERY);
+            if due && self.feeder != Feeder::Node {
+                self.node_probe = Some(Instant::now());
+                let c = NodeClient::new(self.ctx.node_src.clone().expect("checked"));
+                match node::status(&c, self.ctx.net) {
+                    Ok(st) => {
+                        self.node_ok = st.synced;
+                        self.ctx.progress.lock().node = Some(st);
+                    }
+                    Err(e) => {
+                        self.node_ok = false;
+                        tracing::info!(target: "bitcoin", "local node: {e}");
+                    }
+                }
+            }
+            if self.node_ok {
+                return Feeder::Node;
+            }
+        } else {
+            self.node_ok = false;
+        }
+        if kyoto {
+            Feeder::Kyoto
+        } else {
+            Feeder::Servers
+        }
+    }
+
+    /// Hands the chain to another feeder: the header chain stays, the old feeder stops.
+    fn switch(&mut self, to: Feeder) {
+        if to == self.feeder {
+            return;
+        }
+        tracing::info!(target: "bitcoin", "the chain authority is now {to:?}, was {:?}", self.feeder);
+        if self.feeder == Feeder::Kyoto {
+            self.stop_kyoto(None);
+        }
+        if self.feeder == Feeder::Node {
+            self.node = None;
+        }
+        self.feeder = to;
+        let kind = match to {
+            Feeder::Servers => ELECTRUM_HEADERS,
+            Feeder::Kyoto => KYOTO,
+            Feeder::Node => LOCAL_NODE,
+        };
+        self.authority.set_kind(kind);
+        self.ctx.netstate.lock().chain_by = kind;
+    }
+
+    /// Moves the authority's chain from its feeder, stores what changed, and restates BDK's chain.
     fn refresh_authority(&mut self) -> bool {
+        let to = self.choose();
+        self.switch(to);
+        let (change, found) = match self.feeder {
+            Feeder::Servers => (self.refresh_servers(), vec![]),
+            Feeder::Kyoto => self.tend_kyoto(),
+            Feeder::Node => match self.follow_node() {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::info!(target: "bitcoin", "local node: {e}");
+                    self.ctx.progress.lock().last_error = Some(format!("local node: {e}"));
+                    self.node_ok = false;
+                    self.node = None;
+                    (Change::default(), vec![])
+                }
+            },
+        };
+        if let Some(from) = change.changed_from {
+            if change.reorg_depth > 0 {
+                tracing::info!(target: "bitcoin", "authority reorg of {} from {from}", change.reorg_depth);
+                // bdk_electrum caches headers by height, and anchors by them: start them afresh.
+                self.clients.clear();
+            }
+            let mut guard = self.ctx.cell.lock();
+            if let Some(cell) = guard.as_mut() {
+                if let Err(e) = cell.store_headers(self.authority.chain(), from) {
+                    tracing::warn!(target: "bitcoin", "store headers: {e}");
+                }
+            }
+        }
+        for (who, why) in &change.suspects {
+            if self.feeder != Feeder::Servers {
+                tracing::warn!(target: "bitcoin", "{who} named a chain that fails the checks: {why}");
+                self.alert(who, "suspect", format!("its headers fail the checks: {why}"));
+            }
+        }
+        if change.tip_moved {
+            self.move_chain();
+        }
+        let moved = change.tip_moved || !found.is_empty();
+        for f in found {
+            if let Err(e) = self.apply_found(f) {
+                tracing::warn!(target: "bitcoin", "apply: {e}");
+                self.ctx.progress.lock().last_error = Some(e);
+            }
+        }
+        self.ctx.progress.lock().authority = self.authority.summary(now_secs());
+        moved
+    }
+
+    /// Asks the Electrum header sources and keeps the most-work valid chain.
+    fn refresh_servers(&mut self) -> Change {
         let sources: Vec<Source> = {
             let ns = self.ctx.netstate.lock();
             ns.routes
@@ -221,14 +396,7 @@ impl Loop {
                 .collect()
         };
         if sources.is_empty() {
-            let ns = self.ctx.netstate.lock();
-            let why = if !ns.routes.unsupported_chain.is_empty() {
-                format!("the chain is set to {}, which comes in a later pass; enable an Electrum server for it", ns.routes.unsupported_chain.join(", "))
-            } else {
-                "no Electrum server is usable for the chain".to_string()
-            };
-            drop(ns);
-            self.ctx.progress.lock().last_error = Some(why);
+            self.ctx.progress.lock().last_error = Some("no Electrum server is usable for the chain".to_string());
         }
         let mut ready = vec![];
         for s in &sources {
@@ -237,7 +405,7 @@ impl Loop {
                 Err(e) => self.failed(&s.id.clone(), &e),
             }
         }
-        let adapters: Vec<ElectrumHeaders<'_, Checked<electrum_client::Client>>> =
+        let adapters: Vec<ElectrumHeaders<'_, Checked<net::Conn>>> =
             ready.iter().map(|s| ElectrumHeaders { id: &s.id, client: &self.clients[&s.id].inner }).collect();
         let dyns: Vec<&dyn HeaderSource> = adapters.iter().map(|a| a as &dyn HeaderSource).collect();
         let change = self.authority.refresh(&dyns, now_secs() as u32);
@@ -257,31 +425,322 @@ impl Loop {
                 ns.ledger.health_mut(id).tip = tip;
             }
         }
-        if let Some(from) = change.changed_from {
-            if change.reorg_depth > 0 {
-                tracing::info!(target: "bitcoin", "authority reorg of {} from {from}", change.reorg_depth);
-                // bdk_electrum caches headers by height, and anchors by them: start them afresh.
-                self.clients.clear();
-            }
-            let mut guard = self.ctx.cell.lock();
-            if let Some(cell) = guard.as_mut() {
-                if let Err(e) = cell.store_headers(self.authority.chain(), from) {
-                    tracing::warn!(target: "bitcoin", "store headers: {e}");
+        Change { suspects: vec![], ..change }
+    }
+
+    // ── Kyoto ────────────────────────────────────────────────────────────
+
+    fn kyoto_meta(&self, key: &str) -> Option<String> {
+        self.ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, key).ok().flatten())
+    }
+
+    /// Where Kyoto starts: below the last height it scanned; else from the birthday, after a
+    /// headers-only phase when the chain doesn't reach it yet; else from Kyoto's own checkpoint.
+    fn kyoto_start(&self) -> Start {
+        let a = &self.authority;
+        let base = a.base_height();
+        if let Some((h, hash)) = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned) {
+            if a.hash_at(h) == Some(hash) {
+                let s = h.saturating_sub(kyoto::RESTART_DEPTH).max(base);
+                if let Some(sh) = a.hash_at(s) {
+                    return Start { from: (s, sh), headers_only: false, rescan_from: None };
                 }
             }
         }
-        if change.tip_moved {
-            self.move_chain();
+        let want = self.ctx.birthday.saturating_sub(1);
+        if want >= base {
+            if let Some(hash) = a.hash_at(want) {
+                return Start { from: (want, hash), headers_only: false, rescan_from: None };
+            }
+            let tip = a.chain().tip_height();
+            return Start { from: (tip, a.chain().tip_hash()), headers_only: true, rescan_from: Some(want) };
         }
-        self.ctx.progress.lock().authority = self.authority.summary(now_secs());
-        change.tip_moved
+        Start { from: kyoto::builtin_checkpoint(self.ctx.net, want), headers_only: false, rescan_from: None }
+    }
+
+    fn save_book(&self) {
+        if let Some(c) = self.ctx.cell.lock().as_ref() {
+            let _ = meta_set(&c.conn, KYOTO_PEERS, &serde_json::to_string(&self.kyoto_book).unwrap_or_default());
+        }
+    }
+
+    /// Stops the client; with `why`, it stopped by itself: peers never seen this start count a failure.
+    fn stop_kyoto(&mut self, why: Option<Option<String>>) {
+        let Some(c) = self.kyoto.take() else { return };
+        let now = now_secs();
+        for p in c.seen() {
+            self.kyoto_book.connected(&p);
+        }
+        if let Some(why) = why {
+            for p in c.unseen() {
+                self.kyoto_book.failed(&p, now);
+            }
+            self.kyoto_status.restarts += 1;
+            self.kyoto_status.last_stop = Some(why.unwrap_or_else(|| "stopped".into()));
+            // A start that got somewhere retries soon; one that didn't backs off.
+            self.kyoto_backoff = if c.updated { Duration::from_secs(2) } else { (self.kyoto_backoff * 2).clamp(Duration::from_secs(2), KYOTO_RETRY_MAX) };
+            self.kyoto_retry_at = Instant::now() + self.kyoto_backoff;
+            tracing::info!(target: "bitcoin", "kyoto stopped ({}); {} of {} peers never connected; again in {:?}",
+                self.kyoto_status.last_stop.as_deref().unwrap_or(""), c.unseen().len(), c.peers.len(), self.kyoto_backoff);
+        }
+        c.stop();
+        self.kyoto_rescan = None;
+        self.kyoto_status.running = false;
+        self.kyoto_status.connected = 0;
+        self.ctx.netstate.lock().kyoto = None;
+        self.save_book();
+    }
+
+    /// Starts Kyoto when it isn't running, takes its updates, restarts it when it runs out of
+    /// peers, and rebuilds it when the wallet reveals addresses past what it watches.
+    fn tend_kyoto(&mut self) -> (Change, Vec<Found>) {
+        let mut change = Change::default();
+        let mut found = vec![];
+        let (route, proxy, quorum) = {
+            let ns = self.ctx.netstate.lock();
+            (ns.routes.kyoto.clone(), ns.routes.proxy.clone(), ns.routes.kyoto_required)
+        };
+        let Some(route) = route else { return (change, found) };
+        if let Some(d) = &route.down {
+            self.stop_kyoto(None);
+            self.ctx.progress.lock().last_error = Some(format!("Kyoto: {d}"));
+            return (change, found);
+        }
+        let now = now_secs();
+        if self.kyoto.is_none() && Instant::now() >= self.kyoto_retry_at {
+            let start = self.kyoto_start();
+            let peers = self.kyoto_book.pick(&route.peers, now, &mut rand::thread_rng());
+            let required = kyoto::required(self.ctx.net, quorum, peers.len());
+            let started = {
+                let guard = self.ctx.cell.lock();
+                match guard.as_ref() {
+                    Some(cell) => kyoto::Client::start(&self.ctx.rt, &cell.wallet, &route, proxy.as_ref(), required, peers, start),
+                    None => Err("closed".into()),
+                }
+            };
+            match started {
+                Ok(c) => {
+                    self.kyoto_rescan = start.rescan_from;
+                    self.ctx.netstate.lock().kyoto = Some(c.requester.clone());
+                    self.kyoto_status.dialled = c.peers.len();
+                    self.kyoto_status.running = true;
+                    self.kyoto_status.phase = "headers";
+                    self.kyoto = Some(c);
+                }
+                Err(e) => {
+                    self.kyoto_backoff = (self.kyoto_backoff * 2).clamp(Duration::from_secs(2), KYOTO_RETRY_MAX);
+                    self.kyoto_retry_at = Instant::now() + self.kyoto_backoff;
+                    self.ctx.progress.lock().last_error = Some(format!("Kyoto: {e}"));
+                }
+            }
+        }
+        let feeds = self.kyoto.as_mut().map(|c| c.poll()).unwrap_or_default();
+        // Updates sent before the node stopped are taken before the stop.
+        let mut stopped = None;
+        for f in feeds {
+            match f {
+                Feed::Progress { fraction, height } => {
+                    self.kyoto_status.progress = fraction;
+                    self.kyoto_status.height = height;
+                }
+                Feed::Warning(w) => self.kyoto_status.last_warning = Some(w),
+                Feed::Stopped(why) => stopped = Some(why),
+                Feed::Update(u) => match self.take_kyoto_update(*u) {
+                    Ok((c, f)) => {
+                        change = merge(change, c);
+                        found.extend(f);
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "bitcoin", "kyoto update: {e}");
+                        self.kyoto_status.last_warning = Some(e.clone());
+                        self.alert(KYOTO, "authority_suspect", e);
+                    }
+                },
+            }
+        }
+        if let Some(why) = stopped {
+            self.stop_kyoto(Some(why));
+        }
+        // Addresses revealed past what the client watches need a client that watches them.
+        let rebuild = match (&self.kyoto, self.ctx.cell.lock().as_ref()) {
+            (Some(c), Some(cell)) => c.needs_rebuild(&cell.wallet),
+            _ => false,
+        };
+        if rebuild {
+            tracing::info!(target: "bitcoin", "kyoto: rebuilding for addresses revealed past its lookahead");
+            self.stop_kyoto(None);
+            self.kyoto_status.rebuilds += 1;
+            self.kyoto_retry_at = Instant::now();
+        }
+        if let Some(c) = &self.kyoto {
+            self.kyoto_status.connected = c.connected();
+            self.kyoto_status.phase = kyoto::phase(c.updated && self.kyoto_rescan.is_none(), self.kyoto_status.progress);
+            self.authority.set_peers(c.connected() as u32);
+        }
+        self.kyoto_status.skipped = self.kyoto_book.skipped(now);
+        self.ctx.progress.lock().kyoto = Some(self.kyoto_status.clone());
+        (change, found)
+    }
+
+    /// Mirrors Kyoto's chain since its start into the authority's, then hands over what its
+    /// filters matched. Below the wallet's checkpoint, Kyoto's chain must reach that checkpoint.
+    fn take_kyoto_update(&mut self, u: bdk_wallet::Update) -> Result<(Change, Vec<Found>), String> {
+        let (requester, start) = match &self.kyoto {
+            Some(c) => (c.requester.clone(), c.start),
+            None => return Ok((Change::default(), vec![])),
+        };
+        let Some(cp) = u.chain else { return Ok((Change::default(), vec![])) };
+        let mut ids: Vec<(u32, BlockHash)> = cp.iter().map(|c| (c.height(), c.hash())).take_while(|(h, _)| *h > start.from.0).collect();
+        ids.reverse();
+        // Kyoto's own headers run contiguously from its start; anything past a gap is BDK's.
+        let run = ids.iter().enumerate().take_while(|(i, (h, _))| *h == start.from.0 + 1 + *i as u32).count();
+        ids.truncate(run);
+        let base = self.authority.base_height();
+        if let Some((_, hash)) = ids.iter().find(|(h, _)| *h == base) {
+            if self.authority.hash_at(base) != Some(*hash) {
+                return Err("Kyoto's peers are on a chain without the wallet's checkpoint".into());
+            }
+        }
+        let above: Vec<(u32, BlockHash)> = ids.iter().filter(|(h, _)| *h > base).copied().collect();
+        let fork = above.iter().rev().find(|(h, hash)| self.authority.hash_at(*h) == Some(*hash)).map_or(start.from.0.max(base), |(h, _)| *h);
+        if self.authority.hash_at(fork).is_none() {
+            return Err(format!("Kyoto's chain doesn't meet the wallet's at {fork}"));
+        }
+        let wanted: Vec<(u32, BlockHash)> = above.into_iter().filter(|(h, _)| *h > fork).collect();
+        // Without the headers, the update's transactions still count: anchors above the chain's
+        // tip are held until it reaches them, and the scanned height stays where it was.
+        let (change, mirrored) = match kyoto::headers(&self.ctx.rt, &requester, &wanted, &self.ctx.stop) {
+            Ok(headers) => {
+                let branch: Vec<_> = headers.into_iter().map(|(_, h)| h).collect();
+                let change = self.authority.adopt(fork, &branch, now_secs() as u32);
+                if !change.suspects.is_empty() {
+                    return Err(format!("Kyoto's headers fail the checks: {}", change.suspects[0].1));
+                }
+                (change, true)
+            }
+            Err(e) => {
+                tracing::info!(target: "bitcoin", "kyoto: headers not taken this round: {e}");
+                (Change::default(), false)
+            }
+        };
+        let tip = ids.last().copied().or_else(|| self.authority.hash_at(start.from.0).map(|h| (start.from.0, h))).filter(|_| mirrored);
+        let mut found = vec![];
+        if let Some(h) = self.kyoto_rescan {
+            // The headers-only phase is done: scan filters from the birthday on.
+            if self.authority.hash_at(h).is_some() {
+                let _ = requester.rescan_from(h);
+                tracing::info!(target: "bitcoin", "kyoto: headers synced; scanning filters after {h}");
+                self.kyoto_rescan = None;
+            }
+        } else {
+            // Kyoto's blocks below the wallet's checkpoint are named by Kyoto itself.
+            for (a, _) in &u.tx_update.anchors {
+                if a.block_id.height < base {
+                    self.authority.note_old(a.block_id.height, a.block_id.hash);
+                    if let Some(c) = self.ctx.cell.lock().as_ref() {
+                        let _ = c.store_old(&[(a.block_id.height, a.block_id.hash)]);
+                    }
+                }
+            }
+            found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: tip.map(|t| (KYOTO_SCANNED, t)) });
+        }
+        Ok((change, found))
+    }
+
+    // ── The local node ───────────────────────────────────────────────────
+
+    /// Takes the node's headers up to its tip, then the wallet's transactions in its blocks and mempool.
+    fn follow_node(&mut self) -> Result<(Change, Vec<Found>), String> {
+        let rpc = self.ctx.node_src.clone().ok_or("no local node")?;
+        if self.node.is_none() {
+            let scanned = self.kyoto_meta(NODE_SCANNED).as_deref().and_then(parse_scanned).filter(|(h, hash)| self.authority.hash_at(*h) == Some(*hash));
+            self.node = Some(Follower::new(Arc::new(NodeClient::new(rpc)), scanned));
+        }
+        let follower = self.node.as_ref().expect("set above");
+        let st = node::status(follower.client(), self.ctx.net)?;
+        self.ctx.progress.lock().node = Some(st.clone());
+        if !st.synced {
+            return Err(format!("the local node is not synced ({} of {} blocks)", st.blocks, st.headers));
+        }
+        let mut change = Change::default();
+        while self.authority.chain().tip_height() < st.blocks || self.authority.tip_height().is_none() {
+            let c = self.node.as_ref().expect("set").headers(&mut self.authority, st.blocks, now_secs() as u32)?;
+            let progressed = c.tip_moved;
+            change = merge(change, c);
+            if !progressed || self.stopped() {
+                break;
+            }
+        }
+        if !change.suspects.is_empty() {
+            return Err(format!("the node's headers fail the checks: {}", change.suspects[0].1));
+        }
+        self.authority.set_peers(1);
+        let (index, expected) = {
+            let guard = self.ctx.cell.lock();
+            let cell = guard.as_ref().ok_or("closed")?;
+            let expected: Vec<Arc<bitcoin::Transaction>> = cell.wallet.transactions().filter(|t| !t.chain_position.is_confirmed()).map(|t| t.tx_node.tx.clone()).collect();
+            (cell.wallet.spk_index().clone(), expected)
+        };
+        let birthday = self.ctx.birthday;
+        let mut found = vec![];
+        loop {
+            let f = self.node.as_mut().expect("set").scan(&self.authority, &index, expected.clone(), birthday)?;
+            let done = f.at_tip || f.scanned.is_none();
+            found.push(Found { source: LOCAL_NODE, tx_update: f.tx_update, last_active: f.last_active, evicted: f.evicted, scanned: f.scanned.map(|s| (NODE_SCANNED, s)) });
+            if done || self.stopped() {
+                break;
+            }
+        }
+        Ok((change, found))
+    }
+
+    /// Applies what the authority found: checked against its chain all the same, anchors held
+    /// above its tip, the chain given a checkpoint at each anchor.
+    fn apply_found(&mut self, f: Found) -> Result<(), String> {
+        let now = self.now();
+        let mut update = f.tx_update;
+        let pending: Vec<Txid> = update.seen_ats.iter().map(|(t, _)| *t).collect();
+        let mut guard = self.ctx.cell.lock();
+        let cell = guard.as_mut().ok_or("closed")?;
+        let screened = checks::screen(&mut update, &self.authority, &HashMap::new(), &|t| cell.known(t), true);
+        for (txid, a) in &screened.dropped {
+            // The authority's own block, gone from its chain since: a reorg raced the update.
+            tracing::info!(target: "bitcoin", "{}: {txid} at {} is off the chain now; it comes again", f.source, a.block_id.height);
+        }
+        for (txid, a) in &screened.held {
+            let _ = cell.hold(&Held { txid: *txid, anchor: *a, source: f.source.to_string() });
+        }
+        let wanted: BTreeSet<u32> = update.anchors.iter().map(|(a, _)| a.block_id.height).collect();
+        apply_chain(cell, &self.authority, &wanted)?;
+        let capped = cap(cell, &f.last_active, &update);
+        cell.wallet.apply_update(Update { last_active_indices: capped, tx_update: update, chain: None }).map_err(|e| e.to_string())?;
+        let gone: Vec<(Txid, u64)> = f.evicted.into_iter().filter(|(t, _)| cell.known(t)).collect();
+        if !gone.is_empty() {
+            cell.wallet.apply_evicted_txs(gone);
+        }
+        if !pending.is_empty() {
+            let _ = cell.reported(&pending, f.source, now);
+        }
+        cell.settle_sends()?;
+        if let Some((key, (h, hash))) = f.scanned {
+            meta_set(&cell.conn, key, &format!("{h}:{hash}")).map_err(|e| e.to_string())?;
+        }
+        cell.persist()?;
+        drop(guard);
+        let mut p = self.ctx.progress.lock();
+        p.full_scan_done = true;
+        p.synced_tip = self.authority.tip_height();
+        p.last_history_sync = Some(now);
+        p.history_server = Some(f.source.to_string());
+        p.last_error = None;
+        Ok(())
     }
 
     /// Restates BDK's chain on the authority's and applies held anchors it now covers.
     fn move_chain(&mut self) {
         let mut guard = self.ctx.cell.lock();
         let Some(cell) = guard.as_mut() else { return };
-        if let Err(e) = apply_chain(cell, &*self.authority, &BTreeSet::new()) {
+        if let Err(e) = apply_chain(cell, &self.authority, &BTreeSet::new()) {
             tracing::warn!(target: "bitcoin", "{e}");
         }
         let held = cell.held().unwrap_or_default();
@@ -289,7 +748,7 @@ impl Loop {
         let mut wanted = BTreeSet::new();
         let mut dropped = vec![];
         for h in &held {
-            match checks::judge_anchor(&*self.authority, h.anchor.block_id.height, h.anchor.block_id.hash) {
+            match checks::judge_anchor(&self.authority, h.anchor.block_id.height, h.anchor.block_id.hash) {
                 checks::AnchorVerdict::Keep => {
                     ready.anchors.insert((h.anchor, h.txid));
                     wanted.insert(h.anchor.block_id.height);
@@ -306,7 +765,7 @@ impl Loop {
             }
         }
         if !ready.anchors.is_empty() {
-            let _ = apply_chain(cell, &*self.authority, &wanted);
+            let _ = apply_chain(cell, &self.authority, &wanted);
             let _ = cell.wallet.apply_update(Update { tx_update: ready, ..Default::default() });
         }
         if let Err(e) = cell.persist() {
@@ -415,7 +874,7 @@ impl Loop {
         let screened = {
             let guard = self.ctx.cell.lock();
             let cell = guard.as_ref().ok_or("closed")?;
-            checks::screen(&mut update, &*self.authority, &mismatched, &|t| cell.known(t), takes_pending)
+            checks::screen(&mut update, &self.authority, &mismatched, &|t| cell.known(t), takes_pending)
         };
         if !screened.tx_mismatches.is_empty() {
             self.clients.remove(&src.id);
@@ -445,7 +904,7 @@ impl Loop {
                         let _ = cell.store_old(&p);
                     }
                     for (txid, a) in &screened.needs_linkage {
-                        match checks::judge_anchor(&*self.authority, a.block_id.height, a.block_id.hash) {
+                        match checks::judge_anchor(&self.authority, a.block_id.height, a.block_id.hash) {
                             checks::AnchorVerdict::Keep => {
                                 update.anchors.insert((*a, *txid));
                             }
@@ -515,7 +974,7 @@ impl Loop {
                 let _ = cell.hold(&Held { txid: *txid, anchor: *a, source: src.id.clone() });
             }
             let wanted: BTreeSet<u32> = update.anchors.iter().map(|(a, _)| a.block_id.height).collect();
-            apply_chain(cell, &*self.authority, &wanted)?;
+            apply_chain(cell, &self.authority, &wanted)?;
             let capped = cap(cell, &last_active, &update);
             cell.wallet.apply_update(Update { last_active_indices: capped, tx_update: update, chain: None }).map_err(|e| e.to_string())?;
             let _ = cell.reported(&pending, &src.id, now);
@@ -597,7 +1056,7 @@ impl Loop {
                         let h = ns.ledger.health_mut(&s.id);
                         h.tip = Some(a.tip);
                         let before = h.track.verdict;
-                        let auth = &*self.authority;
+                        let auth = &self.authority;
                         let v = crosscheck::judge(&mut h.track, auth_tip, &|x| auth.hash_at(x), &a, now_secs());
                         (before, v)
                     };
@@ -645,6 +1104,20 @@ impl Loop {
                 Err(e) => self.failed(&s.id, &e),
             }
         }
+        // The local node estimates; Kyoto's peers only state the floor they relay at.
+        let (local, kyoto) = {
+            let ns = self.ctx.netstate.lock();
+            (ns.routes.fees_local && self.feeder == Feeder::Node, ns.kyoto.clone())
+        };
+        if let (true, Some(rpc)) = (local, self.ctx.node_src.clone()) {
+            match node::fees(&NodeClient::new(rpc), "local") {
+                Ok(e) => estimates.push(e),
+                Err(e) => tracing::info!(target: "bitcoin", "local node fees: {e}"),
+            }
+        }
+        if let Some(m) = kyoto.and_then(|r| kyoto::min_fee_rate(&self.ctx.rt, &r)) {
+            estimates.push(SourceEstimate { source: KYOTO.into(), rates: [None; 3], minimum: Some(m) });
+        }
         self.ctx.progress.lock().fees = Some(fees::combine(&estimates));
         self.last_fees = Some(Instant::now());
     }
@@ -669,6 +1142,16 @@ impl Loop {
         self.last_expiry = Some(Instant::now());
     }
 
+    /// History comes from servers when they feed the chain, or when Kyoto has had no peer for a
+    /// while and a server is enabled for history.
+    fn servers_hold_history(&self) -> bool {
+        match self.feeder {
+            Feeder::Servers => true,
+            Feeder::Node => false,
+            Feeder::Kyoto => self.kyoto_status.connected == 0 && self.kyoto_status.restarts >= 3,
+        }
+    }
+
     fn run(&mut self) {
         let poll = Duration::from_secs(self.ctx.netstate.lock().routes.poll_secs.max(1));
         let history_every = poll.max(Duration::from_secs(if poll <= Duration::from_secs(5) { 1 } else { 60 }));
@@ -684,7 +1167,9 @@ impl Loop {
                 break;
             }
             let woken = self.ctx.wake.swap(false, Ordering::SeqCst);
-            if moved || woken || self.last_history.is_none_or(|t| t.elapsed() >= history_every) {
+            // Kyoto and the node find the wallet's transactions themselves; servers enabled for
+            // history stand by for when they can't.
+            if self.servers_hold_history() && (moved || woken || self.last_history.is_none_or(|t| t.elapsed() >= history_every)) {
                 if let Err(e) = self.sync_history() {
                     tracing::info!(target: "bitcoin", "history: {e}");
                     self.ctx.progress.lock().last_error = Some(e);
@@ -709,6 +1194,7 @@ impl Loop {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        self.stop_kyoto(None);
         tracing::info!(target: "bitcoin", "sync stopped");
     }
 }
@@ -752,11 +1238,22 @@ fn cap(cell: &Cell, claimed: &BTreeMap<KeychainKind, u32>, update: &TxUpdate<Con
 }
 
 /// Starts the sync thread for an open wallet.
-pub fn spawn(ctx: Ctx, authority: Box<dyn Authority>) -> std::io::Result<std::thread::JoinHandle<()>> {
+pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name("bitcoin-sync".into()).spawn(move || {
+        let book = ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, KYOTO_PEERS).ok().flatten()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         let mut l = Loop {
             ctx,
             authority,
+            feeder: Feeder::Servers,
+            kyoto: None,
+            kyoto_book: book,
+            kyoto_retry_at: Instant::now(),
+            kyoto_backoff: Duration::from_secs(2),
+            kyoto_status: KyotoStatus::default(),
+            kyoto_rescan: None,
+            node: None,
+            node_ok: false,
+            node_probe: None,
             clients: HashMap::new(),
             esplora: HashMap::new(),
             depths: HashMap::new(),
@@ -775,4 +1272,23 @@ pub fn spawn(ctx: Ctx, authority: Box<dyn Authority>) -> std::io::Result<std::th
 pub fn progress_json(p: &Progress) -> Value {
     json!({"authority": p.authority, "syncedTip": p.synced_tip, "lastHistorySync": p.last_history_sync,
            "historyServer": p.history_server, "lastError": p.last_error})
+}
+
+fn merge(mut a: Change, b: Change) -> Change {
+    a.tip_moved |= b.tip_moved;
+    a.changed_from = match (a.changed_from, b.changed_from) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    };
+    a.reorg_depth = a.reorg_depth.max(b.reorg_depth);
+    a.suspects.extend(b.suspects);
+    a.failures.extend(b.failures);
+    a.agreeing.extend(b.agreeing);
+    a
+}
+
+/// A stored `height:hash`.
+fn parse_scanned(s: &str) -> Option<(u32, BlockHash)> {
+    let (h, hash) = s.split_once(':')?;
+    Some((h.parse().ok()?, BlockHash::from_str(hash).ok()?))
 }

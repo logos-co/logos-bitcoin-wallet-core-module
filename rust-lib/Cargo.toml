@@ -5,8 +5,10 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 
-# Standalone crate: keeps cargo from adopting a workspace in a parent directory.
+# Standalone crate: keeps cargo from adopting a workspace in a parent directory. The vendored
+# bip157 is a patched dependency, not a member.
 [workspace]
+exclude = ["vendor"]
 
 [lib]
 crate-type = ["staticlib", "rlib"]
@@ -17,6 +19,15 @@ bdk_wallet = { version = "=3.2.0", features = ["rusqlite"] }
 bdk_electrum = { version = "=0.24.0", default-features = false, features = ["use-rustls-ring"] }
 bdk_esplora = { version = "=0.22.2", default-features = false, features = ["std", "async-https-rustls", "tokio"] }
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
+# Kyoto, the light client: bdk_kyoto 0.18.0 on bip157 0.7.0 with our patches (see [patch] below).
+bdk_kyoto = "=0.18.0"
+# The local node: bitcoind_module's rpc over Logos IPC behind bitcoincore_rpc's RpcApi.
+bdk_bitcoind_rpc = "=0.22.0"
+# Pinned Electrum certificates: our own verifier on the rustls that electrum-client uses.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
+sha2 = "0.10"
+sha3 = "0.10"
 
 # Storage: BDK's rusqlite, switched to SQLCipher for the whole graph.
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
@@ -47,6 +58,12 @@ logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-inter
 [features]
 default = ["logos_module"]
 logos_module = ["dep:logos-rust-sdk"]
+# Fault injection for the integration tests; never in a module build.
+test-hooks = []
+
+# bip157 0.7.0 as published plus patches/bip157, held to an allowlist (tools/kyoto, README).
+[patch.crates-io]
+bip157 = { path = "vendor/bip157" }
 
 [profile.release]
 panic = "unwind"

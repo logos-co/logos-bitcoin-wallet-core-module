@@ -15,12 +15,13 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use crate::authority::{Authority, ServerAuthority};
+use crate::authority::{Authority, ChainAuthority, KYOTO, LOCAL_NODE};
 use crate::jobs::Jobs;
 use crate::ledger::Ledger;
 use crate::manager::{self, ManagerRef, Settled, Ticket};
 use crate::network::{regtest_config, BNetwork, Family};
-use crate::routes::{Kind, Routes, Source};
+use crate::node::{NodeClient, NodeRpc};
+use crate::routes::{self, Kind, Routes, Source};
 use crate::send::{self, Outcome};
 use crate::storage::{meta_get, meta_set};
 use crate::sync::{self, Ctx, NetState, Note, Progress, RouteSource};
@@ -39,6 +40,8 @@ pub type Sink = Arc<dyn Fn(Event) + Send + Sync>;
 pub const READ_WAIT: Duration = Duration::from_millis(750);
 /// A tip older than this is never "synced".
 pub const STALE_TIP_SECS: u64 = 3600;
+/// Kyoto's broadcast counts once a peer asks for the transaction; past this it may still have gone.
+const KYOTO_BROADCAST_WAIT: Duration = Duration::from_secs(20);
 /// An open waits this long at most; the manager expires an unshown request after 5 minutes.
 const OPEN_LIMIT: Duration = Duration::from_secs(6 * 3600);
 /// A shown approval has no timeout on the person; this only bounds a forgotten one.
@@ -162,6 +165,8 @@ pub struct Engine {
     sink: Sink,
     manager: ManagerRef,
     routes_src: Option<Arc<dyn RouteSource>>,
+    /// `bitcoind_module`'s rpc, when the module runs one.
+    node_src: std::sync::OnceLock<Arc<dyn NodeRpc>>,
     pub settled: Arc<Settled>,
     rt: Mutex<Option<tokio::runtime::Runtime>>,
     rt_handle: tokio::runtime::Handle,
@@ -240,6 +245,7 @@ impl Engine {
             sink,
             manager,
             routes_src,
+            node_src: std::sync::OnceLock::new(),
             settled: Arc::default(),
             rt: Mutex::new(Some(rt)),
             rt_handle,
@@ -277,6 +283,11 @@ impl Engine {
             .expect("job thread");
         *engine.worker.lock().unwrap() = Some(handle);
         engine
+    }
+
+    /// The local node's rpc, for wallets opened from now on.
+    pub fn set_node_source(&self, src: Arc<dyn NodeRpc>) {
+        let _ = self.node_src.set(src);
     }
 
     pub fn jobs(&self) -> std::sync::MutexGuard<'_, Jobs> {
@@ -470,7 +481,7 @@ impl Engine {
         let (pw, created) = wallet::load_or_create(&mut conn, &grant.external, &grant.internal, network)?;
         let mut cell = Cell { wallet: pw, conn, network, family: grant.family };
         let now = now_secs();
-        let authority = ServerAuthority::restore(network, cell.load_headers()?, cell.load_old()?, now as u32);
+        let authority = ChainAuthority::restore(network, cell.load_headers()?, cell.load_old()?, now as u32);
         let stored = meta_get(&cell.conn, "birthday").map_err(|e| e.to_string())?.and_then(|s| s.parse::<u32>().ok());
         let stored_src = meta_get(&cell.conn, "birthday_source").map_err(|e| e.to_string())?;
         let (bday, source) = resolve_birthday(birthday, grant.birthday.as_deref(), stored.zip(stored_src), authority.chain(), network, grant.family);
@@ -482,6 +493,7 @@ impl Engine {
         let origin = grant.origin.clone().or(meta_get(&cell.conn, "origin").map_err(|e| e.to_string())?);
         let needs_birthday = source == "activation" && origin.as_deref() != Some("created");
         release_stale_locks(&mut cell)?;
+        restore_live_sends(&mut cell)?;
         cell.persist()?;
         // Every open starts with a full scan: addresses revealed elsewhere since are found too.
         let full_scan_done = false;
@@ -493,7 +505,7 @@ impl Engine {
             ledger.suspect(&s, &why);
         }
         let (routes, routes_err) = self.routes_for(network);
-        let netstate = Arc::new(Mutex::new(NetState { routes, ledger, iso: HashMap::new() }));
+        let netstate = Arc::new(Mutex::new(NetState { routes, ledger, iso: HashMap::new(), chain_by: crate::authority::ELECTRUM_HEADERS, kyoto: None }));
         let progress = Arc::new(Mutex::new(Progress { full_scan_done, authority: authority.summary(now), last_error: routes_err.clone(), ..Default::default() }));
         let cell = Arc::new(Mutex::new(Some(cell)));
         let (stop, wake, reload) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(routes_err.is_some())));
@@ -510,8 +522,9 @@ impl Engine {
             notify: self.notify(),
             rt: self.rt_handle.clone(),
             routes_src: self.routes_src.clone().filter(|_| network != BNetwork::Regtest),
+            node_src: self.node_src.get().cloned(),
         };
-        let thread = sync::spawn(ctx, Box::new(authority)).map_err(|e| e.to_string())?;
+        let thread = sync::spawn(ctx, authority).map_err(|e| e.to_string())?;
         let result = json!({
             "group": grant.group, "family": grant.family, "network": network.name(), "created": created || !existed,
             "reset": reset.is_some(),
@@ -682,6 +695,7 @@ impl Engine {
             if !cell.sends()?.iter().any(|s| s.txid == txid && wallet::live(&s.state)) {
                 return Err("only an unconfirmed send of this wallet can be bumped".into());
             }
+            restore_live_sends(cell)?;
             let psbt = send::build_bump(cell, txid, rate)?;
             let inputs = send::lock(cell, &psbt);
             cell.persist()?;
@@ -789,6 +803,10 @@ impl Engine {
         };
         // From here the transaction may be out: whatever happens, the answer is its txid.
         let stored = self.store_retry(|cell| {
+            #[cfg(any(test, feature = "test-hooks"))]
+            if hooks::BUSY_AFTER_BROADCAST.load(Ordering::SeqCst) {
+                return Err("the wallet is busy; try again (injected)".into());
+            }
             cell.set_send_broadcast(&txid, "sent", &via, out.as_str())?;
             if let Some(old) = replaces {
                 cell.set_send_state(&old, "replaced")?;
@@ -820,18 +838,44 @@ impl Engine {
         Err(last)
     }
 
-    /// Sends through the broadcast route: the first enabled source that takes it.
+    /// Sends through the broadcast route: the local node while it is the authority, then Kyoto's
+    /// peers, then the servers enabled for broadcast; the first that takes it.
     fn broadcast(&self, tx: &Transaction) -> Result<(Outcome, String), String> {
-        let (sources, proxy, netstate) = self.with_open(|w| {
+        let (sources, by, chain_by, kyoto, proxy, netstate) = self.with_open(|w| {
             let ns = w.netstate.lock();
             let list: Vec<Source> = ns.routes.broadcast.iter().filter(|s| s.down.is_none() && ns.ledger.health.get(&s.id).is_none_or(|h| h.suspect.is_none())).cloned().collect();
-            Ok((list, ns.routes.proxy.clone(), w.netstate.clone()))
+            Ok((list, ns.routes.broadcast_by.clone(), ns.chain_by, ns.kyoto.clone(), ns.routes.proxy.clone(), w.netstate.clone()))
         })?;
-        if sources.is_empty() {
-            return Err("no source is enabled for broadcast".into());
-        }
         let txid = tx.compute_txid();
         let mut maybe_left: Option<String> = None;
+        let mut tried = 0;
+        for a in by {
+            let sent: Result<Outcome, String> = match a {
+                routes::Authority::Local if chain_by == LOCAL_NODE => match self.node_src.get() {
+                    Some(rpc) => crate::node::broadcast(&NodeClient::new(rpc.clone()), tx).map(|_| Outcome::Seen),
+                    None => continue,
+                },
+                routes::Authority::Kyoto => match &kyoto {
+                    Some(r) => crate::kyoto::broadcast(&self.rt_handle, r, tx, KYOTO_BROADCAST_WAIT).map(|_| Outcome::Requested),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            tried += 1;
+            let via = if a == routes::Authority::Local { "local" } else { KYOTO };
+            match sent {
+                Ok(o) => return Ok((o, via.to_string())),
+                Err(e) if send::already_known(&e) => return Ok((Outcome::Seen, via.to_string())),
+                Err(e) if send::refused(&e) && maybe_left.is_none() => return Err(format!("{via} refused the transaction: {e}")),
+                Err(e) => {
+                    tracing::info!(target: "bitcoin", "broadcast via {via}: {e}");
+                    maybe_left = Some(via.to_string());
+                }
+            }
+        }
+        if sources.is_empty() && tried == 0 {
+            return Err("no source is enabled for broadcast".into());
+        }
         for s in sources {
             let iso = netstate.lock().iso(&s.id);
             let sent: Result<Outcome, String> = match s.kind {
@@ -948,6 +992,8 @@ impl Engine {
             let caught_up = a.height.is_some() && p.synced_tip == a.height;
             v["authority"] = json!(a);
             v["synced"] = json!(fresh && caught_up);
+            v["kyoto"] = json!(p.kyoto);
+            v["node"] = json!(p.node);
             v["historyServer"] = json!(p.history_server);
             v["lastHistorySync"] = json!(p.last_history_sync);
             if l.state == State::Syncing || l.state == State::Ready {
@@ -995,6 +1041,20 @@ impl Engine {
             Ok(None) => json!({"ok": true, "busy": true, "confirmed": "", "waiting": "", "pending": "", "sent": "", "immature": "", "tooSmall": {"count": null, "sat": ""}}),
             Err(e) => json!({"ok": false, "error": e}),
         }
+    }
+
+    /// Reveals `n` receive addresses at once, as a scan elsewhere might; tests only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn reveal_for_test(&self, n: u32) -> Result<u32, String> {
+        let r = self.cell_job(Duration::from_secs(5), |c| {
+            for _ in 0..n {
+                c.wallet.reveal_next_address(bdk_wallet::KeychainKind::External);
+            }
+            c.persist()?;
+            Ok(c.wallet.derivation_index(bdk_wallet::KeychainKind::External).unwrap_or(0))
+        });
+        self.wake();
+        r
     }
 
     pub fn next_address(&self) -> Value {
@@ -1052,8 +1112,9 @@ impl Engine {
     pub fn sources_status(&self) -> Value {
         match self.with_open(|w| {
             let ns = w.netstate.lock();
+            let kyoto = ns.routes.kyoto.as_ref().map(|k| json!({"id": k.id, "route": k.route, "peers": k.peers.len(), "down": k.down}));
             Ok(json!({"ok": true, "proxy": ns.routes.proxy.as_ref().map(|p| p.addr()), "crossCheck": ns.routes.cross_check,
-                      "unsupportedChain": ns.routes.unsupported_chain, "sources": ns.ledger.status(&ns.routes)}))
+                      "chainBy": ns.chain_by, "local": ns.routes.local, "kyoto": kyoto, "sources": ns.ledger.status(&ns.routes)}))
         }) {
             Ok(v) => v,
             Err(e) => json!({"ok": false, "error": e}),
@@ -1148,6 +1209,28 @@ pub fn resolve_birthday(
 
 /// Locks of previews that never reached broadcasting: they died with the session that built them.
 /// A send that may have left keeps its inputs locked until it confirms or is abandoned.
+/// A send whose record says it may have gone out stays in the wallet as pending, even when the
+/// store after its broadcast never happened: its coins stay spent, and a bump or rebroadcast finds it.
+fn restore_live_sends(cell: &mut Cell) -> Result<(), String> {
+    let missing: Vec<(Transaction, u64)> = cell
+        .sends()?
+        .into_iter()
+        .filter(|s| wallet::live(&s.state) && cell.wallet.tx_graph().get_tx(s.txid).is_none())
+        .map(|s| (s.tx, s.created))
+        .collect();
+    if !missing.is_empty() {
+        tracing::info!(target: "bitcoin", "{} send(s) that may have gone out are back as pending", missing.len());
+        cell.wallet.apply_unconfirmed_txs(missing);
+    }
+    Ok(())
+}
+
+/// Fault injection for tests: the store after a successful broadcast answers busy.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod hooks {
+    pub static BUSY_AFTER_BROADCAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+}
+
 fn release_stale_locks(cell: &mut Cell) -> Result<(), String> {
     let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| wallet::live(&s.state)).flat_map(|s| s.inputs.clone()).collect();
     let stale: Vec<OutPoint> = cell.wallet.list_locked_outpoints().filter(|o| !live.contains(o)).collect();

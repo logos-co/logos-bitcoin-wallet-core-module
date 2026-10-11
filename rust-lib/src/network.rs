@@ -80,9 +80,18 @@ pub struct RegtestConfig {
     pub electrum: Vec<String>,
     #[serde(default)]
     pub esplora: Vec<String>,
+    /// Kyoto's peers, `host:port`, dialled directly: Kyoto is the authority.
+    #[serde(default)]
+    pub kyoto: Vec<String>,
+    /// `bitcoind_module` is the authority, ahead of Kyoto.
+    #[serde(default)]
+    pub local: bool,
     /// Seconds between chain polls; a regtest chain mines on demand.
     #[serde(default)]
     pub poll_secs: Option<u64>,
+    /// Kyoto's quorum; 2 by default.
+    #[serde(default)]
+    pub kyoto_required: Option<u8>,
 }
 
 static REGTEST: OnceLock<RegtestConfig> = OnceLock::new();
