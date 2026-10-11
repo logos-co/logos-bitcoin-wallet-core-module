@@ -529,9 +529,11 @@ impl Loop {
             let mut ns = self.ctx.netstate.lock();
             ns.ledger.ok(&src.id, now);
             ns.ledger.health_mut(&src.id).last_sync = Some(now);
-            if let Some(e) = ns.ledger.exposure.get(&src.id).cloned() {
-                if let Some(cell) = self.ctx.cell.lock().as_ref() {
-                    let _ = cell.store_exposure(&e);
+            // Broadcasts record exposure too; all of it is kept.
+            let exposure: Vec<_> = ns.ledger.exposure.values().cloned().collect();
+            if let Some(cell) = self.ctx.cell.lock().as_ref() {
+                for e in &exposure {
+                    let _ = cell.store_exposure(e);
                 }
             }
             ns.ledger.current_history = Some(src.id.clone());

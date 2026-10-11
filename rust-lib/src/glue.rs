@@ -1,8 +1,5 @@
-//! Logos glue for `bitcoin_wallet_core_module` (rust-first, `concurrency: "multi"`).
-//!
-//! Structured values cross as JSON strings: `{ ok, ... }` or `{ ok: false, error }`. Sends,
-//! cancels, descriptors and the source-changing paths answer only `bitcoin_wallet_backend`. The
-//! core takes no password, phrase or key: the database key comes from the signer manager only.
+//! Logos glue for `bitcoin_wallet_core_module`: JSON strings in and out, sends, cancels, descriptors
+//! and source changes for `bitcoin_wallet_backend` only, and no secret ever taken as a parameter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
@@ -20,11 +17,8 @@ use crate::sync::RouteSource;
 pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, version, crates }`.
     fn version(&self) -> String;
-    /// Starts `open_wallet` (`{ network, group?, family?, birthday? }`), `close_wallet`,
-    /// `build_send` (`{ recipients: [{ address, amountSat }], feeRate? | target?, sendMax? }`),
-    /// `bump_fee` (`{ txid, feeRate }`), `rebroadcast` (`{ txid }`), and, for the backend only,
-    /// `sign_and_broadcast` and `cancel_send` (`{ previewId }`) and `abandon_send` (`{ txid }`).
-    /// `{ ok, jobId, receipt }`.
+    /// `{ ok, jobId, receipt }` for open_wallet, close_wallet, build_send, bump_fee, rebroadcast, and
+    /// for the backend sign_and_broadcast, cancel_send and abandon_send (README, Job kinds).
     fn start_job(&self, kind: String, params: String) -> String;
     /// `{ ok, jobId, kind, state: queued|running|done|failed|cancelled, error }`.
     fn job_status(&self, job_id: String, receipt: String) -> String;

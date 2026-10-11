@@ -1,6 +1,5 @@
-//! The chain authority: the only source allowed to move the wallet's chain. This pass has the
-//! server-only one, the most-work valid header chain among the enabled Electrum servers. Kyoto,
-//! and later the local node, take its place behind [`Authority`].
+//! The chain authority, the only source that moves the wallet's chain: here the most-work valid
+//! header chain among the enabled Electrum servers; Kyoto and the local node come behind [`Authority`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -188,6 +187,9 @@ impl ChainView for ServerAuthority {
     fn hash_at(&self, height: u32) -> Option<BlockHash> {
         if height >= self.chain.base() {
             self.chain.hash_at(height)
+        } else if height == 0 {
+            // BDK's chain always starts at genesis, which every chain shares.
+            Some(bitcoin::constants::genesis_block(self.chain.network().bitcoin()).block_hash())
         } else {
             self.old.get(&height).copied()
         }
@@ -281,9 +283,8 @@ impl Authority for ServerAuthority {
     }
 }
 
-/// The checkpoints BDK's local chain needs: every height it holds, from the top down to the first
-/// that agrees with the authority, restated; the heights asked for; and the tip. `None` while BDK
-/// holds a block above the authority's tip: it can only be replaced once the authority passes it.
+/// BDK's heights down to the first that agrees, restated, plus `wanted` and the tip; `None` while
+/// BDK holds a block above the authority's tip, which only a longer authority chain can replace.
 pub fn chain_update(view: &dyn ChainView, bdk: &[(u32, BlockHash)], wanted: &BTreeSet<u32>) -> Option<Vec<(u32, BlockHash)>> {
     let tip = view.tip_height()?;
     let mut heights: BTreeMap<u32, BlockHash> = BTreeMap::new();
@@ -411,6 +412,17 @@ mod tests {
         let ahead = vec![(0, honest[0].block_hash()), (40, honest[0].block_hash())];
         assert_eq!(chain_update(&a, &ahead, &BTreeSet::new()), None);
         assert_eq!(chain_update(&ServerAuthority::new(BNetwork::Regtest), &bdk, &BTreeSet::new()), None, "no progress, no update");
+    }
+
+    #[test]
+    fn a_checkpointed_chain_restates_bdks_genesis() {
+        // Signet's authority starts at its checkpoint; BDK's chain starts at genesis.
+        let cp = BNetwork::Signet.checkpoint();
+        let mut a = ServerAuthority::on(HeaderChain::from_checkpoint(BNetwork::Signet, cp.height, cp.header));
+        a.progressed = true;
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Signet).block_hash();
+        let u = chain_update(&a, &[(0, genesis)], &BTreeSet::new()).expect("an update, not a stall");
+        assert_eq!(u, vec![(0, genesis), (cp.height, cp.header.block_hash())]);
     }
 
     #[test]

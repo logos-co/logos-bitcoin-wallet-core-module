@@ -67,6 +67,9 @@ are applied with `chain: None`. Then (`checks.rs`):
   or higher only where a checked transaction pays the address; a sync asking about more than 20,000
   addresses is refused.
 
+Each open starts with a full scan (BDK's, up to the gap limit past the last used address), so
+addresses used elsewhere since are found; later syncs ask about the revealed addresses.
+
 One history server at a time, in the order of the `history` role; after 3 failures in a row, or
 when it is stale or suspect, the next one, and back once the earlier one recovers. A failing source
 backs off (5 s doubling to 5 min), so a hung one never stalls the loop. The exposure record says
@@ -192,4 +195,21 @@ wallet must start empty.
 on that node for the invalidated block, and stops answering.
 
 `tools/e2e/logosctl.sh` runs the module under a logosctl daemon with the real `keystore_module`,
-`signer_manager_module`, `evm_keystore_cli` (custodian) and `evm_signer_cli` (approver).
+`signer_manager_module`, `evm_keystore_cli` (custodian) and `evm_signer_cli` (approver), an
+isolated HOME and a fresh chain: the gate refusing the host, an open decided by the custodian, a
+receive, a send approved by the approver, a close and an unload.
+
+`examples/authority.rs` syncs the authority from the checkpoint against live Electrum servers,
+headers only: on mainnet over Tor, 35,428 headers (to 970,852) in about 40 s.
+
+## Not yet
+
+- Kyoto and the local node as the authority; Kyoto and local route entries are skipped.
+- An authority from Esplora servers alone: without an Electrum server in the `chain` role nothing
+  confirms.
+- Electrum servers with self-signed TLS certificates (common in the community) are refused:
+  `validate_domain` is on and there is no pinning yet. Their onion addresses over Tor work.
+- Unload can't reach the manager, so it skips `close_account`; the grant ends when the manager
+  restarts or the wallet is opened again.
+- testnet4 and signet check proof of work against each header's own target only: rust-bitcoin
+  has no BIP94 or 20-minute rule.

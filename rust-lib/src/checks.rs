@@ -83,9 +83,8 @@ impl Screened {
     }
 }
 
-/// Screens a server's answer in place. `mismatched` maps a requested txid to the txid its bytes
-/// hash to, as the Electrum wrapper saw them; `known` says whether the wallet already holds a txid.
-/// Without `takes_pending` the source's unconfirmed transactions are left out.
+/// Screens an answer in place. `mismatched`: requested txid → what its bytes hash to; `known`: the
+/// wallet holds it already. Without `takes_pending`, the source's unconfirmed transactions go.
 pub fn screen(
     update: &mut TxUpdate<ConfirmationBlockTime>,
     view: &dyn ChainView,

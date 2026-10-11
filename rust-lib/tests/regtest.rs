@@ -1,11 +1,5 @@
-//! The engine against a local regtest chain, with no Logos runtime: bitcoind plus two electrs from
-//! tools/regtest/chain.sh, a doctoring proxy in front of one electrs, and an in-process signer
-//! manager whose signer is logos-signer-interface's MockSigner, keyed from the test phrase.
-//!
-//! With a fresh chain from `tools/regtest/chain.sh prepare` (the test phrase's wallet must be empty):
-//! REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE=<chain>/bitcoind/regtest/.cookie \
-//! REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 REGTEST_CHAIN=../tools/regtest/chain.sh \
-//!   cargo test --release --no-default-features --test regtest -- --ignored --nocapture
+//! The engine on tools/regtest/chain.sh's chain, no Logos runtime: a doctoring proxy, and a manager
+//! over the interface's MockSigner. The run command and its environment are in the README.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};

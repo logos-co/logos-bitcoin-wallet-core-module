@@ -483,7 +483,8 @@ impl Engine {
         let needs_birthday = source == "activation" && origin.as_deref() != Some("created");
         release_stale_locks(&mut cell)?;
         cell.persist()?;
-        let full_scan_done = meta_get(&cell.conn, "full_scan_done").map_err(|e| e.to_string())?.is_some();
+        // Every open starts with a full scan: addresses revealed elsewhere since are found too.
+        let full_scan_done = false;
         let mut ledger = Ledger::default();
         for e in cell.load_exposure()? {
             ledger.exposure.insert(e.source.clone(), e);

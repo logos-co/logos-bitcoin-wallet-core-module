@@ -1,7 +1,5 @@
-//! The server-only chain authority against live Electrum servers: headers only, no address is
-//! asked about. Syncs from the network's checkpoint to the tip and prints how long it took.
-//!   cargo run --release --no-default-features --example authority -- <network> <socks5h://proxy|direct> <server>...
-//! e.g. mainnet socks5h://127.0.0.1:9050 ssl://electrum.blockstream.info:50002
+//! The server-only authority from the checkpoint to the tip against live Electrum servers, headers only:
+//! `--example authority -- mainnet socks5h://127.0.0.1:9050 ssl://electrum.blockstream.info:50002`
 
 use std::time::Instant;
 

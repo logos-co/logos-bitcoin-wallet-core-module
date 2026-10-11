@@ -1,6 +1,5 @@
-//! Connections to Electrum and Esplora servers on their routes, and a checking wrapper around
-//! Electrum that records what BDK asked and got: transactions are re-hashed against their txids,
-//! Merkle proofs kept for the length check, and address queries bounded.
+//! Connections on each source's route, and an Electrum wrapper that re-hashes transactions against
+//! their txids, keeps Merkle proofs for the length check, and bounds address queries.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
