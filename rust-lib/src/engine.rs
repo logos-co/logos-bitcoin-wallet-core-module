@@ -599,7 +599,14 @@ impl Engine {
             if let Some(r) = self.test_routes.lock().clone() {
                 return (r, None);
             }
-            let table = self.routes_src.as_ref().and_then(|src| src.route_table(network.name()).and_then(|r| Routes::from_table(&r)).ok());
+            // A node module that isn't loaded, or is slow, leaves regtest.json's routes at once.
+            let table = self.routes_src.as_ref().and_then(|src| match sync::route_table_within(src, network.name(), sync::REGTEST_ROUTES_WAIT) {
+                Ok(r) => Routes::from_table(&r).ok(),
+                Err(e) => {
+                    tracing::info!(target: "bitcoin", "route_table: {e}; regtest.json's routes");
+                    None
+                }
+            });
             return (Routes::for_regtest(table, regtest_config()), None);
         }
         match &self.routes_src {
@@ -1500,6 +1507,34 @@ mod tests {
         let again = finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset"}));
         assert_eq!((again["birthday"].clone(), again["needsBirthday"].clone()), (json!({"height": 212, "source": "set"}), json!(false)), "kept: {again}");
         e.shutdown();
+    }
+
+    /// A route source that answers after `0`, as an unloaded node module looks over Logos IPC.
+    struct Silent(Duration);
+
+    impl sync::RouteSource for Silent {
+        fn route_table(&self, _network: &str) -> Result<String, String> {
+            std::thread::sleep(self.0);
+            Err("no answer".into())
+        }
+    }
+
+    #[test]
+    fn regtest_takes_regtest_json_at_once_when_the_node_module_does_not_answer() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), Some(Arc::new(Silent(Duration::from_secs(30)))));
+        let t0 = Instant::now();
+        finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+        assert!(t0.elapsed() < sync::REGTEST_ROUTES_WAIT + Duration::from_secs(2), "opened in {:?}, not the IPC budget", t0.elapsed());
+        let routes = e.with_open(|w| Ok(w.netstate.lock().routes.clone())).unwrap();
+        assert_eq!(routes, Routes::for_regtest(None, regtest_config()), "regtest.json's routes");
+        e.shutdown();
+        // Elsewhere a silent node module still fails closed: no routes, and the error says why.
+        let other = Engine::new(root.path().join("other"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), Some(Arc::new(Silent(Duration::from_millis(200)))));
+        let (r, err) = other.routes_for(BNetwork::Signet);
+        assert_eq!((r, err.as_deref()), (Routes::default(), Some("route_table: no answer")));
+        other.shutdown();
     }
 
     #[test]

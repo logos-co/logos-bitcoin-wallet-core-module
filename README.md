@@ -287,7 +287,7 @@ Amounts are decimal strings of satoshis.
 | `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
 | `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat } }`; `unchecked` is what unchecked rows pay the wallet; empty strings while busy |
 | `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once 20 stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
-| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, confirmedVia }`; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `unchecked` is a block a server reported below the chain's start, which nothing checked; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState` is the wallet's own send record's state |
+| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, confirmedVia }`; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `unchecked` is a block a server reported below the chain's start, which nothing checked, and its `reportedBy` names that server; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState` is the wallet's own send record's state |
 | `fee_rates()` | `{ fast, normal, slow, minimum, sources }` sat/vB: the median of the fee sources, never below the highest minimum relay fee |
 | `address_valid(text, network)` | An address or BIP21 URI: `{ valid, address, type, amountSat?, label?, message? }` |
 | `sources_status()`, `exposure()` | `{ chainBy, local, kyoto: { id, route, peers, down }, sources }`: who feeds the chain and per server health and verdicts, with `encrypted` false for plain text outside Tor (the app marks those servers); the servers that learned the addresses |
@@ -346,8 +346,9 @@ way.
 
 On regtest, `regtest.json` in the persistence directory turns regtest on. The routes come from
 the node module's `route_table("regtest")` when it routes anything there, servers and Kyoto's
-peers alike, with `regtest.json`'s `pollSecs` and `kyotoRequired`; only when it routes nothing do
-`regtest.json`'s own loopback sources serve:
+peers alike, with `regtest.json`'s `pollSecs` and `kyotoRequired`; only when it routes nothing, or
+isn't loaded or doesn't answer within 3 s (it would otherwise hold an open for the whole 20 s IPC
+budget), do `regtest.json`'s own loopback sources serve; other networks keep failing closed:
 `{ "electrum": ["tcp://127.0.0.1:60601", ...], "esplora": [], "kyoto": ["127.0.0.1:18544", ...],
 "local": false, "kyotoRequired": 2, "checkOnly": false, "pollSecs": 1 }`. So pins, `userAdded` and
 the plain-text rule run end to end on regtest (`tools/e2e/pins.sh`).

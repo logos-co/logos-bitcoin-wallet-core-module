@@ -248,6 +248,9 @@ fn restores_match_cores_wallet() {
         let row = &got[txid];
         let want = if *height < checkpoint as u64 { "unchecked" } else { "confirmed" };
         assert_eq!((row["state"].as_str(), row["height"].as_u64()), (Some(want), Some(*height)), "{txid}: {row}");
+        if want == "unchecked" {
+            assert_eq!(row["reportedBy"], "esplora-0", "the server that reported it: {row}");
+        }
     }
     assert!(u.alerts("unchecked_anchor", "esplora-0") >= 1, "an alert names the unchecked transactions");
     assert!(u.engine.balance()["unchecked"].as_str().unwrap() != "0");

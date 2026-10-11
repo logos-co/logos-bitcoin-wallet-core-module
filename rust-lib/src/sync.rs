@@ -55,6 +55,20 @@ pub trait RouteSource: Send + Sync {
     }
 }
 
+/// How long a regtest open or reload waits for the node module's routes before taking
+/// `regtest.json`'s: an unloaded module would hold it for the whole IPC budget.
+pub const REGTEST_ROUTES_WAIT: Duration = Duration::from_secs(3);
+
+/// `src.route_table(network)` within `budget`; past it an error, the call left to finish alone.
+pub fn route_table_within(src: &Arc<dyn RouteSource>, network: &str, budget: Duration) -> Result<String, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (s, n) = (src.clone(), network.to_string());
+    std::thread::Builder::new().name("bitcoin-routes".into()).spawn(move || {
+        let _ = tx.send(s.route_table(&n));
+    }).map_err(|e| e.to_string())?;
+    rx.recv_timeout(budget).map_err(|_| format!("no answer within {} s", budget.as_secs()))?
+}
+
 /// What the sync thread shares with readers and with send jobs.
 #[derive(Default)]
 pub struct NetState {
@@ -334,7 +348,11 @@ impl Loop {
 
     fn reload_routes(&mut self) {
         let Some(src) = &self.ctx.routes_src else { return };
-        let table = src.route_table(self.ctx.net.name()).and_then(|r| Routes::from_table(&r));
+        let table = match self.ctx.net {
+            BNetwork::Regtest => route_table_within(src, self.ctx.net.name(), REGTEST_ROUTES_WAIT),
+            _ => src.route_table(self.ctx.net.name()),
+        }
+        .and_then(|r| Routes::from_table(&r));
         // Regtest keeps regtest.json's servers while the node module routes nothing there.
         let table = match table {
             Ok(r) if self.ctx.net == BNetwork::Regtest && !r.has_entries() => {

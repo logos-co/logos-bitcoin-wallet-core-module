@@ -431,8 +431,15 @@ impl Cell {
         let mut seen = BTreeSet::new();
         let base = self.chain_base();
         let held_of: BTreeMap<Txid, &Held> = held.iter().map(|h| (h.txid, h)).collect();
-        // Held above the chain's tip: waiting; below its start, where nothing links: unchecked.
+        // Held above the chain's tip: waiting; below its start, where nothing links: unchecked,
+        // named by the source that reported it.
         let held_state = |h: &Held| if h.anchor.block_id.height < base { "unchecked" } else { "waiting" };
+        let held_row = |mut r: Value, h: &Held| {
+            if r["state"] == "unchecked" && r["reportedBy"].is_null() {
+                r["reportedBy"] = json!(h.source);
+            }
+            r
+        };
         let row = |tx: &Transaction, txid: Txid, state: &str, block: Option<BlockId>, time: u64| -> Value {
             let height = block.map(|b| b.height);
             let c = intent::classify(&self.shape(tx, bumps.contains(&txid)));
@@ -460,7 +467,7 @@ impl Cell {
                 // Confirmed only because a descendant is: the anchor is the descendant's, not its own.
                 ChainPosition::Confirmed { anchor, transitively: Some(via) } => {
                     let mut r = match held_of.get(&txid) {
-                        Some(h) => row(&tx, txid, held_state(h), Some(h.anchor.block_id), h.anchor.confirmation_time),
+                        Some(h) => held_row(row(&tx, txid, held_state(h), Some(h.anchor.block_id), h.anchor.confirmation_time), h),
                         None => {
                             let mut r = row(&tx, txid, "confirmed", None, anchor.confirmation_time);
                             r["confirmations"] = json!(tip.saturating_sub(anchor.block_id.height) + 1);
@@ -481,7 +488,7 @@ impl Cell {
         for h in held {
             if seen.insert(h.txid) {
                 if let Some(tx) = self.wallet.tx_graph().get_tx(h.txid) {
-                    rows.push((1, h.anchor.block_id.height, h.anchor.confirmation_time, row(&tx, h.txid, held_state(h), Some(h.anchor.block_id), h.anchor.confirmation_time)));
+                    rows.push((1, h.anchor.block_id.height, h.anchor.confirmation_time, held_row(row(&tx, h.txid, held_state(h), Some(h.anchor.block_id), h.anchor.confirmation_time), h)));
                 }
             }
         }
@@ -655,6 +662,7 @@ mod tests {
         };
         let r = row(&held);
         assert_eq!((r["state"].as_str(), r["height"].as_u64(), r["confirmedVia"].as_str()), (Some("unchecked"), Some(2), Some(spend.compute_txid().to_string().as_str())), "{r}");
+        assert_eq!(r["reportedBy"], "esplora-0", "the source that reported it");
         let r = row(&[]);
         assert_eq!((r["state"].as_str(), r["height"].as_u64(), r["blockHash"].as_str()), (Some("confirmed"), None, None), "never the spender's height: {r}");
         assert_eq!(r["confirmedVia"], spend.compute_txid().to_string());
