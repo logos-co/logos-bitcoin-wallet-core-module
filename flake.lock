@@ -82,17 +82,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1791602078,
-        "narHash": "sha256-sDlIjFZASxUbfYdOu5h/cMVJx4XR+9Rfa9bFBOY/XOU=",
+        "lastModified": 1791675304,
+        "narHash": "sha256-ivtC5srsjNYvAa1bAzQf/qj4XDNiMgh2gSuSYYQnfRc=",
         "owner": "logos-co",
         "repo": "logos-evm-keystore-module",
-        "rev": "e4c6fcd39411f0ed52083f0a7fb2701e742f81f1",
+        "rev": "c68b7b4d933f30f87e033e6a1d7865f298e4d858",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-evm-keystore-module",
-        "rev": "e4c6fcd39411f0ed52083f0a7fb2701e742f81f1",
+        "rev": "c68b7b4d933f30f87e033e6a1d7865f298e4d858",
         "type": "github"
       }
     },
@@ -9723,17 +9723,17 @@
         "logos-signer-interface": "logos-signer-interface"
       },
       "locked": {
-        "lastModified": 1791675812,
-        "narHash": "sha256-mkmmUWE/xigrMr+aOvjUwCAIuHRJF4ANuqovkUZQHiE=",
+        "lastModified": 1791681826,
+        "narHash": "sha256-yCJVkKj8t8cfCuPc/y9ayZ9zMetBsYU76KPM7H9zTNU=",
         "owner": "logos-co",
         "repo": "logos-signer-manager-module",
-        "rev": "17eef7a343af9a849f816fa2d57dd7622a696c41",
+        "rev": "80bc40ccbe6c689caadc736b3db2136bfbde1818",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-signer-manager-module",
-        "rev": "17eef7a343af9a849f816fa2d57dd7622a696c41",
+        "rev": "80bc40ccbe6c689caadc736b3db2136bfbde1818",
         "type": "github"
       }
     }
