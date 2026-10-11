@@ -145,6 +145,32 @@
           cargoBuildFlags = [ "--bin" "electrs" ];
           doCheck = false;
         };
+      # rustc leaves SQLCipher's OpenSSL (big-obj COFF) out of the staticlib's index, so ld took the
+      # host's libcrypto DLL: prefix that OpenSSL and its callers apart from logos-protocol's, re-index.
+      opensslApart = ''
+        a=$PWD/lib/libbitcoin_wallet_core.a
+        chmod u+w "$a"
+        (
+          set -euo pipefail
+          export LC_ALL=C
+          cd "$(mktemp -d)"
+          O='^lib(crypto|ssl|common|default|legacy)-lib-.*[.]obj$'
+          ossl=$($AR t "$a" | grep -E "$O")
+          $AR x "$a" $ossl
+          $NM -g --defined-only $ossl \
+            | awk 'NF == 3 && $3 !~ /^[.@]/ { print $3 " bwc_openssl_" $3; print ".refptr." $3 " .refptr.bwc_openssl_" $3 }' \
+            | sort -u > rename
+          callers=$($NM -A -u "$a" \
+            | awk -F: -v O="$O" 'NR == FNR { split($0, r, " "); s[r[1]] = 1; next } $2 !~ O { n = split($NF, f, " "); if (f[n] in s) print $2 }' rename - \
+            | sort -u)
+          grep -q -- '-sqlite3\.o$' <<< "$callers"
+          echo "OpenSSL apart: $(( $(wc -l < rename) / 2 )) symbols, $(wc -w <<< "$ossl") objects, callers:" $callers
+          $AR x "$a" $callers
+          for m in $ossl $callers; do $OBJCOPY --redefine-syms=rename "$m"; done
+          $AR r "$a" $ossl $callers
+          $RANLIB "$a"
+        )
+      '';
     in
     {
       packages = forAllSystems (system:
@@ -156,6 +182,7 @@
             BIP157_PATCHES_CHECKED = "${bip157Check (buildSystem system)}";
             BDK_KYOTO_PATCHES_CHECKED = "${bdkKyotoCheck (buildSystem system)}";
           };
+          preConfigure = nixpkgs.lib.optionalString (system == "x86_64-windows") opensslApart;
         }).packages.${system}
         // { bip157-check = bip157Check (buildSystem system); bdk_kyoto-check = bdkKyotoCheck (buildSystem system); }
         // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; esplora-electrs = esploraElectrs system; }

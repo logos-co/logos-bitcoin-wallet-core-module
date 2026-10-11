@@ -536,10 +536,12 @@ windows-latest.
   winpthreads include, and ring is the provider installed at run time. Its jitterentropy marks
   nine functions `dllexport`, so the plugin exports `aws_lc_0_45_0_jent_*` beside
   `qt_plugin_instance` and `qt_plugin_query_metadata_v2`.
-- **SQLCipher's crypto in the plugin is the host's `libcrypto-3-x64.dll`** (OpenSSL 3.6.2 in
-  today's logosctl and Basecamp), not the vendored OpenSSL also linked in: the plugin imports
-  `EVP_*`, `PKCS5_PBKDF2_HMAC` and `RAND_bytes` from it, which the node module (same SDK, no
-  SQLCipher) does not. The test programs link only the vendored one.
+- **SQLCipher's crypto in the plugin is the vendored OpenSSL** (3.6.3), as in the test programs.
+  rustc's staticlib index leaves openssl-src's big-obj objects out, so ld used to take the host's
+  `libcrypto-3-x64.dll`; the plugin build now prefixes that OpenSSL's symbols and SQLCipher's
+  references to them (`bwc_openssl_*`) and re-indexes the archive. logos-protocol's TLS keeps the
+  host's `libcrypto-3-x64.dll` and `libssl-3-x64.dll`, as in every module, and the vendored
+  OpenSSL adds `CRYPT32` (its certificate-store loader) and `USER32` to the plugin's imports.
 - Owner-only modes (0700, 0600) are Unix's; on Windows the profile's ACL keeps the files.
 
 ### Spike 4: the database

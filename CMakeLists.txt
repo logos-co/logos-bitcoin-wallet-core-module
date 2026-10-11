@@ -14,4 +14,8 @@ endif()
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/metadata.json" METADATA_JSON)
 string(JSON MODULE_NAME GET ${METADATA_JSON} name)
 
-logos_module(NAME ${MODULE_NAME})
+# On Windows the OpenSSL SQLCipher bundles reads the certificate store (winstore) through crypt32.
+if(WIN32)
+    set(CORE_LINK_LIBRARIES crypt32)
+endif()
+logos_module(NAME ${MODULE_NAME} LINK_LIBRARIES ${CORE_LINK_LIBRARIES})
