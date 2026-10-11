@@ -42,7 +42,8 @@ pub fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, Storage
     Ok(conn)
 }
 
-/// Owner-only files; the directory above is 0700.
+/// Owner-only files; the directory above is 0700. On Windows the profile's ACL already is.
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn restrict(path: &Path) {
     #[cfg(unix)]
     {

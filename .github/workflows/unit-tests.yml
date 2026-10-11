@@ -49,3 +49,42 @@ jobs:
 
       - name: cargo test --no-default-features
         run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+
+  storage:
+    # Spike 4 (tests/storage.rs): 10,000 persisted updates through BDK's SQLCipher store, the
+    # reopen timed, a wrong key, and no wallet strings in the files. ci.yml runs it on Windows.
+    name: storage test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the SDK revision the builder pins
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev=$(jq -r '.nodes as $n | ($n[.root].inputs["logos-module-builder"]) as $b
+                       | $n[$n[$b].inputs["logos-rust-sdk"]].locked.rev' flake.lock)
+          [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no SDK pin in flake.lock ($rev)"; exit 1; }
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          ref: ${{ steps.sdk.outputs.rev }}
+          path: logos-rust-sdk-src
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --test storage (release, as the module runs)
+        run: cargo test --manifest-path rust-lib/Cargo.toml --release --no-default-features --locked --test storage -- --ignored --nocapture

@@ -326,6 +326,9 @@ loopback stand in for two operators. `chain.sh pruned` adds a pruned node (`-pru
 -fastprune`, a filter index) that dials the main node only, and `chain.sh prune <height>` prunes
 it; `chain.sh esplora` starts Blockstream's electrs on the main node (`ESPLORA`, from `nix build
 .#esplora-electrs`). `nix build .#regtest-chain` packages the script with bitcoind and electrs.
+`LISTEN=0.0.0.0` puts the P2P and Electrum ports on the LAN for a wallet on another machine, `HOST`
+is the address `peers` and `electrum` print, and `WHITELIST` gives a subnet download,noban as
+loopback has; RPC stays on loopback.
 
 ```bash
 export BITCOIND=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind
@@ -423,6 +426,64 @@ headers only: on mainnet over Tor, 35,428 headers (to 970,852) in about 40 s. Ky
 over Tor, from the checkpoint (290,000) with a birthday at 325,000: headers to 325,838, then the
 birthday's filters, synced in 153 s and in 380 s on two runs, at 54–57 MB peak for the whole
 process. A first sync of 10,001 regtest blocks took 2.3 s at a 30 MB peak (Linux).
+
+## Windows
+
+`packages.x86_64-windows.{lgx,lgx-portable,install,install-portable}` cross-build from x86_64-linux
+with logos-module-builder's MinGW wiring, and the portable `.lgx` passes nix-bundle-lgx's
+system-DLL gate. `packages.x86_64-windows.test-bin` holds `storage.exe` (spike 4, below) and
+`p2p_proxy.exe`; both import only Windows' own DLLs. CI runs `storage.exe` under wine and on
+windows-latest.
+
+- **aws-lc-sys stays in the build.** electrum-client 0.25.0 spells its `rustls-ring` feature
+  `rustls/ring`, which also turns on its own `rustls` feature and so `rustls/default`: no choice of
+  features drops aws-lc-rs (`rustls?/ring` upstream would). It crosses with the builder's
+  winpthreads include, and ring is the provider installed at run time. Its jitterentropy marks
+  nine functions `dllexport`, so the plugin exports `aws_lc_0_45_0_jent_*` beside
+  `qt_plugin_instance` and `qt_plugin_query_metadata_v2`.
+- **SQLCipher's crypto in the plugin is the host's `libcrypto-3-x64.dll`** (OpenSSL 3.6.2 in
+  today's logosctl and Basecamp), not the vendored OpenSSL also linked in: the plugin imports
+  `EVP_*`, `PKCS5_PBKDF2_HMAC` and `RAND_bytes` from it, which the node module (same SDK, no
+  SQLCipher) does not. The test programs link only the vendored one.
+- Owner-only modes (0700, 0600) are Unix's; on Windows the profile's ACL keeps the files.
+
+### Spike 4: the database
+
+`tests/storage.rs` (`cargo test --release --no-default-features --test storage -- --ignored
+--nocapture`; `SPIKE4_DIR` keeps the files and writes the strings to look for): 10,000
+transaction updates, each persisted on its own, through BDK's store on SQLCipher; a timed reopen;
+a wrong key; and a scan of the files, open (with the WAL) and closed, for the descriptors, the
+xpub and every address and txid, as text and as raw bytes. An unencrypted control must show them.
+
+| 2026-10-11 | Provider | 10,000 updates | Reopen | Wrong key | `strings -a` hits |
+|---|---|---|---|---|---|
+| macOS 27, aarch64 | CommonCrypto | 2.96 s | 0.67 s | refused, files unchanged | 0 (control 17) |
+| Linux x86_64 | OpenSSL 3.6.3 | 7.47 s | 0.63 s | refused, files unchanged | 0 (control 17) |
+| Windows 10.0.26200 | OpenSSL 3.6.3 | 6.04 s | 0.72 s | refused, files unchanged | 0 (control 17) |
+
+`strings` read the Windows files on the Mac. A database the module wrote on Windows in the
+regtest flow below has no wallet string either.
+
+### Under logosctl on Windows
+
+The chain runs on a Linux machine (`chain.sh` with the LAN variables above); logosctl's Windows
+bundle, the keystore side and the core run on Windows and reach it directly under the LAN rule
+(`regtest.json` with `tcp://framework.lan:…`, an IP, and Kyoto's peers by IP). On 2026-10-11:
+
+- **Electrum header chain:** opened in evm_keystore_cli and synced in 0.40 s; a receive; a send
+  approved in evm_signer_cli, `seen`; a fee bump to 10 sat/vB replaced it in the mempool and
+  confirmed, the original reading `replaced`; closed and reopened (no reset), synced in 0.61 s,
+  balance unchanged; unload 94 ms.
+- **Kyoto**, electrs only checking: synced in 0.65 s; the send and the bump went out through Kyoto
+  (`requested`, in the miner's mempool after 0.8 s and 1.3 s); the bump confirmed; reopen 0.60 s;
+  unload 97 ms. Mined before the bump reached the miner, the original confirmed instead: its row
+  then named the dead bump in `replacedBy` (fixed in `history()`, with a unit test).
+- **Spike 3**, 20 unloads per state: syncing headers 20/20 within 2 s (median 146 ms, max
+  177 ms), downloading filters 20/20 (144, 165), idle 20/20 (147, 186); the module's own part at
+  most 74 ms; every reopen intact; Windows Error Reporting logged no crash.
+- **The local node** (bitcoind_module) as the authority: synced on it in 0.39 s, a coinbase
+  matured, a send through its `sendrawtransaction` confirmed, and `set_birthday` read its filters
+  and fetched the 2 matching blocks.
 
 ## Not yet
 

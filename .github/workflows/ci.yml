@@ -39,10 +39,14 @@ jobs:
 
   windows:
     # The cross build on Linux, the PE and import-closure gates and the hand-off live in
-    # logos-co/logos-windows-ci. No smoke: a module plugin has no entry point of its own.
+    # logos-co/logos-windows-ci. The plugin has no entry point of its own, so the smoke is spike
+    # 4's storage test (tests/storage.rs), under wine and then on windows-latest.
     uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
     secrets: inherit
     with:
-      targets: default
-      # Not yet measured for this crate graph; the Zcash core's figure as a start.
-      cold-derivation-budget: 340
+      targets: default test-bin
+      smoke: |
+        run test-bin/bin/storage.exe --ignored --nocapture
+      # Measured 179 derivations to build on a cold cache (2026-10-11), none of them Qt: the
+      # crate graph, SQLCipher and OpenSSL, and the test programs.
+      cold-derivation-budget: 220

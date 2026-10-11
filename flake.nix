@@ -94,14 +94,12 @@
             runHook postBuild
           '';
           doCheck = false;
-          # The MinGW runtime DLLs beside it, so bin/ runs on a bare Windows.
+          # Both import only Windows' own DLLs (checked with objdump), so bin/ runs as it is.
           installPhase = ''
             runHook preInstall
             mkdir -p $out/bin
             cp target/${triple}/release/deps/storage-*.exe $out/bin/storage.exe
             cp target/${triple}/release/examples/p2p_proxy.exe $out/bin/
-            cp ${wpkgs.windows.pthreads}/bin/libwinpthread-1.dll ${wpkgs.windows.mcfgthreads}/bin/libmcfgthread-2.dll \
-              ${cc.cc.lib}/${wpkgs.stdenv.hostPlatform.config}/lib/libgcc_s_seh-1.dll $out/bin/
             runHook postInstall
           '';
         };
