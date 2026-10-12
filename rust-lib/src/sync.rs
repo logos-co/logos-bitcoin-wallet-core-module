@@ -30,6 +30,7 @@ use crate::ledger::Ledger;
 use crate::net::{self, Checked};
 use crate::network::{BNetwork, Family};
 use crate::node::{self, Follower, NodeClient, NodeRpc, PrunedGap};
+use crate::peers::{self, PeerReports};
 use crate::routes::{Isolation, Kind, Routes, Source};
 use crate::storage::{meta_get, meta_set};
 use crate::wallet::{Cell, Held};
@@ -54,6 +55,9 @@ pub trait RouteSource: Send + Sync {
     fn source_credentials(&self, _network: &str, _source: &str) -> Result<Option<(String, String)>, String> {
         Ok(None)
     }
+    /// How Kyoto's peers did and the peers they gossiped, as `{ outcomes, learned }`
+    /// (`peers::PeerReports`). Best effort.
+    fn report_peers(&self, _network: &str, _report: &str) {}
 }
 
 /// Headers a sync may fetch from Esplora, one request each, to link old anchors to the chain.
@@ -128,8 +132,11 @@ pub struct KyotoStatus {
     pub window: [u32; 2],
     pub last_warning: Option<String>,
     pub last_stop: Option<String>,
-    /// The last filter-header conflict: when, and the peers dropped for a day over it.
+    /// The last filter-header conflict: when, and the peers set aside over it.
     pub last_conflict: Option<Conflict>,
+    /// Addresses Kyoto's peers gossiped since the wallet opened, and those kept for the node module.
+    pub gossiped: u64,
+    pub learned: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -232,6 +239,8 @@ const NODE_GAP: &str = "node_gap";
 /// One round of the node's scan stops after this, so its finds are applied as it goes.
 const NODE_ROUND: Duration = Duration::from_secs(3);
 const KYOTO_PEERS: &str = "kyoto_peers";
+/// Learned peers this wallet reported, by `host:port`, and the peer that gossiped each.
+const KYOTO_CREDITS: &str = "kyoto_learned_from";
 /// The local node is asked whether it is synced this often while it isn't the authority.
 const NODE_PROBE_EVERY: Duration = Duration::from_secs(30);
 /// Kyoto's restarts back off up to this, while starts make no progress.
@@ -242,7 +251,15 @@ struct Loop {
     authority: ChainAuthority,
     feeder: Feeder,
     kyoto: Option<kyoto::Client>,
+    /// Failures per peer, for `regtest.json`'s peers; the node module keeps its own for its peers.
     kyoto_book: PeerBook,
+    /// The client reports its peers to the node module, which then decides what to skip.
+    kyoto_reporting: bool,
+    peer_reports: PeerReports,
+    /// A conflict's peers, left out of the next start.
+    kyoto_avoid: HashSet<String>,
+    /// This start's own peers: the node module keeps no record of them.
+    kyoto_own: HashSet<String>,
     kyoto_retry_at: Instant,
     kyoto_backoff: Duration,
     kyoto_status: KyotoStatus,
@@ -442,8 +459,11 @@ impl Loop {
                 let mut ns = self.ctx.netstate.lock();
                 if ns.routes != r {
                     tracing::info!(target: "bitcoin", "routes changed: {} chain, {} history", r.chain.len(), r.history.len());
-                    self.clients.clear();
-                    self.esplora.clear();
+                    // Kyoto's peers change as the node module learns them; servers stay connected.
+                    if (Routes { kyoto: r.kyoto.clone(), ..ns.routes.clone() }) != r {
+                        self.clients.clear();
+                        self.esplora.clear();
+                    }
                     ns.routes = r;
                     drop(ns);
                     self.route_gap();
@@ -751,16 +771,22 @@ impl Loop {
         }
     }
 
-    /// Stops the client; with `why`, it stopped by itself: peers never seen this start count a failure.
+    /// Stops the client; with `why`, it stopped by itself. The node module hears how its peers
+    /// did; on regtest.json's peers, those never seen this start count a failure instead.
     fn stop_kyoto(&mut self, why: Option<Option<String>>) {
         let Some(c) = self.kyoto.take() else { return };
         let now = now_secs();
-        for p in c.seen() {
-            self.kyoto_book.connected(&p);
+        let book = !self.kyoto_reporting;
+        if book {
+            for p in c.seen() {
+                self.kyoto_book.connected(&p);
+            }
         }
         if let Some(why) = why {
-            for p in c.unseen() {
-                self.kyoto_book.failed(&p, now);
+            if book {
+                for p in c.unseen() {
+                    self.kyoto_book.failed(&p, now);
+                }
             }
             self.kyoto_status.restarts += 1;
             self.kyoto_status.last_stop = Some(why.unwrap_or_else(|| "stopped".into()));
@@ -776,7 +802,27 @@ impl Loop {
         self.kyoto_status.running = false;
         self.kyoto_status.connected = 0;
         self.ctx.netstate.lock().kyoto = None;
-        self.save_book();
+        if book {
+            self.save_book();
+        } else {
+            self.send_reports(true);
+        }
+    }
+
+    /// Sends the node module what is due of Kyoto's peer reports; `ended` as a client stops.
+    fn send_reports(&mut self, ended: bool) {
+        let settled = self.kyoto.as_ref().is_some_and(|c| c.started.elapsed() >= peers::SETTLE);
+        let Some(report) = self.peer_reports.take(Instant::now(), ended, settled) else { return };
+        let count = |k: &str| report[k].as_array().map_or(0, Vec::len);
+        tracing::info!(target: "bitcoin", "kyoto: reported {} outcomes and {} learned peers", count("outcomes"), count("learned"));
+        if count("learned") > 0 {
+            if let Some(c) = self.ctx.cell.lock().as_ref() {
+                let _ = meta_set(&c.conn, KYOTO_CREDITS, &self.peer_reports.credits_json());
+            }
+        }
+        if let Some(src) = &self.ctx.routes_src {
+            src.report_peers(self.ctx.net.name(), &report.to_string());
+        }
     }
 
     /// Keeps `window_key` while a scan from the scan start runs: set when one begins (nothing
@@ -919,18 +965,37 @@ impl Loop {
         let now = now_secs();
         if self.kyoto.is_none() && Instant::now() >= self.kyoto_retry_at {
             let (start, snapshot) = self.kyoto_start();
-            let peers = self.kyoto_book.pick(&route.peers, now, &mut rand::thread_rng());
+            // The node module's records choose the peers and hear how they did; regtest.json's
+            // peers are a random 8 with the core's own count of failures.
+            let reporting = route.listed.is_some() && self.ctx.routes_src.is_some();
+            let avoid = std::mem::take(&mut self.kyoto_avoid);
+            let peers = match &route.listed {
+                Some(listed) if reporting => {
+                    // The table doesn't say who gossiped a learned peer: this core's reports do.
+                    let listed: Vec<peers::Listed> = listed
+                        .iter()
+                        .map(|l| peers::Listed { from: l.from.clone().or_else(|| self.peer_reports.credit(&l.peer).map(str::to_string)), ..l.clone() })
+                        .collect();
+                    self.kyoto_own = listed.iter().filter(|l| l.source == peers::PeerSource::Own).map(|l| l.peer.clone()).collect();
+                    peers::choose(&listed, &avoid, &mut rand::thread_rng())
+                }
+                _ => self.kyoto_book.pick(&route.peers, now, &mut rand::thread_rng()),
+            };
             let required = kyoto::required(self.ctx.net, quorum, peers.len());
             (self.kyoto_status.quorum, self.kyoto_status.one_peer_decides) = (required, required == 1);
             let started = {
                 let guard = self.ctx.cell.lock();
                 match guard.as_ref() {
-                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, snapshot, self.kyoto_lookahead, self.ctx.wake.clone()),
+                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, snapshot, self.kyoto_lookahead, reporting, self.ctx.wake.clone()),
                     None => Err("closed".into()),
                 }
             };
             match started {
                 Ok(c) => {
+                    self.kyoto_reporting = reporting;
+                    if reporting {
+                        self.peer_reports.start();
+                    }
                     self.kyoto_rescan = start.rescan_from;
                     self.kyoto_status.window = c.window;
                     self.note_window(KYOTO_SCANNED, KYOTO_WINDOW, c.window);
@@ -961,6 +1026,9 @@ impl Loop {
                 Feed::Warning(w) => self.kyoto_status.last_warning = Some(w),
                 Feed::Conflict => conflict = true,
                 Feed::Stopped(why) => stopped = Some(why),
+                Feed::Dial { peer, outcome } if !self.kyoto_own.contains(&peer) => self.peer_reports.dial(&peer, outcome),
+                Feed::Dial { .. } => {}
+                Feed::Gossip { from, addrs } => self.peer_reports.gossip(self.ctx.net, &from, &addrs, now),
                 Feed::Update { update, scanned, synced } => match self.take_kyoto_update(*update, scanned, synced) {
                     Ok((c, f)) => {
                         change = merge(change, c);
@@ -976,14 +1044,21 @@ impl Loop {
         }
         if conflict && self.kyoto.is_some() {
             // Peers disagree on filter headers and bip157 can't tell which one lies: the peers
-            // connected then sit out a day, and a fresh subset starts at once.
+            // connected then sit out (a day, on regtest.json's peers), and a fresh subset starts.
             let peers: Vec<String> = self.kyoto.as_ref().map(|c| Some(c.connected_now()).filter(|n| !n.is_empty()).unwrap_or_else(|| c.seen())).unwrap_or_default();
-            self.stop_kyoto(Some(Some("filter-header conflict".into())));
-            for p in &peers {
-                self.kyoto_book.skip(p, now);
+            if self.kyoto_reporting {
+                // The node module hears of them; the next start leaves them out.
+                self.peer_reports.conflict(&peers);
+                self.kyoto_avoid = peers.iter().cloned().collect();
             }
-            self.save_book();
-            tracing::warn!(target: "bitcoin", "kyoto: a filter-header conflict; {} peer(s) skipped for a day, starting again", peers.len());
+            self.stop_kyoto(Some(Some("filter-header conflict".into())));
+            if !self.kyoto_reporting {
+                for p in &peers {
+                    self.kyoto_book.skip(p, now);
+                }
+                self.save_book();
+            }
+            tracing::warn!(target: "bitcoin", "kyoto: a filter-header conflict; {} peer(s) set aside, starting again", peers.len());
             self.kyoto_status.last_conflict = Some(Conflict { at: now, peers });
             self.kyoto_retry_at = Instant::now();
             stopped = None;
@@ -1014,7 +1089,12 @@ impl Loop {
             self.kyoto_status.phase = kyoto::phase(scanned, self.kyoto_status.progress);
             self.authority.set_peers(c.connected() as u32);
         }
-        self.kyoto_status.skipped = self.kyoto_book.skipped(now);
+        // The node module leaves the peers it skips out of the table.
+        self.kyoto_status.skipped = if self.kyoto_reporting { 0 } else { self.kyoto_book.skipped(now) };
+        (self.kyoto_status.gossiped, self.kyoto_status.learned) = (self.peer_reports.gossiped, self.peer_reports.kept);
+        if self.kyoto_reporting {
+            self.send_reports(false);
+        }
         self.ctx.progress.lock().kyoto = Some(self.kyoto_status.clone());
         (change, found)
     }
@@ -1883,6 +1963,8 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
     std::thread::Builder::new().name("bitcoin-sync".into()).spawn(move || {
         let meta = |key: &str| ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, key).ok().flatten());
         let book = meta(KYOTO_PEERS).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let mut peer_reports = PeerReports::default();
+        peer_reports.load_credits(&meta(KYOTO_CREDITS).unwrap_or_default());
         let node_gap = meta(NODE_GAP).and_then(|t| serde_json::from_str(&t).ok());
         let n = kyoto::lookahead_for(ctx.gap_limit.load(Ordering::SeqCst));
         let mut l = Loop {
@@ -1891,6 +1973,10 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             feeder: Feeder::Servers,
             kyoto: None,
             kyoto_book: book,
+            kyoto_reporting: false,
+            peer_reports,
+            kyoto_avoid: HashSet::new(),
+            kyoto_own: HashSet::new(),
             kyoto_retry_at: Instant::now(),
             kyoto_backoff: Duration::from_secs(2),
             kyoto_status: KyotoStatus::default(),

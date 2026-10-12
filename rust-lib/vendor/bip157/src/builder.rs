@@ -144,6 +144,14 @@ impl Builder {
         self
     }
 
+    /// Report how each dial to a peer ends ([`Info::Dial`](crate::Info::Dial)), and ask each
+    /// peer for the addresses it knows, with [`Builder::whitelist_only`] too, reporting what it
+    /// sends ([`Info::Addresses`](crate::Info::Addresses)).
+    pub fn report_peers(mut self) -> Self {
+        self.config.report_peers = true;
+        self
+    }
+
     /// Route network traffic through a Tor daemon using a Socks5 proxy. Currently, proxies
     /// must be reachable by IP address.
     pub fn socks5_proxy(mut self, proxy: impl Into<Socks5Proxy>) -> Self {

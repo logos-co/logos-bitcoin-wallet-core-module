@@ -1,6 +1,7 @@
 //! Kyoto, the BIP157/158 light client, as a chain authority: bdk_kyoto 0.18.0 on bip157 0.7.0
-//! with our patches. Each start dials a random 8 of the node module's peers, whitelist only; a
-//! peer that fails 3 starts is skipped for a day. README, "Kyoto", has the rules and why.
+//! with our patches. Each start dials 8 of the node module's peers, whitelist only, chosen as
+//! `peers::choose` says, and reports back how each did; on `regtest.json`'s peers, a random 8,
+//! and a peer that fails 3 starts is skipped for a day. README, "Kyoto", has the rules and why.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bdk_kyoto::bip157::chain::{ChainState, IndexedHeader};
-use bdk_kyoto::bip157::{self, AddrV2, Builder, HashCheckpoint, Header, Info, ServiceFlags, TrustedPeer, Warning};
+use bdk_kyoto::bip157::{self, AddrV2, AddrV2Message, Builder, DialOutcome, HashCheckpoint, Header, Info, ServiceFlags, TrustedPeer, Warning};
 use bdk_kyoto::builder::BuilderExt;
 use bdk_kyoto::{Requester, SyncConfig};
 use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
@@ -46,6 +47,32 @@ pub enum Peer {
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
+fn onion_checksum(key: &[u8; 32]) -> [u8; 2] {
+    let mut h = Sha3_256::new();
+    h.update(b".onion checksum");
+    h.update(key);
+    h.update([3u8]);
+    let d = h.finalize();
+    [d[0], d[1]]
+}
+
+/// The v3 onion name of an ed25519 key: base32 of the key, its checksum and version 3.
+pub fn onion_name(key: &[u8; 32]) -> String {
+    let mut bytes = key.to_vec();
+    bytes.extend_from_slice(&onion_checksum(key));
+    bytes.push(3);
+    let (mut bits, mut n, mut out) = (0u64, 0u32, String::with_capacity(62));
+    for b in bytes {
+        bits = (bits << 8) | b as u64;
+        n += 8;
+        while n >= 5 {
+            n -= 5;
+            out.push(B32[((bits >> n) & 31) as usize] as char);
+        }
+    }
+    out + ".onion"
+}
+
 /// The key in a v3 onion name, after checking its version and checksum.
 pub fn onion_key(host: &str) -> Result<[u8; 32], String> {
     let name = host.strip_suffix(".onion").ok_or("not an onion name")?;
@@ -67,14 +94,11 @@ pub fn onion_key(host: &str) -> Result<[u8; 32], String> {
     if rest[2] != 3 {
         return Err(format!("{host}: not a version 3 onion name"));
     }
-    let mut h = Sha3_256::new();
-    h.update(b".onion checksum");
-    h.update(key);
-    h.update([3u8]);
-    if h.finalize()[..2] != rest[..2] {
+    let key: [u8; 32] = key.try_into().expect("32 bytes");
+    if onion_checksum(&key) != rest[..2] {
         return Err(format!("{host}: the onion name's checksum is wrong"));
     }
-    Ok(key.try_into().expect("32 bytes"))
+    Ok(key)
 }
 
 fn is_lan_name(host: &str) -> bool {
@@ -110,6 +134,15 @@ impl Peer {
             Peer::Ip(sa) => TrustedPeer::from_socket_addr(*sa),
             Peer::Onion(key, port) => TrustedPeer::new(AddrV2::TorV3(*key), Some(*port), ServiceFlags::NONE),
             Peer::Lan(host, port) => TrustedPeer::from_hostname(host.clone(), *port),
+        }
+    }
+
+    /// Whether a dial the client reports, by address and port, was to this peer.
+    fn is_at(&self, addr: &AddrV2, port: u16) -> bool {
+        match self {
+            Peer::Ip(sa) => sa.port() == port && self.is(addr),
+            Peer::Onion(_, p) => *p == port && self.is(addr),
+            Peer::Lan(..) => false,
         }
     }
 
@@ -242,6 +275,10 @@ pub enum Feed {
     Conflict,
     /// The node stopped: it ran out of peers, or was told to.
     Stopped(Option<String>),
+    /// How a dial to one of this start's peers ended, when the client reports peers.
+    Dial { peer: String, outcome: DialOutcome },
+    /// Addresses a peer gossiped, when the client reports peers; `from` as it was dialled.
+    Gossip { from: String, addrs: Vec<AddrV2Message> },
 }
 
 /// The phase a client is in, for status. Kyoto reports progress only as whole batches finish, so
@@ -286,11 +323,12 @@ pub struct Client {
 const KEYCHAINS: [KeychainKind; 2] = [KeychainKind::External, KeychainKind::Internal];
 
 impl Client {
-    /// Builds and starts a client for `wallet`, dialling `peers` on `route`; `wake` is set when
-    /// an update or a stop waits for the sync thread. It watches each keychain's revealed index
-    /// plus `lookahead`. `snapshot` holds the headers from `start.from` to `start.known_to`.
+    /// Builds and starts a client for `wallet`, dialling `peers` on `route`, first ones first;
+    /// `wake` is set when an update or a stop waits for the sync thread. It watches each
+    /// keychain's revealed index plus `lookahead`. `snapshot` holds the headers from `start.from`
+    /// to `start.known_to`. With `report`, it feeds each dial's outcome and the peers' gossip.
     #[allow(clippy::too_many_arguments)]
-    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, report: bool, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
         let net = wallet.network();
         let default_port = match net {
             bitcoin::Network::Bitcoin => 8333,
@@ -310,9 +348,10 @@ impl Client {
             return Err("Kyoto has no peer it can dial on its route".into());
         }
         let t = timeouts(route.route);
+        // bip157 dials the peer added last first.
         let mut b = Builder::new(net)
             .whitelist_only()
-            .add_peers(dial.iter().map(|(_, p)| p.trusted()))
+            .add_peers(dial.iter().rev().map(|(_, p)| p.trusted()))
             .required_peers(required)
             .handshake_timeout(t.handshake)
             .filter_batch_timeout(t.filter_batch);
@@ -324,6 +363,9 @@ impl Client {
         }
         if start.headers_only {
             b = b.headers_only_sync();
+        }
+        if report {
+            b = b.report_peers();
         }
         let cp = HashCheckpoint::new(start.from.0, start.from.1);
         let lookahead = lookahead.max(LOOKAHEAD);
@@ -342,13 +384,12 @@ impl Client {
         let requester = client.requester();
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("bitcoin-kyoto").enable_all().build().map_err(|e| e.to_string())?;
         let (tx, feed) = channel::<Feed>();
-        let (stopped, woken) = (tx.clone(), wake.clone());
+        // The stop goes out through drain_logs, after the reports the node made before it.
+        let (stopped, stop) = tokio::sync::oneshot::channel::<Option<String>>();
         rt.spawn(async move {
-            let why = node.run().await.err().map(|e| e.to_string());
-            let _ = stopped.send(Feed::Stopped(why));
-            woken.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = stopped.send(node.run().await.err().map(|e| e.to_string()));
         });
-        let updated = tx.clone();
+        let (updated, woken) = (tx.clone(), wake.clone());
         updates.checkpoint_every(CHECKPOINT_FILTERS);
         let widen = updates.widen_handle();
         rt.spawn(async move {
@@ -356,10 +397,10 @@ impl Client {
                 if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), synced: updates.synced() }).is_err() {
                     break;
                 }
-                wake.store(true, std::sync::atomic::Ordering::SeqCst);
+                woken.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
-        rt.spawn(drain_logs(logging, tx.clone()));
+        rt.spawn(drain_logs(logging, tx.clone(), dial.clone(), stop, wake));
         let (seen, connected, best_header) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)), Arc::new(Mutex::new(start.from.0)));
         let now = Arc::new(Mutex::new(vec![]));
         rt.spawn(watch_peers(requester.clone(), dial.clone(), Watched { seen: seen.clone(), now: now.clone(), connected: connected.clone(), best_header: best_header.clone() }));
@@ -492,12 +533,56 @@ pub fn rescan_lookahead(window: [u32; 2], used: &BTreeMap<KeychainKind, u32>, ga
 /// bip157's warning when two peers' filter headers disagree (node.rs, `CFHeaderChanges::Conflict`).
 const FILTER_HEADER_CONFLICT: &str = "conflict while peers are sending filter headers";
 
-async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>) {
+/// `host:port` of an address a client reports.
+fn addr_text(addr: &AddrV2, port: u16) -> String {
+    match addr {
+        AddrV2::Ipv4(ip) => SocketAddr::new(IpAddr::V4(*ip), port).to_string(),
+        AddrV2::Ipv6(ip) => SocketAddr::new(IpAddr::V6(*ip), port).to_string(),
+        AddrV2::TorV3(key) => format!("{}:{port}", onion_name(key)),
+        other => format!("{other:?}:{port}"),
+    }
+}
+
+/// Hands one of Kyoto's infos on; false once the sync thread is gone.
+fn forward(info: Info, tx: &Sender<Feed>, dial: &[(String, Peer)], latest: &mut Option<(f32, u32)>) -> bool {
+    let named = |addr: &AddrV2, port: u16| dial.iter().find(|(_, p)| p.is_at(addr, port)).map(|(t, _)| t.clone());
+    match info {
+        Info::Progress(p) => *latest = Some((p.fraction_complete(), p.chain_height())),
+        Info::Dial { addr, port, outcome } => {
+            tracing::debug!(target: "bitcoin", "kyoto: dialled {}: {outcome}", addr_text(&addr, port));
+            // A name on the user's network dials addresses no listed peer names.
+            if let Some(peer) = named(&addr, port) {
+                return tx.send(Feed::Dial { peer, outcome }).is_ok();
+            }
+        }
+        Info::Addresses { from, port, addresses } => {
+            let from = named(&from, port).unwrap_or_else(|| addr_text(&from, port));
+            return tx.send(Feed::Gossip { from, addrs: addresses }).is_ok();
+        }
+        i => tracing::debug!(target: "bitcoin", "kyoto: {i}"),
+    }
+    true
+}
+
+async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>, dial: Vec<(String, Peer)>, mut stop: tokio::sync::oneshot::Receiver<Option<String>>, wake: Arc<std::sync::atomic::AtomicBool>) {
     // A first sync reports progress thousands of times: the latest goes out every 250 ms.
     let (mut latest, mut sent): (Option<(f32, u32)>, Option<(f32, u32)>) = (None, None);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    // Closed channels drop out; only the stop ends this.
+    let (mut infos, mut warnings) = (true, true);
     loop {
         tokio::select! {
+            why = &mut stop => {
+                // What the node reported before it stopped goes first.
+                while let Ok(info) = logs.info_subscriber.try_recv() {
+                    if !forward(info, &tx, &dial, &mut latest) {
+                        return;
+                    }
+                }
+                let _ = tx.send(Feed::Stopped(why.unwrap_or_else(|_| Some("the node's task ended".into()))));
+                wake.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
             _ = tick.tick() => {
                 if latest != sent {
                     if let Some((fraction, height)) = latest {
@@ -508,12 +593,15 @@ async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>) {
                     sent = latest;
                 }
             }
-            info = logs.info_subscriber.recv() => match info {
-                Some(Info::Progress(p)) => latest = Some((p.fraction_complete(), p.chain_height())),
-                Some(i) => tracing::debug!(target: "bitcoin", "kyoto: {i}"),
-                None => return,
+            info = logs.info_subscriber.recv(), if infos => match info {
+                Some(i) => {
+                    if !forward(i, &tx, &dial, &mut latest) {
+                        return;
+                    }
+                }
+                None => infos = false,
             },
-            warn = logs.warning_subscriber.recv() => match warn {
+            warn = logs.warning_subscriber.recv(), if warnings => match warn {
                 Some(Warning::UnexpectedSyncError { warning }) if warning.contains(FILTER_HEADER_CONFLICT) => {
                     tracing::info!(target: "bitcoin", "kyoto: {warning}");
                     if tx.send(Feed::Conflict).is_err() {
@@ -527,7 +615,7 @@ async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>) {
                     }
                 }
                 Some(w) => tracing::debug!(target: "bitcoin", "kyoto: {w}"),
-                None => return,
+                None => warnings = false,
             },
         }
     }
@@ -660,31 +748,10 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
-    // A made-up v3 onion name with a valid checksum, derived from a fixed key.
-    fn onion_of(key: [u8; 32]) -> String {
-        let mut h = Sha3_256::new();
-        h.update(b".onion checksum");
-        h.update(key);
-        h.update([3u8]);
-        let mut bytes = key.to_vec();
-        bytes.extend_from_slice(&h.finalize()[..2]);
-        bytes.push(3);
-        let (mut bits, mut n, mut out) = (0u64, 0u32, String::new());
-        for b in bytes {
-            bits = (bits << 8) | b as u64;
-            n += 8;
-            while n >= 5 {
-                n -= 5;
-                out.push(B32[((bits >> n) & 31) as usize] as char);
-            }
-        }
-        format!("{out}.onion")
-    }
-
     #[test]
     fn peers_parse_as_kyoto_dials_them() {
         let key = [7u8; 32];
-        let onion = onion_of(key);
+        let onion = onion_name(&key);
         assert_eq!(onion.len(), 62);
         assert_eq!(parse_peer(&format!("{onion}:8333"), 1).unwrap(), Peer::Onion(key, 8333));
         assert_eq!(parse_peer(&onion, 38333).unwrap(), Peer::Onion(key, 38333));
@@ -702,6 +769,13 @@ mod tests {
         assert!(Peer::Lan("nas.local".into(), 1).reachable(Route::Tor).is_err());
         assert!(Peer::Ip("1.2.3.4:8333".parse().unwrap()).reachable(Route::Tor).is_ok());
         assert!(Peer::Onion(key, 1).is(&AddrV2::TorV3(key)) && !Peer::Onion(key, 1).is(&AddrV2::TorV3([8; 32])));
+        // A reported dial names its port too.
+        let local = parse_peer("127.0.0.1:18544", 1).unwrap();
+        assert!(local.is_at(&AddrV2::Ipv4([127, 0, 0, 1].into()), 18544) && !local.is_at(&AddrV2::Ipv4([127, 0, 0, 1].into()), 18545));
+        assert!(Peer::Onion(key, 8333).is_at(&AddrV2::TorV3(key), 8333) && !Peer::Onion(key, 8333).is_at(&AddrV2::TorV3(key), 8334));
+        // The published example name round-trips.
+        let known = "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+        assert_eq!(onion_name(&onion_key(known).unwrap()), known);
     }
 
     #[test]

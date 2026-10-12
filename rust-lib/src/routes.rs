@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::network::RegtestConfig;
+use crate::peers::{Listed, PeerSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,6 +71,9 @@ pub struct KyotoRoute {
     pub route: Route,
     /// `host:port` as the node module lists them: the curated subset, or the user's own peers.
     pub peers: Vec<String>,
+    /// The same with where each came from and whether it connected before, when the node module
+    /// keeps each peer's record and takes reports; `None` for plain `host:port` (regtest.json).
+    pub listed: Option<Vec<Listed>>,
     pub down: Option<String>,
 }
 
@@ -159,7 +163,7 @@ pub fn is_onion(host: &str) -> bool {
     host.strip_suffix(".onion").is_some_and(|n| n.len() == 56 && n.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')))
 }
 
-fn is_loopback_or_lan(host: &str) -> bool {
+pub(crate) fn is_loopback_or_lan(host: &str) -> bool {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(ip)) => {
             let [a, b, ..] = ip.octets();
@@ -239,7 +243,35 @@ pub fn resolve_kyoto(id: &str, route: Route, peers: Vec<String>, proxy: Option<&
         _ if peers.is_empty() => Some("no peer to dial: the peer list is empty".to_string()),
         _ => None,
     };
-    KyotoRoute { id: id.to_string(), route, peers, down }
+    KyotoRoute { id: id.to_string(), route, peers, listed: None, down }
+}
+
+/// The table's `peers`: `host:port`, or `{ peer, source, ok }` from a node module that keeps
+/// each peer's record. A bad entry is skipped.
+fn parse_peers(v: Option<&Value>) -> (Vec<String>, Option<Vec<Listed>>) {
+    let Some(Value::Array(items)) = v else { return (vec![], None) };
+    let mut listed = Vec::with_capacity(items.len());
+    let mut records = false;
+    for item in items {
+        let entry = match item {
+            Value::String(peer) => Some(Listed { peer: peer.clone(), source: PeerSource::List, ok: false, from: None }),
+            Value::Object(o) => {
+                records = true;
+                o.get("peer").and_then(Value::as_str).map(|peer| Listed {
+                    peer: peer.to_string(),
+                    source: PeerSource::parse(o.get("source").and_then(Value::as_str).unwrap_or("list")),
+                    ok: o.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                    from: None,
+                })
+            }
+            _ => None,
+        };
+        match entry {
+            Some(e) => listed.push(e),
+            None => tracing::warn!(target: "bitcoin", "route_table.peers: skipped {item}"),
+        }
+    }
+    (listed.iter().map(|l| l.peer.clone()).collect(), records.then_some(listed))
 }
 
 impl Routes {
@@ -262,11 +294,8 @@ impl Routes {
         let servers = |name: &str| -> Result<Vec<Source>, String> { Ok(entries(name)?.iter().filter_map(|e| resolve(e, proxy.as_ref())).collect()) };
         let kind = |e: &Entry, k: &str| e.kind.as_deref() == Some(k);
         let chain = entries("chain")?;
-        let peers: Vec<String> = match v.get("peers") {
-            Some(Value::Array(_)) => serde_json::from_value(v["peers"].clone()).map_err(|e| format!("route_table.peers: {e}"))?,
-            _ => vec![],
-        };
-        let kyoto = chain.iter().find(|e| kind(e, "kyoto")).map(|e| resolve_kyoto(&e.id, e.route, peers.clone(), proxy.as_ref()));
+        let (peers, listed) = parse_peers(v.get("peers"));
+        let kyoto = chain.iter().find(|e| kind(e, "kyoto")).map(|e| KyotoRoute { listed: listed.clone(), ..resolve_kyoto(&e.id, e.route, peers.clone(), proxy.as_ref()) });
         let local = chain.iter().find(|e| kind(e, "local")).map(|e| e.id.clone());
         let broadcast_by = entries("broadcast")?
             .iter()
@@ -456,8 +485,25 @@ mod tests {
         let r = Routes::from_table(&reply).unwrap();
         assert!(r.chain.is_empty() && r.local.is_none());
         assert_eq!(r.kyoto.as_ref().map(|k| k.peers.clone()), Some(vec!["a.onion:38333".to_string()]));
+        assert_eq!(r.kyoto.as_ref().unwrap().listed, None, "plain host:port: the core keeps the old rules");
         assert!(r.history[0].credentials && r.history[0].kind == Kind::Esplora && r.history[0].down.is_none());
         assert_eq!(r.fees[0].kind, Kind::Electrum);
+    }
+
+    #[test]
+    fn peers_with_their_records_say_where_each_came_from() {
+        let reply = json!({"ok": true, "proxy": "socks5h://127.0.0.1:9050",
+            "chain": [{"id": "kyoto", "kind": "kyoto", "url": "", "operator": "peers", "route": "onion"}],
+            "peers": [{"peer": "a.onion:8333", "source": "list", "ok": true}, {"peer": "b.onion:8333", "source": "learned", "ok": false},
+                {"peer": "[fd00::2]:8333", "source": "own", "ok": false}, {"peer": "c.onion:8333", "source": "something new"},
+                {"source": "list"}, 7]})
+        .to_string();
+        let k = Routes::from_table(&reply).unwrap().kyoto.unwrap();
+        assert_eq!(k.peers, vec!["a.onion:8333", "b.onion:8333", "[fd00::2]:8333", "c.onion:8333"], "bad entries skipped");
+        let l = k.listed.unwrap();
+        assert_eq!((l[0].source, l[0].ok), (PeerSource::List, true));
+        assert_eq!((l[1].source, l[1].ok), (PeerSource::Learned, false));
+        assert_eq!((l[2].source, l[3].source), (PeerSource::Own, PeerSource::Seed), "an unknown source counts as a seed");
     }
 
     #[test]

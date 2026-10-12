@@ -131,7 +131,7 @@ pub(crate) async fn create_socks5(
     let dest_port_bytes = port.to_be_bytes();
     let ip_type_byte = addr.type_byte();
     // Begin the handshake by requesting a connection to the proxy.
-    let mut tcp_stream = timeout.map_err(|_| Socks5Error::ConnectionFailed)?;
+    let mut tcp_stream = timeout?;
     tcp_stream.write_all(&[VERSION, METHODS, NOAUTH]).await?;
     // Read the response from the proxy
     let mut buf = [0_u8; 2];
@@ -155,7 +155,7 @@ pub(crate) async fn create_socks5(
         return Err(Socks5Error::WrongVersion);
     }
     if buf[1] != RESPONSE_SUCCESS {
-        return Err(Socks5Error::ConnectionFailed);
+        return Err(Socks5Error::Reply(buf[1]));
     }
     // Read off the destination of our request
     match buf[3] {

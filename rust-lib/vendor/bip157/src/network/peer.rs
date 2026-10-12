@@ -22,7 +22,7 @@ use tokio::{
 
 use crate::network::gossip::TransactionCheck;
 use crate::network::RelayPolicy;
-use crate::{broadcaster::BroadcastQueue, messages::Warning, BlockType, Dialog, Info};
+use crate::{broadcaster::BroadcastQueue, messages::Warning, BlockType, DialOutcome, Dialog, Info};
 
 use super::{
     error::PeerError,
@@ -71,6 +71,8 @@ pub(crate) struct Peer {
     tx_queue: Arc<Mutex<BroadcastQueue>>,
     relay_policy: RelayPolicy,
     cf_header_requests: CfHeaderRequests,
+    report_peers: bool,
+    dial_reported: bool,
 }
 
 impl Peer {
@@ -87,6 +89,7 @@ impl Peer {
         db: Arc<Mutex<AddressBook>>,
         timeout_config: PeerTimeoutConfig,
         tx_queue: Arc<Mutex<BroadcastQueue>>,
+        report_peers: bool,
     ) -> Self {
         Self {
             nonce,
@@ -102,10 +105,41 @@ impl Peer {
             message_state: MessageState::new(timeout_config.response_timeout),
             tx_queue,
             cf_header_requests: CfHeaderRequests::default(),
+            report_peers,
+            dial_reported: false,
         }
     }
 
     pub async fn run(
+        &mut self,
+        connection: TcpStream,
+        is_proxy_connection: bool,
+    ) -> Result<(), PeerError> {
+        let result = self.run_connection(connection, is_proxy_connection).await;
+        // The connection ended before the peer's version: it timed out, or the peer closed it.
+        let outcome = if self.message_state.unresponsive() {
+            DialOutcome::TimedOut
+        } else {
+            DialOutcome::Refused
+        };
+        self.report_dial(outcome);
+        result
+    }
+
+    // The first outcome of this dial, once, when reporting peers.
+    fn report_dial(&mut self, outcome: DialOutcome) {
+        if self.report_peers && !self.dial_reported {
+            self.dial_reported = true;
+            let (addr, port) = self.source.network_addr();
+            self.dialog.send_info(Info::Dial {
+                addr,
+                port,
+                outcome,
+            });
+        }
+    }
+
+    async fn run_connection(
         &mut self,
         connection: TcpStream,
         is_proxy_connection: bool,
@@ -240,6 +274,10 @@ impl Peer {
                 if self.message_state.version_handshake.is_complete() {
                     return Err(PeerError::DisconnectCommand);
                 }
+                self.report_dial(DialOutcome::Version {
+                    services: version.services,
+                    version: version.version,
+                });
                 self.main_thread_sender
                     .send(PeerThreadMessage {
                         nonce: self.nonce,
@@ -249,6 +287,14 @@ impl Peer {
                 Ok(())
             }
             ReaderMessage::Addr(addrs) => {
+                if self.report_peers {
+                    let (from, port) = self.source.network_addr();
+                    self.dialog.send_info(Info::Addresses {
+                        from,
+                        port,
+                        addresses: addrs.clone(),
+                    });
+                }
                 let mut db_lock = self.db.lock().await;
                 db_lock.add_gossiped(addrs.into_iter(), &self.source.network_addr().0);
                 Ok(())
@@ -563,7 +609,203 @@ impl Peer {
 
 #[cfg(test)]
 mod tests {
-    use super::CfHeaderRequests;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use addrman::Record;
+    use bitcoin::consensus::serialize;
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::Network;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, Mutex};
+
+    use crate::broadcaster::BroadcastQueue;
+    use crate::network::outbound::make_version;
+    use crate::network::{AddressBook, MainThreadMessage, PeerId, PeerThreadMessage};
+    use crate::network::{PeerTimeoutConfig, RelayPolicy};
+    use crate::{BlockType, DialOutcome, Dialog, Event, Info, Warning};
+
+    use super::{CfHeaderRequests, Peer};
+
+    // A reporting peer task dialled to a loopback socket the test speaks for.
+    struct Dialled {
+        remote: TcpStream,
+        port: u16,
+        infos: mpsc::Receiver<Info>,
+        _rest: (
+            mpsc::Receiver<PeerThreadMessage>,
+            mpsc::Sender<MainThreadMessage>,
+            mpsc::UnboundedReceiver<Warning>,
+            mpsc::UnboundedReceiver<Event>,
+        ),
+    }
+
+    async fn dialled() -> Dialled {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let local = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (remote, _) = listener.accept().await.unwrap();
+        let (info_tx, infos) = mpsc::channel(32);
+        let (warn_tx, warn_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (main_tx, main_rx) = mpsc::channel(32);
+        let (to_peer, from_main) = mpsc::channel(32);
+        let loopback = Ipv4Addr::LOCALHOST;
+        let source = Record::new(
+            AddrV2::Ipv4(loopback),
+            port,
+            ServiceFlags::NONE,
+            &IpAddr::V4(loopback),
+        );
+        let timeouts = PeerTimeoutConfig {
+            response_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let mut peer = Peer::new(
+            PeerId(1),
+            source,
+            Network::Regtest,
+            BlockType::default(),
+            RelayPolicy::BlocksOnly,
+            main_tx,
+            from_main,
+            Arc::new(Dialog::new(info_tx, warn_tx, event_tx)),
+            Arc::new(Mutex::new(AddressBook::new())),
+            timeouts,
+            Arc::new(Mutex::new(BroadcastQueue::new())),
+            true,
+        );
+        tokio::spawn(async move { peer.run(local, false).await });
+        Dialled {
+            remote,
+            port,
+            infos,
+            _rest: (main_rx, to_peer, warn_rx, event_rx),
+        }
+    }
+
+    async fn report(infos: &mut mpsc::Receiver<Info>) -> Info {
+        let next = async {
+            loop {
+                match infos.recv().await.expect("the peer task is gone") {
+                    i @ (Info::Dial { .. } | Info::Addresses { .. }) => return i,
+                    _ => continue,
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), next)
+            .await
+            .expect("a report in time")
+    }
+
+    fn outcome(info: Info, port: u16) -> DialOutcome {
+        match info {
+            Info::Dial {
+                addr,
+                port: p,
+                outcome,
+            } => {
+                assert_eq!((addr, p), (AddrV2::Ipv4(Ipv4Addr::LOCALHOST), port));
+                outcome
+            }
+            other => panic!("not a dial: {other}"),
+        }
+    }
+
+    fn wire(message: NetworkMessage) -> Vec<u8> {
+        serialize(&RawNetworkMessage::new(Network::Regtest.magic(), message))
+    }
+
+    #[tokio::test]
+    async fn a_dial_reports_how_it_ended_and_the_addresses_the_peer_gossips() {
+        let Dialled {
+            remote,
+            port,
+            mut infos,
+            _rest,
+        } = dialled().await;
+        drop(remote);
+        assert_eq!(
+            outcome(report(&mut infos).await, port),
+            DialOutcome::Refused,
+            "closed first"
+        );
+
+        let Dialled {
+            remote: _silent,
+            port,
+            mut infos,
+            _rest,
+        } = dialled().await;
+        assert_eq!(
+            outcome(report(&mut infos).await, port),
+            DialOutcome::TimedOut,
+            "no version"
+        );
+
+        let Dialled {
+            mut remote,
+            port,
+            mut infos,
+            _rest,
+        } = dialled().await;
+        let services =
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
+        let mut version = make_version(&RelayPolicy::BlocksOnly);
+        (version.services, version.version) = (services, 70016);
+        let onion = |key, services| AddrV2Message {
+            time: 1_700_000_000,
+            services,
+            addr: AddrV2::TorV3([key; 32]),
+            port: 8333,
+        };
+        let gossip = vec![onion(1, services), onion(2, ServiceFlags::NETWORK)];
+        remote
+            .write_all(&wire(NetworkMessage::Version(version)))
+            .await
+            .unwrap();
+        remote
+            .write_all(&wire(NetworkMessage::AddrV2(gossip.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome(report(&mut infos).await, port),
+            DialOutcome::Version {
+                services,
+                version: 70016
+            }
+        );
+        match report(&mut infos).await {
+            Info::Addresses {
+                from,
+                port: p,
+                addresses,
+            } => {
+                assert_eq!((from, p), (AddrV2::Ipv4(Ipv4Addr::LOCALHOST), port));
+                assert_eq!(addresses, gossip[..1], "only peers that serve filters");
+            }
+            other => panic!("not gossip: {other}"),
+        }
+        drop(remote);
+        let rest = async {
+            let mut rest = vec![];
+            while let Some(info) = infos.recv().await {
+                rest.push(info);
+            }
+            rest
+        };
+        let rest = tokio::time::timeout(Duration::from_secs(10), rest)
+            .await
+            .unwrap();
+        assert!(
+            !rest.iter().any(|i| matches!(i, Info::Dial { .. })),
+            "one outcome per dial"
+        );
+    }
 
     #[test]
     fn only_requested_filter_headers_are_answers() {

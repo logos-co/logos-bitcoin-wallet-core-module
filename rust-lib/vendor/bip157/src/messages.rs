@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::Div;
 
-use bitcoin::p2p::address::AddrV2;
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::Transaction;
 use bitcoin::{block::Header, p2p::message_network::RejectReason, BlockHash, FeeRate, Wtxid};
@@ -24,6 +24,60 @@ pub enum Info {
     Progress(Progress),
     /// A requested block has been received and is being processed.
     BlockReceived(BlockHash),
+    /// A dial to a peer ended (`Builder::report_peers`).
+    Dial {
+        /// The peer's address.
+        addr: AddrV2,
+        /// The port dialled.
+        port: u16,
+        /// How the dial ended.
+        outcome: DialOutcome,
+    },
+    /// A peer gossiped addresses of peers that serve compact block filters
+    /// (`Builder::report_peers`).
+    Addresses {
+        /// The peer that sent them.
+        from: AddrV2,
+        /// The port it was dialled on.
+        port: u16,
+        /// The addresses as the peer sent them.
+        addresses: Vec<AddrV2Message>,
+    },
+}
+
+/// How a dial to a peer ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialOutcome {
+    /// The peer sent its version message.
+    Version {
+        /// The services the peer signals.
+        services: ServiceFlags,
+        /// The peer's protocol version.
+        version: u32,
+    },
+    /// The connection, or the peer's version message, did not come in time.
+    TimedOut,
+    /// The peer refused the connection, or closed it before its version message.
+    Refused,
+    /// No route to the peer, or the proxy could not reach it.
+    Unreachable,
+    /// The dial failed on this side, on the local network or at the proxy: it says nothing
+    /// about the peer.
+    Local,
+}
+
+impl core::fmt::Display for DialOutcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DialOutcome::Version { services, version } => {
+                write!(f, "version {version}, services {services}")
+            }
+            DialOutcome::TimedOut => write!(f, "timed out"),
+            DialOutcome::Refused => write!(f, "refused"),
+            DialOutcome::Unreachable => write!(f, "unreachable"),
+            DialOutcome::Local => write!(f, "failed on this side"),
+        }
+    }
 }
 
 impl core::fmt::Display for Info {
@@ -36,6 +90,16 @@ impl core::fmt::Display for Info {
                 write!(f, "Percent complete: {progress_percent}")
             }
             Info::BlockReceived(hash) => write!(f, "Received block {hash}"),
+            Info::Dial {
+                addr,
+                port,
+                outcome,
+            } => write!(f, "Dialled {addr:?} port {port}: {outcome}"),
+            Info::Addresses {
+                from,
+                port,
+                addresses,
+            } => write!(f, "{} addresses from {from:?} port {port}", addresses.len()),
         }
     }
 }

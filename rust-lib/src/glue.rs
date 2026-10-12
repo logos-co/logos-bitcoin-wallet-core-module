@@ -375,6 +375,10 @@ impl RouteSource for NodeIpc {
         self.p().call_json_async_with_timeout("report_mismatch", &json!([network, source, kind, h]), BUDGET, |_| {});
     }
 
+    fn report_peers(&self, network: &str, report: &str) {
+        self.p().call_json_async_with_timeout("report_peers", &json!([network, report]), BUDGET, |_| {});
+    }
+
     fn source_credentials(&self, network: &str, source: &str) -> Result<Option<(String, String)>, String> {
         let (tx, rx) = sync_channel(1);
         self.p().call_json_async_with_timeout("source_credentials", &json!([network, source]), BUDGET, move |r| {

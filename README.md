@@ -131,14 +131,32 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with five, below
-(`kyoto.rs`):
+bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with six, below
+(`kyoto.rs`, `peers.rs`):
 
-- Peers come from the route table's `peers`: every peer the node module's verified peer list
-  makes usable on Kyoto's route, or the user's own, which replace the list. Each start takes a
-  random 8, `whitelist_only`, as literal addresses, so Kyoto never resolves a public name; onion
-  names are checked (base32, checksum, version 3). A peer that never connects in 3 starts in a row
-  is skipped for 24 hours, unless every peer is.
+- Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
+  module's peer book for this install, or the user's own, which replace it. Each start dials 8,
+  `whitelist_only`, as literal addresses, so Kyoto never resolves a public name; onion names are
+  checked (base32, checksum, version 3). Own peers come first and bypass the rest. Then at least
+  3 from `list` when it has them, then the others; within each, peers that connected before
+  (`ok`) ahead of new ones, at random, and at most 2 learned peers credited to one gossiping peer.
+  The table doesn't name it: the core remembers whom it credited each peer it reported to
+  (`kyoto_learned_from`), and learned peers it can't place share one cap of 2. bip157 dials them
+  in that order.
+- After each start the core reports to the node module (`report_peers`) how each peer it tried
+  did: `ok` when the version handshake showed bits 0, 3 and 6 (and protocol 70016), else a
+  `reason`: `timeout`, `refused`, `unreachable`, `services`, or `conflict` for a peer set aside
+  after a filter-header conflict (bip157 patch 6). A dial that failed on this side, at the SOCKS
+  proxy or the local network, says nothing of the peer and isn't reported; nor are a start's
+  failures when none of its peers answered (offline, or Tor still starting), nor the user's own
+  peers. Kyoto asks each peer for addresses (`getaddr`), and the core reports those that are onion
+  v3 (on regtest, on the user's network instead), have bits 0, 3 and 6 and were seen within 3 days
+  and at most 10 minutes ahead, with `from`, the peer that sent them: at most 500 a report, at most
+  once a minute, new ones before newer sightings of reported ones (sent again after 6 hours). The
+  node module keeps each peer's record and skips one that failed 3 times in a row for 24 hours;
+  `regtest.json`'s peers, with no record behind them, are a random 8 and keep the core's own count
+  (`kyoto_peers`): 3 starts in a row without connecting skip a peer for 24 hours, unless every
+  peer is.
 - One connection type per client, as the node module routes it: `direct` for peers on the user's
   network (names there resolve locally), else all through Tor's SOCKS port, never a mix. Kyoto
   takes the proxy by IP address only.
@@ -177,10 +195,10 @@ bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with
   from the block before the birthday and goes on scanning from where it stopped, so the scan can
   still start over in place.
 - A filter-header conflict between peers (bip157 can't tell which lies, and disconnects one): the
-  peers connected then are skipped for 24 hours and a fresh subset starts at once
-  (`status.kyoto.lastConflict: { at, peers }`). bip157's own resolution, fetching the block to
-  find the liar, is not needed for safety, as no filter header is taken without the quorum; with
-  verified peers only, conflicts should be rare, and skipping both sides costs a peer a day.
+  peers connected then are reported (`conflict`) and left out of a fresh subset that starts at
+  once; on `regtest.json`'s peers, skipped for 24 hours (`status.kyoto.lastConflict: { at, peers
+  }`). bip157's own resolution, fetching the block to find the liar, is not needed for safety, as
+  no filter header is taken without the quorum; conflicts should be rare.
 - Each update's headers are read back from Kyoto (`get_header`), checked against the hashes the
   update names, and taken into the header chain with the same checks as any source. Its
   transactions pass the anchor checks too, then reach BDK with a checkpoint at each anchor.
@@ -196,13 +214,14 @@ bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with
   connection limit (135% CPU after one rebuild, before this).
 - `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, quorum, onePeerDecides,
   headers, progress, connected, dialled, skipped, restarts, rebuilds, rescans, window, lastWarning,
-  lastStop, lastConflict }`. Kyoto counts progress by finished batches, so a catch-up within one
-  batch reads `syncing` until its filters are in; `headers` is Kyoto's best header; `window` is the
-  highest index the client watches per keychain.
+  lastStop, lastConflict, gossiped, learned }`. Kyoto counts progress by finished batches, so a
+  catch-up within one batch reads `syncing` until its filters are in; `headers` is Kyoto's best
+  header; `window` is the highest index the client watches per keychain; `gossiped` counts the
+  addresses peers sent since the wallet opened and `learned` those kept for the node module.
 
 ### Kyoto patches
 
-`patches/bip157/` holds five patches on bip157 0.7.0 as published, in `git format-patch` form, each
+`patches/bip157/` holds six patches on bip157 0.7.0 as published, in `git format-patch` form, each
 with unit tests:
 
 1. distinct peers count toward the filter-header quorum, and unsolicited `cfheaders` are dropped
@@ -214,9 +233,18 @@ with unit tests:
 4. a random nonce in each version message (`network/outbound.rs`); the user agent still names Kyoto;
 5. a rescan keeps the filter headers the quorum agreed on and checks only the filters again
    (`chain/graph.rs`, `chain/chain.rs`): `rescan_from` cleared them, so a scan that started over
-   downloaded every filter header from there again.
+   downloaded every filter header from there again;
+6. `Builder::report_peers`: how each dial ends, as `Info::Dial` with the peer's address and port
+   (its version's services and protocol, timed out, refused, unreachable, or failed on this side),
+   and every `addrv2` message as `Info::Addresses` with its sender; peers are asked for addresses
+   with `whitelist_only` too, and out of peers to dial the node waits for the handshakes in flight
+   before it gives up, so each of them reports (`messages.rs`, `lib.rs`, `builder.rs`, `node.rs`,
+   `network/peer.rs`, `network/peer_map.rs`, `network/mod.rs`, `network/socks.rs`,
+   `network/error.rs`). A failed TCP or SOCKS5 connect keeps its cause: a SOCKS5 reply speaks of
+   the destination, a proxy that can't be reached of nothing. bip157's client gossip subscription
+   (#607) is for transactions only; nothing showed the addresses peers sent.
 
-`tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those seven files: a patch
+`tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those thirteen files: a patch
 touching any other file fails the build until the file is added there, with a reason.
 `rust-lib/vendor/bip157` is the result, used through `[patch.crates-io]`. `nix build
 .#bip157-check` rebuilds it from the published crate (fetched by hash) and diffs it byte for byte,
@@ -367,7 +395,8 @@ more: `{ "modules": [...], "allowHost": true }`.
 From `bitcoin_node_module`'s `route_table(network)`: `{ proxy, chain, history, pending, fees,
 broadcast, check, peers, crossCheck }`, each role `[{ id, kind, url, operator, route:
 tor|direct|onion, credentials?, certSha256?, userAdded? }]`. A `local` entry in `chain` makes the local node an
-authority, a `kyoto` entry Kyoto, with `peers` as its peers; `local` and `kyoto` in `broadcast` put
+authority, a `kyoto` entry Kyoto, with `peers` as its peers (`{ peer, source, ok }`, or plain
+`host:port`, which keeps the core's own rules); `local` and `kyoto` in `broadcast` put
 them ahead of the servers there. Tor and onion routes go through the `socks5h://` proxy with SOCKS
 credentials per server, so each gets its own circuit; with no proxy they are down, never reached
 directly. Plain `tcp://` and `http://` go only to an onion service, through Tor, or to a server
@@ -405,8 +434,9 @@ and unchecked ones below the chain's start), `core_exposure`, `core_suspects`, `
 `core_sends` (state `broadcasting`, `sent`, `replaced`, `confirmed`, `conflicted`, `abandoned` or
 `failed`) and `core_meta`, which keeps the birthday, the gap limit (`gap_limit`), the chain's checkpoint (`chain_base`), the last
 heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`), the indices a scan from the
-birthday watched (`kyoto_window`, `node_window`), a pruned node's gap (`node_gap`) and Kyoto's peer
-failures (`kyoto_peers`). `scan_rules` marks the scan rules a wallet was scanned under: a wallet
+birthday watched (`kyoto_window`, `node_window`), a pruned node's gap (`node_gap`), Kyoto's peer
+failures on `regtest.json`'s peers (`kyoto_peers`) and whom each learned peer the wallet reported
+is credited to (`kyoto_learned_from`). `scan_rules` marks the scan rules a wallet was scanned under: a wallet
 from before these (2) scans again once, from its birthday. A send whose record says it may
 have gone out comes back as pending on reopen, even when the store after its broadcast never
 happened, so its coins stay spent and a bump or a rebroadcast finds it; `history` rows of the
@@ -460,6 +490,8 @@ ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs R
   cargo test --release --no-default-features --features test-hooks --test anchors -- --ignored --nocapture
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test gap -- --ignored --nocapture
+REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
+  --test peers -- --ignored --nocapture
 ```
 
 `chain.sh reorg` pays the replacement blocks to a fresh address each time: right after a burst of
@@ -548,6 +580,16 @@ addresses to 80 handed out, so the restore's scan watches past 72. 70 to 72 then
 warning. `set_gap_limit` 60 scans again (Kyoto in place) and counts them as confirmed, and a
 reopen keeps 60.
 
+`peers` stands in for the node module with a table of five peers behind `p2p_proxy` fronts, with a
+quorum of 4 they can't meet, so each start dials all five and stops: the main node, the follower,
+the main node with bit 6 cleared from its version, a closed port and a port that never answers.
+The follower's address book holds onion peers (`addpeeraddress`, which Core fixes at bits 0 and
+3); its front adds bit 6 and gossips 601 peers on loopback beside, and three no network keeps
+(seen 4 days ago, no witness bit, a public address). Each start reports `ok` for the two good
+peers and `services`, `refused` and `timeout` for the others, and the refusing peer is dialled
+start after start: the core skips nobody by itself. The loopback peers go 500 in the first report
+and the other 101 a minute later; the onions came through (regtest keeps none), and nothing else.
+
 `esplora`, with Blockstream's electrs (esplora flavour, `--jsonrpc-import`) for history, pending
 payments, broadcast, fees and checks, and the Electrum header chain for the chain: a payment
 pending then confirmed (its anchor checked by Esplora's merkle proof and the block's `tx_count`),
@@ -572,11 +614,11 @@ and the matched blocks; in place, a widening pass receives only the filters and 
 two widening passes come to 2,053,320 bytes by a new client and 511,492 in place, 75% less; on
 Linux, 2,053,797 and 511,969.
 
-On 2026-10-12, macOS 27 (aarch64) and Linux (x86_64): `regtest` 64 s and 51 s, `kyoto` 131 s and
-61 s, `node` 235 s and 54 s (the Mac mines slowly), `esplora` 20 s and 18 s, `restore` 120 s and
-17 s, `widen` 120 s and 14 s, `anchors` 49 s and 47 s, `gap` 28 s and 18 s. After `kyoto`'s birthday
-restart the peers refuse a reconnect or two; on the Mac each refusal backs off longer, so that suite
-takes 125 to 245 s there.
+On 2026-10-12, macOS 27 (aarch64) and Linux (x86_64): `regtest` 50 s and 51 s, `kyoto` 74 s and
+61 s, `node` 131 s and 54 s, `esplora` 22 s and 18 s, `restore` 45 s and 17 s, `widen` 51 s and
+14 s, `anchors` 51 s and 47 s, `gap` 22 s and 18 s, `peers` 70 s on macOS. The Mac ran them with the
+chain and the build on its internal drive; on an external one, `node` took 235 s, `restore` and
+`widen` 120 s, and `kyoto` 125 to 245 s.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.

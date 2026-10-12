@@ -13,7 +13,8 @@
 #   chain.sh prune <height>      prune that node's blocks below <height>; prints its pruneheight
 #   chain.sh esplora             start Blockstream's electrs (the esplora flavour, $ESPLORA) on the
 #                                main node, its REST API on 127.0.0.1:$ESPLORA_PORT
-#   chain.sh rpc <method> [json-params] | pruned-rpc <method> [json-params] | electrum | peers | stop
+#   chain.sh rpc <method> [json-params] | peer-rpc | pruned-rpc (the follower's, the pruned node's)
+#   chain.sh electrum | peers | stop
 # Env: BITCOIND, ELECTRS (binaries; default: on PATH), CHAIN_DIR (state, default ./chain),
 # RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, PEER_RPC_PORT, PEER_P2P_PORT, PRUNED_RPC_PORT,
 # PRUNED_P2P_PORT, ELECTRUM_PORTS (two, comma-separated), ESPLORA (binary), ESPLORA_PORT (3002;
@@ -200,6 +201,7 @@ prune)
   rrpc pruneblockchain "[$2]" > /dev/null
   rrpc getblockchaininfo | json_num pruneheight;;
 pruned-rpc) rrpc "$2" "${3:-[]}";;
+peer-rpc) prpc "$2" "${3:-[]}";;
 esplora)
   stop_pid esplora
   mkdir -p "$C/esplora"

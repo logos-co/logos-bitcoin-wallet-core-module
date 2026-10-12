@@ -80,7 +80,6 @@ pub(crate) enum PeerError {
     ChannelClosed,
     DisconnectCommand,
     UnreachableSocketAddr,
-    Socks5(Socks5Error),
 }
 
 impl core::fmt::Display for PeerError {
@@ -108,9 +107,6 @@ impl core::fmt::Display for PeerError {
             }
             PeerError::Encryption(err) => {
                 write!(f, "encrypting a serialized message failed: {err}")
-            }
-            PeerError::Socks5(err) => {
-                write!(f, "could not connect via Socks5 proxy: {err}")
             }
         }
     }
@@ -148,6 +144,8 @@ pub(crate) enum Socks5Error {
     AuthRequired,
     ConnectionTimeout,
     ConnectionFailed,
+    // The proxy's reply code to the connect request.
+    Reply(u8),
     Io(io::Error),
 }
 
@@ -160,6 +158,10 @@ impl core::fmt::Display for Socks5Error {
             Socks5Error::ConnectionFailed => write!(
                 f,
                 "the server could not connect to the requested destination."
+            ),
+            Socks5Error::Reply(code) => write!(
+                f,
+                "the server could not connect to the requested destination: reply {code}."
             ),
             Socks5Error::Io(err) => write!(f, "socks5 io failed unexpectedly: {err}"),
         }

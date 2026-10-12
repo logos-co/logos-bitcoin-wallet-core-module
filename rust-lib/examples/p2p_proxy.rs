@@ -1,10 +1,13 @@
 //! A Bitcoin P2P proxy for the Kyoto tests: forwards a peer, or delays its answers, goes down,
-//! or forges the filter header and filter of one block, sending the forged batch several times.
+//! forges the filter header and filter of one block (sending the forged batch several times),
+//! adds to the peer's gossip, or hides some of its services.
 //! The tests use it in process; scripts run it with a mode file it rereads every 200 ms:
 //!   p2p_proxy <listen addr> <upstream addr> <mode file>
 //! Modes, as JSON: {"mode":"forward"} | {"mode":"down"} |
 //!   {"mode":"delay","ms":{"headers":500,"cfheaders":2000,"cfilter":5}} |
-//!   {"mode":"forge","block":"<hash>","copies":3}
+//!   {"mode":"forge","block":"<hash>","copies":3} |
+//!   {"mode":"gossip","services":64,"extra":[{"host":"<ip or onion>","port":8333,"services":73,"age":60}]} |
+//!   {"mode":"services","clear":64}
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -15,7 +18,9 @@ use std::time::Duration;
 use bitcoin::bip158::FilterHash;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::message_filter::{CFHeaders, CFilter};
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::BlockHash;
 use serde::Deserialize;
 
@@ -30,6 +35,31 @@ pub enum Mode {
     /// Swaps `block`'s filter for an empty one, in its filter header batch and its filter, and
     /// sends each forged batch `copies` times.
     Forge { block: BlockHash, copies: usize },
+    /// Adds `services` to every address the peer gossips, and sends `extra` after its verack.
+    Gossip { services: u64, extra: Vec<Gossiped> },
+    /// Clears these service bits in the peer's version message.
+    Services { clear: u64 },
+}
+
+/// An address to gossip: an IP address or a v3 onion name, last seen `age` seconds ago.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Gossiped {
+    pub host: String,
+    pub port: u16,
+    pub services: u64,
+    pub age: u64,
+}
+
+impl Gossiped {
+    fn message(&self) -> AddrV2Message {
+        let addr = match self.host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => AddrV2::Ipv4(ip),
+            Ok(std::net::IpAddr::V6(ip)) => AddrV2::Ipv6(ip),
+            Err(_) => AddrV2::TorV3(bitcoin_wallet_core::kyoto::onion_key(&self.host).expect("a v3 onion name")),
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        AddrV2Message { time: now.saturating_sub(self.age) as u32, services: ServiceFlags::from(self.services), addr, port: self.port }
+    }
 }
 
 /// The empty BIP158 filter: no elements.
@@ -112,6 +142,14 @@ fn command(header: &[u8; 24]) -> String {
     String::from_utf8_lossy(&header[4..16]).trim_end_matches('\0').to_string()
 }
 
+/// A message of `command` under `header`'s magic.
+fn frame(header: &[u8; 24], command: &str, payload: &[u8]) -> Vec<u8> {
+    let mut h = *header;
+    h[4..16].fill(0);
+    h[4..4 + command.len()].copy_from_slice(command.as_bytes());
+    reframe(&h, payload)
+}
+
 /// The header for `payload` under `header`'s magic and command: new length and checksum.
 fn reframe(header: &[u8; 24], payload: &[u8]) -> Vec<u8> {
     let mut out = header[..16].to_vec();
@@ -129,6 +167,7 @@ fn pump(mut from: TcpStream, mut to: TcpStream, watch: Option<Watch>) {
         let Ok((header, payload)) = read_message(&mut from) else { break };
         let mut copies = 1;
         let mut bytes = None;
+        let mut after = None;
         if let Some((mode, seen, sizes)) = &watch {
             let cmd = command(&header);
             *seen.lock().unwrap().entry(cmd.clone()).or_default() += 1;
@@ -164,12 +203,34 @@ fn pump(mut from: TcpStream, mut to: TcpStream, watch: Option<Watch>) {
                     }
                     _ => {}
                 },
-                Mode::Forward => {}
+                Mode::Gossip { services, extra } => match cmd.as_str() {
+                    "addrv2" => {
+                        if let Ok(mut addrs) = deserialize::<Vec<AddrV2Message>>(&payload) {
+                            for a in &mut addrs {
+                                a.services |= ServiceFlags::from(services);
+                            }
+                            bytes = Some(reframe(&header, &serialize(&addrs)));
+                        }
+                    }
+                    "verack" if !extra.is_empty() => {
+                        let addrs: Vec<AddrV2Message> = extra.iter().map(Gossiped::message).collect();
+                        after = Some(frame(&header, "addrv2", &serialize(&addrs)));
+                    }
+                    _ => {}
+                },
+                // The services follow the 4-byte protocol version.
+                Mode::Services { clear } if cmd == "version" && payload.len() >= 12 => {
+                    let mut p = payload.clone();
+                    let services = u64::from_le_bytes(p[4..12].try_into().unwrap()) & !clear;
+                    p[4..12].copy_from_slice(&services.to_le_bytes());
+                    bytes = Some(reframe(&header, &p));
+                }
+                Mode::Services { .. } | Mode::Forward => {}
             }
         }
         let out = bytes.unwrap_or_else(|| reframe(&header, &payload));
-        for _ in 0..copies {
-            if to.write_all(&out).is_err() {
+        for msg in std::iter::repeat_n(&out, copies).chain(after.as_ref()) {
+            if to.write_all(msg).is_err() {
                 let _ = from.shutdown(Shutdown::Both);
                 return;
             }

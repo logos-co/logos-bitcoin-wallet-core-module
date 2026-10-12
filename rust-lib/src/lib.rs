@@ -16,6 +16,7 @@ pub mod manager;
 pub mod net;
 pub mod network;
 pub mod node;
+pub mod peers;
 pub mod pin;
 pub mod routes;
 pub mod send;

@@ -86,14 +86,15 @@ pub use {
     crate::chain::ChainState,
     crate::client::{Client, Requester},
     crate::error::{ClientError, NodeError},
-    crate::messages::{Event, Info, Progress, RejectPayload, SyncUpdate, Warning},
+    crate::messages::{DialOutcome, Event, Info, Progress, RejectPayload, SyncUpdate, Warning},
     crate::node::Node,
 };
 
 #[doc(inline)]
 pub use bitcoin::{
-    bip158::BlockFilter, block::Header, p2p::address::AddrV2, p2p::message_network::RejectReason,
-    p2p::ServiceFlags, Address, Block, BlockHash, FeeRate, Network, ScriptBuf, Transaction, Wtxid,
+    bip158::BlockFilter, block::Header, p2p::address::AddrV2, p2p::address::AddrV2Message,
+    p2p::message_network::RejectReason, p2p::ServiceFlags, Address, Block, BlockHash, FeeRate,
+    Network, ScriptBuf, Transaction, Wtxid,
 };
 
 pub extern crate tokio;
@@ -385,6 +386,7 @@ struct Config {
     filter_type: FilterType,
     block_type: BlockType,
     headers_only_sync: bool,
+    report_peers: bool,
 }
 
 impl Default for Config {
@@ -399,6 +401,7 @@ impl Default for Config {
             filter_type: FilterType::default(),
             block_type: BlockType::default(),
             headers_only_sync: Default::default(),
+            report_peers: Default::default(),
         }
     }
 }

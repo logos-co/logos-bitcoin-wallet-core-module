@@ -27,7 +27,7 @@ use crate::{
         dns::bootstrap_dns, error::PeerError, gossip::GossipMonitor, peer::Peer, PeerId,
         PeerTimeoutConfig, RelayPolicy,
     },
-    BlockType, Dialog, TrustedPeer, TrustedPeerInner,
+    BlockType, Dialog, Info, TrustedPeer, TrustedPeerInner,
 };
 
 use super::{AddressBook, ConnectionType, MainThreadMessage, PeerThreadMessage};
@@ -44,6 +44,8 @@ pub(crate) struct ManagedPeer {
     broadcast_min: FeeRate,
     ptx: Sender<MainThreadMessage>,
     handle: JoinHandle<Result<(), PeerError>>,
+    // Its version message came.
+    version: bool,
 }
 
 /// A peer that is used solely for watching incoming transaction gossip.
@@ -69,6 +71,8 @@ enum GossipSubscriptionStatus {
 pub(crate) struct PeerMap {
     pub(crate) tx_queue: Arc<Mutex<BroadcastQueue>>,
     pub(crate) whitelist_only: bool,
+    // Report each dial's outcome and the addresses peers gossip.
+    pub(crate) report_peers: bool,
     current_id: PeerId,
     network: Network,
     block_type: BlockType,
@@ -97,6 +101,7 @@ impl PeerMap {
         Self {
             tx_queue: Arc::new(Mutex::new(BroadcastQueue::new())),
             whitelist_only,
+            report_peers: false,
             current_id: PeerId(0),
             network,
             block_type,
@@ -190,17 +195,25 @@ impl PeerMap {
             Arc::clone(&self.db),
             self.timeout_config,
             Arc::clone(&self.tx_queue),
+            self.report_peers,
         );
         let connection = self
             .connector
-            .connect(addr, port, self.timeout_config.handshake_timeout)
+            .connect(addr.clone(), port, self.timeout_config.handshake_timeout)
             .await;
         let connection = match connection {
             Ok(conn) => conn,
-            Err(e) => {
+            Err(outcome) => {
+                if self.report_peers {
+                    self.dialog.send_info(Info::Dial {
+                        addr,
+                        port,
+                        outcome,
+                    });
+                }
                 let mut db_lock = self.db.lock().await;
                 db_lock.failed(&loaded_peer);
-                return Err(e);
+                return Err(PeerError::ConnectionFailed);
             }
         };
         let is_proxy = self.connector.is_proxy();
@@ -212,6 +225,7 @@ impl PeerMap {
                 broadcast_min: FeeRate::BROADCAST_MIN,
                 ptx,
                 handle,
+                version: false,
             },
         ))
     }
@@ -223,11 +237,19 @@ impl PeerMap {
         }
     }
 
-    // Set the services of a peer
+    // Set the services of a peer, from its version message
     pub fn set_services(&mut self, nonce: PeerId, flags: ServiceFlags) {
         if let Some(peer) = self.map.get_mut(&nonce) {
             peer.record.update_service_flags(flags);
+            peer.version = true;
         }
+    }
+
+    // Whether a connected peer has yet to send its version message
+    pub fn handshaking(&self) -> bool {
+        self.map
+            .values()
+            .any(|peer| !peer.version && !peer.handle.is_finished())
     }
 
     // The minimum fee rate to successfully broadcast a transaction to all peers
@@ -439,5 +461,76 @@ impl PeerMap {
                 .is_none_or(|peer| peer.handle.is_finished()),
             GossipSubscriptionStatus::Unsubscribed => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use addrman::Record;
+    use bitcoin::p2p::{address::AddrV2, ServiceFlags};
+    use bitcoin::{FeeRate, Network};
+    use tokio::sync::mpsc;
+
+    use super::{ManagedPeer, PeerMap};
+    use crate::network::{error::PeerError, ConnectionType, PeerId, PeerTimeoutConfig};
+    use crate::{BlockType, Dialog};
+
+    #[tokio::test]
+    async fn a_peer_is_handshaking_until_its_version_or_its_end() {
+        let (mtx, _mrx) = mpsc::channel(1);
+        let (info_tx, _infos) = mpsc::channel(1);
+        let (warn_tx, _warnings) = mpsc::unbounded_channel();
+        let (event_tx, _events) = mpsc::unbounded_channel();
+        let dialog = Arc::new(Dialog::new(info_tx, warn_tx, event_tx));
+        let mut peers = PeerMap::new(
+            mtx,
+            Network::Regtest,
+            BlockType::default(),
+            vec![],
+            true,
+            dialog,
+            ConnectionType::ClearNet,
+            PeerTimeoutConfig::default(),
+        );
+        let loopback = Ipv4Addr::LOCALHOST;
+        let record = Record::new(
+            AddrV2::Ipv4(loopback),
+            18444,
+            ServiceFlags::NONE,
+            &IpAddr::V4(loopback),
+        );
+        let mut add = |id, handle| {
+            let (ptx, _) = mpsc::channel(1);
+            let record = record.clone();
+            let broadcast_min = FeeRate::BROADCAST_MIN;
+            let version = false;
+            let peer = ManagedPeer {
+                record,
+                broadcast_min,
+                ptx,
+                handle,
+                version,
+            };
+            peers.map.insert(PeerId(id), peer);
+        };
+        add(
+            1,
+            tokio::spawn(std::future::pending::<Result<(), PeerError>>()),
+        );
+        let ended = tokio::spawn(async { Ok::<(), PeerError>(()) });
+        while !ended.is_finished() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        add(2, ended);
+        assert!(peers.handshaking(), "connected, and no version yet");
+        peers.set_services(PeerId(1), ServiceFlags::NETWORK);
+        assert!(
+            !peers.handshaking(),
+            "a version came, and a dial that ended is over"
+        );
     }
 }

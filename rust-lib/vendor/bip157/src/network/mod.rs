@@ -27,9 +27,9 @@ use bitcoin::{
 use socks::{create_socks5, SocksConnection};
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
 
-use error::PeerError;
+use error::Socks5Error;
 
-use crate::{network::gossip::GossipMonitor, Socks5Proxy};
+use crate::{network::gossip::GossipMonitor, DialOutcome, Socks5Proxy};
 
 pub(crate) mod dns;
 pub(crate) mod error;
@@ -159,42 +159,64 @@ impl ConnectionType {
         addr: AddrV2,
         port: u16,
         handshake_timeout: Duration,
-    ) -> Result<TcpStream, PeerError> {
+    ) -> Result<TcpStream, DialOutcome> {
         match &self {
             Self::ClearNet => {
                 let socket_addr = match addr {
                     AddrV2::Ipv4(ip) => IpAddr::V4(ip),
                     AddrV2::Ipv6(ip) => IpAddr::V6(ip),
-                    _ => return Err(PeerError::UnreachableSocketAddr),
+                    _ => return Err(DialOutcome::Local),
                 };
-                let timeout = tokio::time::timeout(
-                    handshake_timeout,
-                    TcpStream::connect((socket_addr, port)),
-                )
-                .await
-                .map_err(|_| PeerError::ConnectionFailed)?;
-                let tcp_stream = timeout.map_err(|_| PeerError::ConnectionFailed)?;
-                Ok(tcp_stream)
+                let connect = TcpStream::connect((socket_addr, port));
+                match tokio::time::timeout(handshake_timeout, connect).await {
+                    Ok(Ok(tcp_stream)) => Ok(tcp_stream),
+                    Ok(Err(e)) => Err(io_outcome(&e)),
+                    Err(_) => Err(DialOutcome::TimedOut),
+                }
             }
             Self::Socks5Proxy(proxy) => {
                 let addr = match addr {
                     AddrV2::Ipv4(ipv4) => SocksConnection::ClearNet(IpAddr::V4(ipv4)),
                     AddrV2::Ipv6(ipv6) => SocksConnection::ClearNet(IpAddr::V6(ipv6)),
                     AddrV2::TorV3(onion) => SocksConnection::OnionService(onion),
-                    _ => return Err(PeerError::UnreachableSocketAddr),
+                    _ => return Err(DialOutcome::Local),
                 };
-                let socks5_timeout =
-                    tokio::time::timeout(handshake_timeout, create_socks5(proxy.0, addr, port))
-                        .await
-                        .map_err(|_| PeerError::ConnectionFailed)?;
-                let tcp_stream = socks5_timeout.map_err(PeerError::Socks5)?;
-                Ok(tcp_stream)
+                let connect = create_socks5(proxy.0, addr, port);
+                match tokio::time::timeout(handshake_timeout, connect).await {
+                    Ok(Ok(tcp_stream)) => Ok(tcp_stream),
+                    Ok(Err(e)) => Err(socks_outcome(&e)),
+                    Err(_) => Err(DialOutcome::TimedOut),
+                }
             }
         }
     }
 
     fn is_proxy(&self) -> bool {
         matches!(self, ConnectionType::Socks5Proxy(_))
+    }
+}
+
+// What a failed TCP connect says about the peer; errors of the local network say nothing.
+fn io_outcome(e: &std::io::Error) -> DialOutcome {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => DialOutcome::Refused,
+        ErrorKind::TimedOut => DialOutcome::TimedOut,
+        ErrorKind::HostUnreachable => DialOutcome::Unreachable,
+        _ => DialOutcome::Local,
+    }
+}
+
+// A SOCKS5 reply speaks of the destination (RFC 1928; 0xf0-0xf7 are Tor's onion service
+// errors); any other failure is the proxy's.
+fn socks_outcome(e: &Socks5Error) -> DialOutcome {
+    match e {
+        Socks5Error::Reply(0x05) => DialOutcome::Refused,
+        Socks5Error::Reply(0x06 | 0xf7) => DialOutcome::TimedOut,
+        // Command or address type not supported: this proxy can't, whatever the peer.
+        Socks5Error::Reply(0x07 | 0x08) => DialOutcome::Local,
+        Socks5Error::Reply(_) => DialOutcome::Unreachable,
+        _ => DialOutcome::Local,
     }
 }
 
@@ -689,5 +711,105 @@ mod tests {
         assert!(!filter_rate.slow_peer(Duration::from_secs(120)));
         tokio::time::sleep(Duration::from_secs(90)).await;
         assert!(filter_rate.slow_peer(Duration::from_secs(120)));
+    }
+
+    // A SOCKS5 proxy on loopback answering every connect request with `reply`, or never.
+    async fn socks_proxy(reply: Option<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 3];
+                    s.read_exact(&mut greeting).await?;
+                    s.write_all(&[5, 0]).await?;
+                    // Version, command, reserved, type 3 (a name), its length; the name, port.
+                    let mut head = [0u8; 5];
+                    s.read_exact(&mut head).await?;
+                    let mut rest = vec![0u8; head[4] as usize + 2];
+                    s.read_exact(&mut rest).await?;
+                    match reply {
+                        Some(code) => s.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?,
+                        None => tokio::time::sleep(Duration::from_secs(60)).await,
+                    }
+                    Ok::<_, std::io::Error>(())
+                });
+            }
+        });
+        addr
+    }
+
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_says_why_and_whether_it_speaks_of_the_peer() {
+        use super::{io_outcome, ConnectionType};
+        use crate::{DialOutcome, Socks5Proxy};
+        use bitcoin::p2p::address::AddrV2;
+        use std::io::{Error, ErrorKind};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let loopback = AddrV2::Ipv4(Ipv4Addr::LOCALHOST);
+        let second = Duration::from_secs(1);
+        let direct = ConnectionType::ClearNet
+            .connect(loopback, closed_port(), second)
+            .await;
+        assert_eq!(direct.unwrap_err(), DialOutcome::Refused);
+        assert_eq!(
+            io_outcome(&Error::from(ErrorKind::HostUnreachable)),
+            DialOutcome::Unreachable
+        );
+        assert_eq!(
+            io_outcome(&Error::from(ErrorKind::NetworkUnreachable)),
+            DialOutcome::Local
+        );
+        assert_eq!(
+            io_outcome(&Error::from(ErrorKind::AddrNotAvailable)),
+            DialOutcome::Local
+        );
+
+        let onion = AddrV2::TorV3([7; 32]);
+        let through = |proxy: SocketAddr| {
+            let onion = onion.clone();
+            async move {
+                let via = ConnectionType::Socks5Proxy(Socks5Proxy::new(proxy));
+                via.connect(onion, 8333, second).await.unwrap_err()
+            }
+        };
+        assert_eq!(
+            through(socks_proxy(Some(5)).await).await,
+            DialOutcome::Refused
+        );
+        assert_eq!(
+            through(socks_proxy(Some(4)).await).await,
+            DialOutcome::Unreachable
+        );
+        assert_eq!(
+            through(socks_proxy(Some(1)).await).await,
+            DialOutcome::Unreachable
+        );
+        assert_eq!(
+            through(socks_proxy(Some(6)).await).await,
+            DialOutcome::TimedOut
+        );
+        assert_eq!(
+            through(socks_proxy(Some(7)).await).await,
+            DialOutcome::Local
+        );
+        assert_eq!(
+            through(socks_proxy(None).await).await,
+            DialOutcome::TimedOut,
+            "no reply in time"
+        );
+        let dead_proxy = SocketAddr::from((Ipv4Addr::LOCALHOST, closed_port()));
+        assert_eq!(
+            through(dead_proxy).await,
+            DialOutcome::Local,
+            "a dead proxy says nothing of the peer"
+        );
     }
 }

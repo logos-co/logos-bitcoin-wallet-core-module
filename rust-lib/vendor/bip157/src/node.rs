@@ -74,6 +74,7 @@ impl Node {
             filter_type,
             block_type,
             headers_only_sync,
+            report_peers,
         } = config;
         // Set up a communication channel between the node and client
         let (info_tx, info_rx) = mpsc::channel::<Info>(32);
@@ -87,7 +88,7 @@ impl Node {
         let state = NodeState::Behind;
         // Configure the peer manager
         let (mtx, mrx) = mpsc::channel::<PeerThreadMessage>(32);
-        let peer_map = PeerMap::new(
+        let mut peer_map = PeerMap::new(
             mtx,
             network,
             block_type,
@@ -97,6 +98,7 @@ impl Node {
             connection_type,
             peer_timeout_config,
         );
+        peer_map.report_peers = report_peers;
         // Build the chain
         let chain_state = chain_state.unwrap_or(ChainState::Checkpoint(
             HashCheckpoint::from_genesis(network),
@@ -313,11 +315,12 @@ impl Node {
                 connected: live,
                 required,
             });
-            let address = self
-                .peer_map
-                .next_peer()
-                .await
-                .ok_or(NodeError::NoReachablePeers)?;
+            let address = match self.peer_map.next_peer().await {
+                Some(address) => address,
+                // Reporting peers, the handshakes in flight end first, so each dial reports.
+                None if self.peer_map.report_peers && self.peer_map.handshaking() => return Ok(()),
+                None => return Err(NodeError::NoReachablePeers),
+            };
             if self.peer_map.dispatch(address).await.is_err() {
                 self.dialog.send_warning(Warning::CouldNotConnect);
             }
@@ -465,8 +468,8 @@ impl Node {
         self.peer_map
             .send_message(nonce, MainThreadMessage::SendHeaders)
             .await;
-        // Request peer addresses unless restricted to the whitelist only.
-        if !self.peer_map.whitelist_only {
+        // Request peer addresses unless restricted to the whitelist only, or to report them.
+        if !self.peer_map.whitelist_only || self.peer_map.report_peers {
             crate::debug!("Requesting new addresses");
             self.peer_map
                 .send_message(nonce, MainThreadMessage::GetAddr)

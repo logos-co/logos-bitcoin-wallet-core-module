@@ -14,10 +14,16 @@ allowed=(
   src/chain/chain.rs      # 1, 2: the filter-header vote; 5: a rescan keeps the filter headers
   src/chain/graph.rs      # 5: the filter state a rescan resets
   src/chain/mod.rs        # 1: one vote per peer
-  src/network/peer.rs     # 1, 3: unsolicited cfheaders, the batch deadline
-  src/network/mod.rs      # 3: the batch deadline setting
-  src/builder.rs          # 3: Builder::filter_batch_timeout
+  src/network/peer.rs     # 1, 3: unsolicited cfheaders, the batch deadline; 6: each dial's outcome, gossip
+  src/network/mod.rs      # 3: the batch deadline setting; 6: why a connect failed
+  src/builder.rs          # 3: Builder::filter_batch_timeout; 6: Builder::report_peers
   src/network/outbound.rs # 4: the version nonce
+  src/messages.rs         # 6: Info::Dial, Info::Addresses, DialOutcome
+  src/lib.rs              # 6: the report_peers setting; DialOutcome, AddrV2Message exported
+  src/node.rs             # 6: getaddr while reporting peers; handshakes in flight end first
+  src/network/peer_map.rs # 6: a failed connect reported; which peers are mid-handshake
+  src/network/socks.rs    # 6: the SOCKS5 reply code kept
+  src/network/error.rs    # 6: Socks5Error::Reply
 )
 
 work=$(mktemp -d)
