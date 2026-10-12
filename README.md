@@ -614,11 +614,11 @@ and the matched blocks; in place, a widening pass receives only the filters and 
 two widening passes come to 2,053,320 bytes by a new client and 511,492 in place, 75% less; on
 Linux, 2,053,797 and 511,969.
 
-On 2026-10-12, macOS 27 (aarch64) and Linux (x86_64): `regtest` 50 s and 51 s, `kyoto` 74 s and
-61 s, `node` 131 s and 54 s, `esplora` 22 s and 18 s, `restore` 45 s and 17 s, `widen` 51 s and
-14 s, `anchors` 51 s and 47 s, `gap` 22 s and 18 s, `peers` 70 s on macOS. The Mac ran them with the
-chain and the build on its internal drive; on an external one, `node` took 235 s, `restore` and
-`widen` 120 s, and `kyoto` 125 to 245 s.
+On 2026-10-12 at d8d3d7d, macOS 27 (aarch64) and Linux (x86_64): `regtest` 50 s and 53 s, `kyoto`
+72 s and 62 s, `node` 128 s and 54 s, `esplora` 19 s and 18 s, `restore` 42 s and 17 s, `widen`
+48 s and 14 s, `anchors` 48 s and 47 s, `gap` 19 s and 16 s, `peers` 67 s and 76 s. The Mac ran
+them with the chain and the build on its internal drive; on an external one, `node` took 235 s,
+`restore` and `widen` 120 s, and `kyoto` 125 to 245 s.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.
@@ -656,8 +656,8 @@ Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of
 2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians
 0.27 s) and 0.12–0.13 s on Linux; the module's own `about_to_unload`, 10–130 ms. `local-node.sh`
 opened and synced on the node in 1.2 s, and its send went out through `sendrawtransaction`.
-`peers.sh`, on 2026-10-12 on macOS with `bitcoin_node_module` 9bb2291, took 93 s: the four learned,
-then five cuts until the good peer was first and the silent one skipped.
+`peers.sh`, on 2026-10-12 with `bitcoin_node_module` 9bb2291, took 93 s on macOS and 64 s on Linux:
+the four learned, then five and four cuts until the good peer was first and a failing one skipped.
 
 `examples/authority.rs` syncs the Electrum header chain from the checkpoint against live servers,
 headers only: on mainnet over Tor, 35,428 headers (to 970,852) in about 40 s. Kyoto on live signet
