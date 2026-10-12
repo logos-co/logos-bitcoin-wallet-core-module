@@ -644,12 +644,20 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
   `tcp://` electrs on loopback. The core's `regtest.json` names no server. A payment shows pending
   from the front, reached by its pin, and confirms; `sources_status` marks the front encrypted and
   the plain one not. Once `set_source` pins another certificate the core refuses the front, and
-  takes it back with the right pin.
+  takes it back with the right pin;
+- `peers.sh`: the real `bitcoin_node_module`'s peer book. Kyoto goes direct on regtest
+  (`set_source kyoto {"tor":false}`); through the person's own peer, the follower behind a
+  `p2p_proxy` front that gossips four peers on loopback, the core reports them and the book keeps
+  them, learned. With no own peer Kyoto dials the book, two a start (one gossiper), and each start
+  is cut once it syncs, so it dials its second peer: the reports turn the good peer `ok` and first,
+  and the book skips a failing one after three failures in a row.
 
 Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of 20 unloads within
 2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians
 0.27 s) and 0.12–0.13 s on Linux; the module's own `about_to_unload`, 10–130 ms. `local-node.sh`
 opened and synced on the node in 1.2 s, and its send went out through `sendrawtransaction`.
+`peers.sh`, on 2026-10-12 on macOS with `bitcoin_node_module` 9bb2291, took 93 s: the four learned,
+then five cuts until the good peer was first and the silent one skipped.
 
 `examples/authority.rs` syncs the Electrum header chain from the checkpoint against live servers,
 headers only: on mainnet over Tor, 35,428 headers (to 970,852) in about 40 s. Kyoto on live signet
