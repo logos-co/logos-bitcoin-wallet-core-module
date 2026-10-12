@@ -456,23 +456,37 @@ impl Drop for Client {
 pub fn reachable_used(index: &KeychainTxOutIndex<KeychainKind>, gap: u32) -> BTreeMap<KeychainKind, u32> {
     let mut out = BTreeMap::new();
     for k in KEYCHAINS {
-        let (mut last, mut i) = (None::<u32>, 0u32);
-        while i <= last.map_or(gap.saturating_sub(1), |l| l.saturating_add(gap)) {
-            if index.is_used(k, i) {
-                last = Some(i);
+        // Only derived scripts: bdk_chain calls an index it never derived "used".
+        let used = index.inner().all_spks().range((k, 0)..=(k, u32::MAX)).map(|((_, i), _)| *i).filter(|i| index.is_used(k, *i));
+        let mut last = None::<u32>;
+        for i in used {
+            // Fewer than `gap` unused addresses since the last one reached.
+            if i - last.map_or(0, |l| l + 1) >= gap {
+                break;
             }
-            i += 1;
+            last = Some(i);
         }
         out.extend(last.map(|l| (k, l)));
     }
     out
 }
 
+/// The lookahead a scan starts with for a gap limit: as 25 is to the default 20.
+pub fn lookahead_for(gap: u32) -> u32 {
+    gap.saturating_add(LOOKAHEAD - crate::checks::GAP_LIMIT).max(LOOKAHEAD)
+}
+
+/// A lookahead whose window holds the last used index plus `gap`, with room: about twice the
+/// highest used index.
+pub fn wider_lookahead(used: &BTreeMap<KeychainKind, u32>, gap: u32) -> u32 {
+    used.values().copied().max().map_or(lookahead_for(gap), |u| u + lookahead_for(gap) + 1)
+}
+
 /// The lookahead for a scan again when a used index comes within `gap` of `window`, the highest
 /// index watched per keychain from the first block (README, "Kyoto"); `None` when it held.
 pub fn rescan_lookahead(window: [u32; 2], used: &BTreeMap<KeychainKind, u32>, gap: u32) -> Option<u32> {
     let near = KEYCHAINS.iter().zip(window).any(|(k, w)| used.get(k).is_some_and(|u| u + gap > w));
-    near.then(|| used.values().copied().max().unwrap_or(0) + LOOKAHEAD + 1)
+    near.then(|| wider_lookahead(used, gap))
 }
 
 /// bip157's warning when two peers' filter headers disagree (node.rs, `CFHeaderChanges::Conflict`).
@@ -764,6 +778,9 @@ mod tests {
         let used = reachable_used(&index, 20);
         assert_eq!((used[&KeychainKind::External], used[&KeychainKind::Internal]), (50, 3), "313 lies past 20 unused after 50");
         assert_eq!(rescan_lookahead([315, 315], &used, 20), None, "a far payment doesn't widen the scan");
+        // A gap wider than the scripts derived ends at the last one.
+        assert_eq!(reachable_used(&index, 1000)[&KeychainKind::External], 313);
+        assert_eq!(reachable_used(w.spk_index(), 1000), BTreeMap::new(), "nothing used, nothing reached");
     }
 
     #[test]
@@ -776,6 +793,10 @@ mod tests {
         // The next window, 2 x 38 + 25, holds signet's receive index 38 with room to spare.
         assert_eq!(rescan_lookahead([38 + 64 - 1, 38 + 64 - 1], &used(38, Some(56)), 20), None);
         assert_eq!(rescan_lookahead([24, 24], &BTreeMap::new(), 20), None, "nothing used yet");
+        // A gap limit of 60: index 10 needs a window to 70, and the scan starts that wide.
+        assert_eq!((lookahead_for(20), lookahead_for(60)), (LOOKAHEAD, 65));
+        assert_eq!(rescan_lookahead([45, 45], &used(10, None), 60), Some(10 + 65 + 1));
+        assert_eq!(rescan_lookahead([10 + 76 - 1, 75], &used(10, None), 60), None, "the wider window holds");
     }
 
     #[test]

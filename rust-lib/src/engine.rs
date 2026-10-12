@@ -49,7 +49,7 @@ const APPROVAL_LIMIT: Duration = Duration::from_secs(6 * 3600);
 
 /// Job kinds only the wallet backend may start.
 pub fn backend_only(kind: &str) -> bool {
-    matches!(kind, "sign_and_broadcast" | "cancel_send" | "abandon_send" | "set_birthday")
+    matches!(kind, "sign_and_broadcast" | "cancel_send" | "abandon_send" | "set_birthday" | "set_gap_limit")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,7 @@ struct Light {
     birthday: Option<u32>,
     birthday_source: Option<String>,
     needs_birthday: bool,
+    gap_limit: Option<u32>,
 }
 
 impl Default for Light {
@@ -104,6 +105,7 @@ impl Default for Light {
             birthday: None,
             birthday_source: None,
             needs_birthday: false,
+            gap_limit: None,
         }
     }
 }
@@ -122,6 +124,9 @@ struct OpenWallet {
     /// The height scans start from, and a flag that has them start again from it.
     birthday: Arc<AtomicU32>,
     rescan: Arc<AtomicBool>,
+    /// The gap limit, and a flag that has the scans go again from the birthday, wider.
+    gap_limit: Arc<AtomicU32>,
+    gap_raised: Arc<AtomicBool>,
     netstate: Arc<Mutex<NetState>>,
     progress: Arc<Mutex<Progress>>,
     thread: Option<JoinHandle<()>>,
@@ -147,7 +152,7 @@ pub enum Birthday {
 }
 
 enum Task {
-    Open { network: BNetwork, group: Option<String>, family: Option<Family>, birthday: Option<Birthday> },
+    Open { network: BNetwork, group: Option<String>, family: Option<Family>, birthday: Option<Birthday>, gap_limit: Option<u32> },
     Close,
     BuildSend(Value),
     BumpFee { txid: Txid, fee_rate: f64 },
@@ -156,6 +161,7 @@ enum Task {
     Rebroadcast { txid: Txid },
     Abandon { txid: Txid },
     SetBirthday(Birthday),
+    SetGapLimit(u32),
 }
 
 struct Queue {
@@ -197,13 +203,14 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
     let v: Value = if raw.trim().is_empty() { json!({}) } else { serde_json::from_str(raw).map_err(|e| format!("params: {e}"))? };
     let obj = v.as_object().ok_or("params must be a JSON object")?;
     let allowed: &[&str] = match kind {
-        "open_wallet" => &["network", "group", "family", "birthday"],
+        "open_wallet" => &["network", "group", "family", "birthday", "gapLimit"],
         "close_wallet" => &[],
         "build_send" => &["recipients", "feeRate", "target", "sendMax", "smallChangeToFee"],
         "bump_fee" => &["txid", "feeRate"],
         "sign_and_broadcast" | "cancel_send" => &["previewId"],
         "rebroadcast" | "abandon_send" => &["txid"],
         "set_birthday" => &["date", "height"],
+        "set_gap_limit" => &["gapLimit"],
         other => return Err(format!("unknown job kind {other}")),
     };
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -232,7 +239,7 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
                 Value::String(s) if wallet::day_to_unix(s).is_some() => Some(Birthday::Day(s.clone())),
                 _ => return Err("birthday must be a height or a YYYY-MM-DD day".into()),
             };
-            Task::Open { network, group, family, birthday }
+            Task::Open { network, group, family, birthday, gap_limit: gap_limit(&v["gapLimit"])? }
         }
         "close_wallet" => Task::Close,
         "build_send" => Task::BuildSend(v.clone()),
@@ -249,8 +256,22 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
             (Value::Null, Value::Number(n)) => Birthday::Height(n.as_u64().filter(|h| *h <= u32::MAX as u64).ok_or("height must be a whole number")? as u32),
             _ => return Err("invalid birthday: give { date: YYYY-MM-DD } or { height }".into()),
         }),
+        "set_gap_limit" => Task::SetGapLimit(gap_limit(&v["gapLimit"])?.ok_or(GAP_LIMIT_RANGE)?),
         _ => unreachable!(),
     })
+}
+
+const GAP_LIMIT_RANGE: &str = "invalid gapLimit: a whole number from 20 to 1000";
+
+fn gap_limit(v: &Value) -> Result<Option<u32>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) => match n.as_u64() {
+            Some(g) if (u64::from(crate::checks::GAP_LIMIT)..=u64::from(wallet::MAX_GAP_LIMIT)).contains(&g) => Ok(Some(g as u32)),
+            _ => Err(GAP_LIMIT_RANGE.into()),
+        },
+        _ => Err(GAP_LIMIT_RANGE.into()),
+    }
 }
 
 impl Engine {
@@ -348,7 +369,7 @@ impl Engine {
             return;
         }
         let outcome = match task {
-            Task::Open { network, group, family, birthday } => self.open_flow(network, group, family, birthday, cancel),
+            Task::Open { network, group, family, birthday, gap_limit } => self.open_flow(network, group, family, birthday, gap_limit, cancel),
             Task::Close => Ok(json!({"closed": self.close(true)})),
             Task::BuildSend(v) => self.build_send(&v),
             Task::BumpFee { txid, fee_rate } => self.bump_fee(txid, fee_rate),
@@ -357,6 +378,7 @@ impl Engine {
             Task::Rebroadcast { txid } => self.rebroadcast(txid),
             Task::Abandon { txid } => self.abandon(txid),
             Task::SetBirthday(b) => self.set_birthday(b),
+            Task::SetGapLimit(g) => self.set_gap_limit(g),
         };
         if let Err(e) = &outcome {
             tracing::info!(target: "bitcoin", "job {id} failed: {e}");
@@ -381,7 +403,7 @@ impl Engine {
     fn emit_state(&self) {
         let s = self.status_inner(false);
         let digest = json!([s["state"], s["synced"], s["authority"]["kind"], s["authority"]["height"], s["openHandle"], s["approvalHandle"], s["lastError"], s["historyServer"], s["needsBirthday"],
-            s["birthday"], s["rescanFrom"], s["lastReorg"]["at"]]).to_string();
+            s["birthday"], s["rescanFrom"], s["lastReorg"]["at"], s["gapLimit"]]).to_string();
         let mut last = self.last_emitted.lock();
         if *last != digest {
             *last = digest;
@@ -407,11 +429,12 @@ impl Engine {
 
     // ── Opening and closing ──────────────────────────────────────────────
 
-    fn open_flow(self: &Arc<Self>, network: BNetwork, group: Option<String>, family: Option<Family>, birthday: Option<Birthday>, cancel: Arc<AtomicBool>) -> Result<Value, String> {
+    #[allow(clippy::too_many_arguments)]
+    fn open_flow(self: &Arc<Self>, network: BNetwork, group: Option<String>, family: Option<Family>, birthday: Option<Birthday>, gap_limit: Option<u32>, cancel: Arc<AtomicBool>) -> Result<Value, String> {
         if let Some(prev) = self.pending_open.lock().replace(cancel.clone()) {
             prev.store(true, Ordering::SeqCst);
         }
-        let r = self.open_flow_inner(network, group, family, birthday, &cancel);
+        let r = self.open_flow_inner(network, group, family, birthday, gap_limit, &cancel);
         self.pending_open.lock().take();
         if let Err(e) = &r {
             let failed = !matches!(e.as_str(), "cancelled");
@@ -426,7 +449,8 @@ impl Engine {
         r
     }
 
-    fn open_flow_inner(self: &Arc<Self>, network: BNetwork, group: Option<String>, family: Option<Family>, birthday: Option<Birthday>, cancel: &AtomicBool) -> Result<Value, String> {
+    #[allow(clippy::too_many_arguments)]
+    fn open_flow_inner(self: &Arc<Self>, network: BNetwork, group: Option<String>, family: Option<Family>, birthday: Option<Birthday>, gap_limit: Option<u32>, cancel: &AtomicBool) -> Result<Value, String> {
         self.close_open(true);
         self.set_light(|l| {
             *l = Light { state: State::AwaitingOpen, network: Some(network), group: group.clone(), family, ..Light::default() };
@@ -467,7 +491,7 @@ impl Engine {
                 l.group = Some(grant.group.clone());
                 l.family = Some(grant.family);
             });
-            self.open_with(network, grant, birthday)
+            self.open_with(network, grant, birthday, gap_limit)
         });
         let _ = self.manager.ack_result(&ticket.handle, &ticket.receipt);
         if opened.is_err() {
@@ -478,7 +502,7 @@ impl Engine {
         opened
     }
 
-    fn open_with(self: &Arc<Self>, network: BNetwork, grant: manager::OpenGrant, birthday: Option<Birthday>) -> Result<Value, String> {
+    fn open_with(self: &Arc<Self>, network: BNetwork, grant: manager::OpenGrant, birthday: Option<Birthday>, gap_limit: Option<u32>) -> Result<Value, String> {
         let wallets = self.root.clone();
         let dir = WalletDir::new(&wallets, network, &grant.group);
         let existed = dir.exists();
@@ -528,6 +552,13 @@ impl Engine {
             sync::forget_scans(&cell.conn)?;
             meta_set(&cell.conn, sync::SCAN_RULES_KEY, sync::SCAN_RULES).map_err(|e| e.to_string())?;
         }
+        // The gap limit asked for, else the one kept; a wider one than the scans had starts them again.
+        let kept_gap = cell.gap_limit();
+        let gap = gap_limit.unwrap_or(kept_gap);
+        if gap > kept_gap {
+            sync::forget_scans(&cell.conn)?;
+        }
+        meta_set(&cell.conn, wallet::GAP_LIMIT_KEY, &gap.to_string()).map_err(|e| e.to_string())?;
         if let Some(o) = &grant.origin {
             meta_set(&cell.conn, "origin", o).map_err(|e| e.to_string())?;
         }
@@ -551,11 +582,14 @@ impl Engine {
         let cell = Arc::new(Mutex::new(Some(cell)));
         let (stop, wake, reload) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(routes_err.is_some())));
         let (birthday_at, rescan) = (Arc::new(AtomicU32::new(bday)), Arc::new(AtomicBool::new(false)));
+        let (gap_at, gap_raised) = (Arc::new(AtomicU32::new(gap)), Arc::new(AtomicBool::new(false)));
         let ctx = Ctx {
             net: network,
             family: grant.family,
             birthday: birthday_at.clone(),
             rescan: rescan.clone(),
+            gap_limit: gap_at.clone(),
+            gap_raised: gap_raised.clone(),
             cell: cell.clone(),
             netstate: netstate.clone(),
             progress: progress.clone(),
@@ -577,6 +611,7 @@ impl Engine {
             "group": grant.group, "family": grant.family, "network": network.name(), "created": created || !existed,
             "reset": reset.is_some(),
             "fingerprint": grant.fingerprint, "birthday": {"height": bday, "source": source}, "needsBirthday": needs_birthday,
+            "gapLimit": gap,
         });
         *self.open.lock() = Some(OpenWallet {
             group: grant.group.clone(),
@@ -590,6 +625,8 @@ impl Engine {
             reload,
             birthday: birthday_at,
             rescan,
+            gap_limit: gap_at,
+            gap_raised,
             netstate,
             progress,
             thread: Some(thread),
@@ -599,6 +636,7 @@ impl Engine {
             l.birthday = Some(bday);
             l.birthday_source = Some(source.clone());
             l.needs_birthday = needs_birthday;
+            l.gap_limit = Some(gap);
             l.last_error = None;
         });
         tracing::info!(target: "bitcoin", "opened {} on {}", meta.group, network.name());
@@ -755,6 +793,28 @@ impl Engine {
         });
         tracing::info!(target: "bitcoin", "birthday set; rescanning from {from}");
         Ok(json!({"birthday": {"height": from, "source": "set"}, "rescanFrom": from}))
+    }
+
+    /// The wallet's gap limit, kept. Raised, the scans go again from the birthday, wider: Kyoto
+    /// and the node's filters in place, a server as a full scan. Lowered, coins only move into
+    /// `beyondGap`: nothing is forgotten.
+    fn set_gap_limit(&self, gap: u32) -> Result<Value, String> {
+        let (limit, raised, birthday, progress) = self.with_open(|w| Ok((w.gap_limit.clone(), w.gap_raised.clone(), w.birthday.clone(), w.progress.clone())))?;
+        let before = self.cell_job(Duration::from_secs(30), |cell| {
+            let before = cell.gap_limit();
+            meta_set(&cell.conn, wallet::GAP_LIMIT_KEY, &gap.to_string()).map_err(|e| e.to_string())?;
+            Ok(before)
+        })?;
+        limit.store(gap, Ordering::SeqCst);
+        let from = (gap > before).then(|| birthday.load(Ordering::SeqCst));
+        if let Some(f) = from {
+            progress.lock().rescan_from = Some(f);
+            raised.store(true, Ordering::SeqCst);
+            self.wake();
+        }
+        self.set_light(|l| l.gap_limit = Some(gap));
+        tracing::info!(target: "bitcoin", "gap limit {before} -> {gap}{}", from.map(|f| format!("; rescanning from {f}")).unwrap_or_default());
+        Ok(json!({"gapLimit": gap, "rescanFrom": from}))
     }
 
     // ── Sends ─────────────────────────────────────────────────────────────
@@ -1073,7 +1133,7 @@ impl Engine {
             "ok": true, "state": l.state.as_str(), "network": l.network.map(|n| n.name()), "group": l.group,
             "family": l.family, "openHandle": l.open_handle, "approvalHandle": l.approval_handle,
             "needsBirthday": l.needs_birthday, "birthday": l.birthday, "birthdaySource": l.birthday_source,
-            "lastError": l.last_error, "synced": false, "busy": false,
+            "gapLimit": l.gap_limit, "lastError": l.last_error, "synced": false, "busy": false,
             "authority": {"kind": null, "height": null, "tipAgeSecs": null, "peers": 0},
         });
         let Some(open) = self.open.try_lock_for(READ_WAIT) else {
@@ -1135,7 +1195,8 @@ impl Engine {
                 b
             }
             // Busy: empty strings are "not read", never zero.
-            Ok(None) => json!({"ok": true, "busy": true, "confirmed": "", "waiting": "", "pending": "", "sent": "", "immature": "", "tooSmall": {"count": null, "sat": ""}}),
+            Ok(None) => json!({"ok": true, "busy": true, "confirmed": "", "waiting": "", "pending": "", "sent": "", "immature": "", "tooSmall": {"count": null, "sat": ""},
+                "beyondGap": {"count": null, "sat": "", "confirmedSat": ""}}),
             Err(e) => json!({"ok": false, "error": e}),
         }
     }
@@ -1416,6 +1477,44 @@ mod tests {
             assert!(parse_task("set_birthday", bad).is_err(), "{bad}");
         }
         assert!(backend_only("set_birthday"));
+    }
+
+    #[test]
+    fn a_gap_limit_runs_from_20_to_1000() {
+        crate::network::configure_regtest(Default::default());
+        let open = |g: &str| parse_task("open_wallet", &format!(r#"{{"network":"regtest","family":"bitcoin","gapLimit":{g}}}"#));
+        assert!(matches!(open("20"), Ok(Task::Open { gap_limit: Some(20), .. })));
+        assert!(matches!(open("1000"), Ok(Task::Open { gap_limit: Some(1000), .. })));
+        assert!(matches!(parse_task("open_wallet", r#"{"network":"regtest","family":"bitcoin"}"#), Ok(Task::Open { gap_limit: None, .. })));
+        assert!(matches!(parse_task("set_gap_limit", r#"{"gapLimit":60}"#), Ok(Task::SetGapLimit(60))));
+        for bad in ["19", "1001", "60.5", "-1", r#""60""#, "null"] {
+            if bad != "null" {
+                assert_eq!(crate::jobs::code_of(&open(bad).err().unwrap()), "invalid", "{bad}");
+            }
+            let e = parse_task("set_gap_limit", &format!(r#"{{"gapLimit":{bad}}}"#)).err().unwrap();
+            assert_eq!(crate::jobs::code_of(&e), "invalid", "{bad}: {e}");
+        }
+        assert!(backend_only("set_gap_limit"));
+    }
+
+    #[test]
+    fn a_gap_limit_is_kept_and_a_raise_scans_again() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), None);
+        let opened = finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin", "gapLimit": 30}));
+        assert_eq!((opened["gapLimit"].clone(), e.status()["gapLimit"].clone()), (json!(30), json!(30)));
+        let bday = e.status()["birthday"].clone();
+        assert_eq!(finish(&e, "set_gap_limit", json!({"gapLimit": 60})), json!({"gapLimit": 60, "rescanFrom": bday}), "raised: scan again");
+        assert_eq!(e.with_open(|w| Ok(w.gap_limit.load(Ordering::SeqCst))).unwrap(), 60, "the sync thread's");
+        assert_eq!(finish(&e, "set_gap_limit", json!({"gapLimit": 25})), json!({"gapLimit": 25, "rescanFrom": null}), "lowered: nothing to scan");
+        finish(&e, "close_wallet", json!({}));
+        let again = finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset"}));
+        assert_eq!((again["gapLimit"].clone(), e.status()["gapLimit"].clone()), (json!(25), json!(25)), "kept: {again}");
+        finish(&e, "close_wallet", json!({}));
+        let other = finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset", "gapLimit": 40}));
+        assert_eq!(other["gapLimit"], 40, "asked for on open");
+        e.shutdown();
     }
 
     #[test]

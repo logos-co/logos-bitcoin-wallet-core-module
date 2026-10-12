@@ -152,8 +152,9 @@ pub fn cap_indices(
     claimed: &BTreeMap<KeychainKind, u32>,
     revealed: impl Fn(KeychainKind) -> Option<u32>,
     proven: impl Fn(KeychainKind) -> Option<u32>,
+    gap: u32,
 ) -> BTreeMap<KeychainKind, u32> {
-    claimed.iter().map(|(k, c)| (*k, cap_last_active(*c, revealed(*k), proven(*k), GAP_LIMIT))).collect()
+    claimed.iter().map(|(k, c)| (*k, cap_last_active(*c, revealed(*k), proven(*k), gap))).collect()
 }
 
 /// Walks a Merkle branch from `txid` at `pos` up to the root it proves.
@@ -371,7 +372,7 @@ mod tests {
         assert_eq!(cap_last_active(7, Some(4), None, GAP_LIMIT), 7, "within the gap stays");
         assert_eq!(cap_last_active(1_000_000, Some(4), Some(90), GAP_LIMIT), 90, "a paid address counts");
         let claimed = BTreeMap::from([(KeychainKind::External, 1_000_000), (KeychainKind::Internal, 3)]);
-        let capped = cap_indices(&claimed, |k| (k == KeychainKind::External).then_some(10), |_| None);
+        let capped = cap_indices(&claimed, |k| (k == KeychainKind::External).then_some(10), |_| None, GAP_LIMIT);
         assert_eq!(capped[&KeychainKind::External], 30);
         assert_eq!(capped[&KeychainKind::Internal], 3);
     }

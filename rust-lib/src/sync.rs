@@ -170,6 +170,9 @@ pub struct Ctx {
     /// Where scans start; `rescan` has them start again from it.
     pub birthday: Arc<AtomicU32>,
     pub rescan: Arc<AtomicBool>,
+    /// The wallet's gap limit, and a flag that has the scans go again from the birthday, wider.
+    pub gap_limit: Arc<AtomicU32>,
+    pub gap_raised: Arc<AtomicBool>,
     pub cell: Arc<Mutex<Option<Cell>>>,
     pub netstate: Arc<Mutex<NetState>>,
     pub progress: Arc<Mutex<Progress>>,
@@ -294,6 +297,10 @@ impl Loop {
         self.ctx.stop.load(Ordering::SeqCst)
     }
 
+    fn gap(&self) -> u32 {
+        self.ctx.gap_limit.load(Ordering::SeqCst)
+    }
+
     fn birthday(&self) -> u32 {
         self.ctx.birthday.load(Ordering::SeqCst)
     }
@@ -320,12 +327,58 @@ impl Loop {
                 let _ = meta_set(&c.conn, CHAIN_BASE, &want.height.to_string());
             }
         }
-        (self.kyoto_lookahead, self.node_lookahead) = (kyoto::LOOKAHEAD, kyoto::LOOKAHEAD);
+        let n = kyoto::lookahead_for(self.gap());
+        (self.kyoto_lookahead, self.node_lookahead) = (n, n);
         self.node_gap = None;
         let mut p = self.ctx.progress.lock();
         p.full_scan_done = false;
         p.synced_tip = None;
         // Again here: a pass from before the restart may have cleared it.
+        p.rescan_from = Some(self.birthday());
+        self.last_history = None;
+    }
+
+    /// A raised gap limit: the scans go again from the birthday, wide enough for it. Kyoto's client
+    /// scans again in place, the node from its filters, and a server's next sync is a full scan.
+    fn scan_wider(&mut self) {
+        let gap = self.gap();
+        let n = {
+            let guard = self.ctx.cell.lock();
+            let Some(cell) = guard.as_ref() else { return };
+            let _ = forget_scans(&cell.conn);
+            kyoto::wider_lookahead(&kyoto::reachable_used(cell.wallet.spk_index(), gap), gap)
+        };
+        tracing::info!(target: "bitcoin", "gap limit {gap}: scanning again from {}", self.birthday());
+        self.kyoto_lookahead = self.kyoto_lookahead.max(n);
+        if self.kyoto.is_some() {
+            self.kyoto_status.rescans += 1;
+            // Still syncing headers only: its pending scan of filters is the one to start lower.
+            let from = self.birthday().saturating_sub(1);
+            let now = match self.kyoto_rescan.as_mut() {
+                Some(h) => {
+                    *h = (*h).min(from);
+                    None
+                }
+                None => Some(from),
+            };
+            if !self.ctx.widen_by_restart && self.widen_kyoto(self.kyoto_lookahead, now) {
+                self.kyoto_scanning |= now.is_some();
+                if let (Some(c), Some(cell)) = (&self.kyoto, self.ctx.cell.lock().as_ref()) {
+                    let _ = meta_set(&cell.conn, KYOTO_WINDOW, &format!("{},{}", c.window[0], c.window[1]));
+                }
+            } else {
+                self.stop_kyoto(None);
+                self.kyoto_retry_at = Instant::now();
+            }
+            self.ctx.progress.lock().kyoto = Some(self.kyoto_status.clone());
+        }
+        if self.node.take().is_some() {
+            self.node_rescans += 1;
+        }
+        self.node_lookahead = self.node_lookahead.max(n);
+        let mut p = self.ctx.progress.lock();
+        p.full_scan_done = false;
+        p.synced_tip = None;
         p.rescan_from = Some(self.birthday());
         self.last_history = None;
     }
@@ -755,8 +808,8 @@ impl Loop {
             let guard = self.ctx.cell.lock();
             let Some(cell) = guard.as_ref() else { return false };
             let Some(window) = meta_get(&cell.conn, window_key).ok().flatten().as_deref().and_then(parse_window) else { return false };
-            let used = kyoto::reachable_used(cell.wallet.spk_index(), checks::GAP_LIMIT);
-            let next = kyoto::rescan_lookahead(window, &used, checks::GAP_LIMIT);
+            let used = kyoto::reachable_used(cell.wallet.spk_index(), self.gap());
+            let next = kyoto::rescan_lookahead(window, &used, self.gap());
             let beyond = cell.wallet.spk_index().last_used_indices().into_iter().filter(|(k, i)| used.get(k).is_none_or(|u| i > u)).collect::<BTreeMap<_, _>>();
             let _ = meta_set(&cell.conn, window_key, "");
             if next.is_some() {
@@ -1394,6 +1447,7 @@ impl Loop {
     fn sync_with(&mut self, src: &Source, takes_pending: bool) -> Result<(), String> {
         let src = src.clone();
         let full = !self.ctx.progress.lock().full_scan_done;
+        let gap = self.gap();
         let now = self.now();
         // The request carries no chain tip, so the server's answer moves no chain.
         let (sync_req, full_req, known_txs, known_anchors) = {
@@ -1426,7 +1480,7 @@ impl Loop {
                 c.populate_anchor_cache(known_anchors);
                 let r = match (sync_req, full_req) {
                     (Some(req), _) => c.sync(req, 25, false).map(|r| (r.tx_update, BTreeMap::new())),
-                    (_, Some(req)) => c.full_scan(req, checks::GAP_LIMIT as usize, 25, false).map(|r| (r.tx_update, r.last_active_indices)),
+                    (_, Some(req)) => c.full_scan(req, gap as usize, 25, false).map(|r| (r.tx_update, r.last_active_indices)),
                     _ => unreachable!(),
                 };
                 let rec = c.inner.take();
@@ -1438,7 +1492,7 @@ impl Loop {
                 let rt = self.ctx.rt.clone();
                 let r = match (sync_req, full_req) {
                     (Some(req), _) => rt.block_on(c.sync(req, 4)).map(|r| (r.tx_update, BTreeMap::new())),
-                    (_, Some(req)) => rt.block_on(c.full_scan(req, checks::GAP_LIMIT as usize, 4)).map(|r| (r.tx_update, r.last_active_indices)),
+                    (_, Some(req)) => rt.block_on(c.full_scan(req, gap as usize, 4)).map(|r| (r.tx_update, r.last_active_indices)),
                     _ => unreachable!(),
                 };
                 let (update, last) = r.map_err(|e| e.to_string())?;
@@ -1741,6 +1795,9 @@ impl Loop {
             if self.ctx.rescan.swap(false, Ordering::SeqCst) {
                 self.restart_scan();
             }
+            if self.ctx.gap_raised.swap(false, Ordering::SeqCst) {
+                self.scan_wider();
+            }
             // Without routes, as when the node module wasn't up at open, ask again soon.
             let none = self.ctx.routes_src.is_some() && self.ctx.netstate.lock().routes.every().is_empty();
             let due = if none { Duration::from_secs(15) } else { ROUTES_EVERY };
@@ -1804,14 +1861,15 @@ fn coinbase_proof(c: &impl ElectrumApi, height: u32) -> Result<(Txid, Vec<[u8; 3
 /// where a checked transaction in the answer pays the address.
 fn cap(cell: &Cell, claimed: &BTreeMap<KeychainKind, u32>, update: &TxUpdate<ConfirmationBlockTime>) -> BTreeMap<KeychainKind, u32> {
     let scripts: HashSet<ScriptBuf> = update.txs.iter().flat_map(|t| t.output.iter().map(|o| o.script_pubkey.clone())).collect();
+    let gap = cell.gap_limit();
     let revealed = |k| cell.wallet.derivation_index(k);
     let proven = |k: KeychainKind| {
         let c = *claimed.get(&k)?;
-        let from = revealed(k).map_or(checks::GAP_LIMIT, |r| r + checks::GAP_LIMIT + 1);
+        let from = revealed(k).map_or(gap, |r| r + gap + 1);
         let to = c.min(from.saturating_add(5_000));
         (from..=to).rev().find(|i| scripts.contains(&cell.wallet.peek_address(k, *i).script_pubkey()))
     };
-    let capped = checks::cap_indices(claimed, revealed, proven);
+    let capped = checks::cap_indices(claimed, revealed, proven, gap);
     for (k, c) in claimed {
         if capped.get(k) != Some(c) {
             tracing::warn!(target: "bitcoin", "capped a claimed address index {c} to {:?}", capped.get(k));
@@ -1826,6 +1884,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
         let meta = |key: &str| ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, key).ok().flatten());
         let book = meta(KYOTO_PEERS).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         let node_gap = meta(NODE_GAP).and_then(|t| serde_json::from_str(&t).ok());
+        let n = kyoto::lookahead_for(ctx.gap_limit.load(Ordering::SeqCst));
         let mut l = Loop {
             ctx,
             authority,
@@ -1837,9 +1896,9 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             kyoto_status: KyotoStatus::default(),
             kyoto_rescan: None,
             kyoto_scanning: false,
-            kyoto_lookahead: kyoto::LOOKAHEAD,
+            kyoto_lookahead: n,
             node: None,
-            node_lookahead: kyoto::LOOKAHEAD,
+            node_lookahead: n,
             node_rescans: 0,
             node_ok: false,
             node_probe: None,

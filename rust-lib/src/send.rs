@@ -132,13 +132,18 @@ pub fn signed_vsize(tx: &Transaction, family: Family) -> u64 {
 pub fn preview_json(cell: &Cell, id: &str, kind: &str, psbt: &Psbt, rate: f64, replaces: Option<Txid>, to_fee: u64) -> Result<Value, String> {
     let net = cell.network.bitcoin();
     let tx = &psbt.unsigned_tx;
+    let rule = cell.gap_rule();
     let mut inputs = vec![];
+    let (mut far_count, mut far_sat) = (0u32, 0u64);
     for (txin, input) in tx.input.iter().zip(&psbt.inputs) {
         let prev = input
             .witness_utxo
             .clone()
             .or_else(|| input.non_witness_utxo.as_ref().and_then(|t| t.output.get(txin.previous_output.vout as usize).cloned()))
             .ok_or("an input has no previous output")?;
+        if cell.wallet.derivation_of_spk(prev.script_pubkey.clone()).is_some_and(|(k, i)| rule.beyond(k, i)) {
+            (far_count, far_sat) = (far_count + 1, far_sat + prev.value.to_sat());
+        }
         inputs.push(json!({
             "outpoint": txin.previous_output.to_string(), "amountSat": prev.value.to_sat().to_string(),
             "address": Address::from_script(&prev.script_pubkey, net).map(|a| a.to_string()).ok(),
@@ -157,6 +162,12 @@ pub fn preview_json(cell: &Cell, id: &str, kind: &str, psbt: &Psbt, rate: f64, r
             }));
         }
         outputs.push(json!({"address": addr, "amountSat": o.value.to_sat().to_string(), "change": change}));
+    }
+    if far_count > 0 {
+        warnings.push(json!({
+            "kind": "beyond_gap_inputs", "count": far_count, "sat": far_sat.to_string(),
+            "message": "Some coins it spends are on addresses beyond the wallet's gap limit, where a restore with that gap limit would not look.",
+        }));
     }
     if to_fee > 0 {
         warnings.push(json!({
@@ -428,6 +439,37 @@ mod tests {
         let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
         (dir, Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin })
+    }
+
+    #[test]
+    fn spending_a_coin_beyond_the_gap_is_warned() {
+        use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
+        let (_dir, mut cell) = funded(100_000);
+        // A second coin at index 75: past the first coin's index 0 plus a gap of 20.
+        let _ = cell.wallet.reveal_addresses_to(KeychainKind::External, 80).count();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([8; 32]), vout: 0 }, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(70_000), script_pubkey: cell.wallet.peek_address(KeychainKind::External, 75).script_pubkey() }],
+        };
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let b1 = BlockId { height: 1, hash: bitcoin::BlockHash::from_byte_array([1; 32]) };
+        let mut u = TxUpdate::default();
+        u.anchors.insert((ConfirmationBlockTime { block_id: b1, confirmation_time: 1 }, tx.compute_txid()));
+        u.txs.push(std::sync::Arc::new(tx));
+        let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
+        cell.wallet.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
+        let to = crate::address::parse("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", BNetwork::Regtest).unwrap().address;
+        let all = SendInput { recipients: vec![Recipient { address: to, amount: None }], fee_rate: Some(2.0), target: None, send_max: true, small_change_to_fee: false };
+        let (psbt, _) = build(&mut cell, &all, 2.0).unwrap();
+        assert_eq!(psbt.unsigned_tx.input.len(), 2, "send-max takes it too");
+        let p = preview_json(&cell, "p1", "send", &psbt, 2.0, None, 0).unwrap();
+        let w = p["warnings"].as_array().unwrap().iter().find(|w| w["kind"] == "beyond_gap_inputs").cloned().expect("warned");
+        assert_eq!((w["count"].clone(), w["sat"].clone()), (json!(1), json!("70000")), "{w}");
+        crate::storage::meta_set(&cell.conn, crate::wallet::GAP_LIMIT_KEY, "80").unwrap();
+        let p = preview_json(&cell, "p2", "send", &psbt, 2.0, None, 0).unwrap();
+        assert!(p["warnings"].as_array().unwrap().iter().all(|w| w["kind"] != "beyond_gap_inputs"), "within a gap of 80");
     }
 
     #[test]

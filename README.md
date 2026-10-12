@@ -31,6 +31,20 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
   come. It is stored (`birthdaySource: "set"`, kept across opens) and every authority scans again
   from it: Kyoto and the node from the new height, a history server with a full scan.
   `status.rescanFrom` holds the height until that scan reaches the tip.
+- **Gap limit.** `open_wallet`'s optional `gapLimit` (20 to 1000) sets how far the wallet's scans
+  look past the last used address: 20 by default, or the value kept in `core_meta` from an earlier
+  open. The open result and `status.gapLimit` carry it. `set_gap_limit` (backend only) changes it on
+  an open wallet; raised, every scan goes again from the birthday wider, as a raise on open does.
+  Kyoto's client and the node's filters scan again in place, and a history server does a full scan
+  with the new stop gap. Lowered, it only moves coins into `beyondGap`: nothing is forgotten.
+- **Coins beyond the gap.** Per keychain, the used indices a scan from 0 reaches without crossing
+  `gapLimit` unused addresses in a row are reachable. An address past the last reachable one plus
+  `gapLimit` is beyond the gap. A scan whose window watched further can still find coins there, as
+  on testnet4 at 300 to 313. Their unspent amounts (confirmed, waiting and pending) count only in
+  `balance.beyondGap`, not in `confirmed`, `waiting`, `pending` or `sent`. A history row whose
+  wallet part is only through such addresses has `beyondGap: true`. They stay spendable: coin
+  selection and send-max use them, and a preview spending any warns
+  `{ kind: "beyond_gap_inputs", count, sat, message }`.
 
 ## The chain authority
 
@@ -92,7 +106,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   under the last block scanned, the scan resumes from the newest scanned block still on the chain.
 - Blocks are applied in height order, so a spend always meets the coin it spends. A scan from the
   birthday keeps the fewest indices it watched (`node_window`); when it reaches the tip and the
-  wallet used an address within the gap limit (20) of them, earlier blocks may pay addresses it
+  wallet used an address within the gap limit (`gapLimit`) of them, earlier blocks may pay addresses it
   never watched, so it scans again from the birthday watching about twice the highest used index,
   until the window holds (`status.node.rescans`); as for Kyoto, only addresses a gap-limit scan
   reaches count.
@@ -142,13 +156,13 @@ bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with
   watches them from its next filter on (bdk_kyoto patch 4; `status.kyoto.rebuilds` counts these).
   Matched blocks are applied in height order (patch 1), so a spend meets its coin.
 - A scan from the birthday keeps the fewest indices any of its clients watched (`kyoto_window`).
-  When it reaches the tip and the wallet used an address within the gap limit (20) of them, earlier
+  When it reaches the tip and the wallet used an address within the gap limit (`gapLimit`) of them, earlier
   blocks may pay addresses it never watched: it scans again from the birthday, watching about twice
   the highest used index (patch 3 indexes every one), until the window holds
   (`status.kyoto.rescans`); the regtest restores below, to index 150 out of order, take two. Each
   pass after the first runs in place: the client keeps its header chain and the filter headers its
   quorum agreed on (bip157 patch 5) and fetches only the filters again (`widen` below). Only
-  used addresses a gap-limit scan reaches count, from index 0 and never past 20 unused in a row:
+  used addresses a gap-limit scan reaches count, from index 0 and never past `gapLimit` unused in a row:
   the public test phrase also has payments far beyond (testnet4 index 313 after 151), which a
   window happens to hold now and then, and which would otherwise widen it again and again.
 - A start begins 8 blocks below the last height whose filters were scanned. A first sync hands over
@@ -259,11 +273,11 @@ are applied with `chain: None`. Then (`checks.rs`):
   or coinbase proof that doesn't fit is a lie.
 - **Evictions** from a sync are dropped; an unconfirmed transaction no server has reported for 14
   days is evicted then.
-- **Address indices** a full scan reports are capped at the revealed index plus the gap limit (20),
+- **Address indices** a full scan reports are capped at the revealed index plus the gap limit,
   or higher only where a checked transaction pays the address; a sync asking about more than 20,000
   addresses is refused.
 
-Each open starts with a full scan (BDK's, up to the gap limit past the last used address), so
+Each open starts with a full scan (BDK's, up to `gapLimit` past the last used address), so
 addresses used elsewhere since are found; later syncs ask about the revealed addresses.
 
 One history server at a time, in the order of the `history` role; after 3 failures in a row, or
@@ -287,6 +301,7 @@ the rate (68 vB a native segwit input, 58 vB a taproot one), with BDK's default 
 locked with `lock_outpoint`. A warning flags change too small to spend; with
 `smallChangeToFee: true` such change goes to the fee instead, its address released, and the
 preview's `warnings` say so: `{ kind: "change_to_fee", amountSat, costToSpendSat, message }`.
+Coins beyond the gap are spent like any, with a warning (above).
 
 `sign_and_broadcast` (backend only) sends `request_approval` with exactly one psbt leg and keeps the
 receipt. While the person decides, `approvalHandle: "smh_…"` shows in `status` and in `preview`, so
@@ -311,10 +326,10 @@ Amounts are decimal strings of satoshis.
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below. Malformed parameters are refused at once with `{ ok: false, error, code: "invalid" }` |
 | `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
-| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
-| `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat } }`; `unchecked` is what unchecked rows pay the wallet; empty strings while busy |
-| `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once 20 stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
-| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, broadcast, via, confirmedVia }`; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `waiting` is a block a server reported that the chain doesn't hold yet, or whose proof hasn't come; `unchecked` is a block a server reported below the chain's start, which nothing checked or which failed its check, and its `reportedBy` names that server; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState`, `broadcast` (`seen`, `requested` or `unknown`) and `via` come from the wallet's own send record, null without one |
+| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, gapLimit, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
+| `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count, sat, confirmedSat } }`; `unchecked` is what unchecked rows pay the wallet; `beyondGap` is the coins beyond the gap, in none of the other figures; empty strings while busy |
+| `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once `gapLimit` stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
+| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, broadcast, via, confirmedVia, beyondGap }`; `beyondGap` is true when the wallet's part of the transaction is only through addresses beyond the gap; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `waiting` is a block a server reported that the chain doesn't hold yet, or whose proof hasn't come; `unchecked` is a block a server reported below the chain's start, which nothing checked or which failed its check, and its `reportedBy` names that server; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState`, `broadcast` (`seen`, `requested` or `unknown`) and `via` come from the wallet's own send record, null without one |
 | `fee_rates()` | `{ fast, normal, slow, minimum, sources }` sat/vB: the median of the fee sources, never below the highest minimum relay fee |
 | `address_valid(text, network)` | An address or BIP21 URI: `{ valid, address, type, amountSat?, label?, message? }` |
 | `sources_status()`, `exposure()` | `{ chainBy, local, kyoto: { id, route, peers, down }, sources }`: who feeds the chain and per server health and verdicts, with `encrypted` false for plain text outside Tor (the app marks those servers); the servers that learned the addresses |
@@ -325,7 +340,7 @@ Amounts are decimal strings of satoshis.
 
 | Job kind | Parameters → result |
 |---|---|
-| `open_wallet` | `{ network, group?, family?, birthday? }` → `{ group, family, network, created, reset, fingerprint, birthday: { height, source }, needsBirthday }` |
+| `open_wallet` | `{ network, group?, family?, birthday?, gapLimit? }` → `{ group, family, network, created, reset, fingerprint, birthday: { height, source }, needsBirthday, gapLimit }` |
 | `close_wallet` | → `{ closed }` |
 | `build_send` | `{ recipients: [{ address, amountSat }], feeRate? \| target?, sendMax?, smallChangeToFee? }` → `{ previewId, kind, inputs, outputs: [{ address, amountSat, change }], feeSat, feeRate, vsize, txid, warnings, replaces, approvalHandle, state }` |
 | `bump_fee` | `{ txid, feeRate }` → a preview of kind `fee_bump`, built by `build_fee_bump` |
@@ -334,6 +349,7 @@ Amounts are decimal strings of satoshis.
 | `rebroadcast` | `{ txid }` → as `sign_and_broadcast` |
 | `abandon_send` | Backend only. `{ txid }` → unlocks a sent transaction's inputs |
 | `set_birthday` | Backend only. `{ date }` or `{ height }` → `{ birthday: { height, source: "set" }, rescanFrom }`; a birthday after the first transaction or a day still to come fails with code `invalid` |
+| `set_gap_limit` | Backend only. `{ gapLimit }` (20 to 1000) → `{ gapLimit, rescanFrom }`, `rescanFrom` the birthday when raised, else null; out of range fails with `invalid`, a wallet busy with `busy` |
 
 Events: `walletStateChanged` (status's shape; also when the authority's kind changes, a reorg
 moves a payment, a birthday is set and its rescan starts and ends), `jobFinished(jobId, state)`, and
@@ -387,7 +403,7 @@ the plain-text rule run end to end on regtest (`tools/e2e/pins.sh`).
 0600): BDK's tables plus `core_headers`, `core_old_hashes`, `core_held` (anchors above the tip,
 and unchecked ones below the chain's start), `core_exposure`, `core_suspects`, `core_reported`,
 `core_sends` (state `broadcasting`, `sent`, `replaced`, `confirmed`, `conflicted`, `abandoned` or
-`failed`) and `core_meta`, which keeps the birthday, the chain's checkpoint (`chain_base`), the last
+`failed`) and `core_meta`, which keeps the birthday, the gap limit (`gap_limit`), the chain's checkpoint (`chain_base`), the last
 heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`), the indices a scan from the
 birthday watched (`kyoto_window`, `node_window`), a pruned node's gap (`node_gap`) and Kyoto's peer
 failures (`kyoto_peers`). `scan_rules` marks the scan rules a wallet was scanned under: a wallet
@@ -442,6 +458,8 @@ REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --fe
   --test widen -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
   cargo test --release --no-default-features --features test-hooks --test anchors -- --ignored --nocapture
+REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
+  --test gap -- --ignored --nocapture
 ```
 
 `chain.sh reorg` pays the replacement blocks to a fresh address each time: right after a burst of
@@ -523,6 +541,13 @@ bdk_electrum checks a proof against the server's own header before anything else
 Electrum's made-up payments never show at all. With held anchors confirmed on their hash alone, as
 before, the made-up one confirms at once.
 
+`gap` pays the test phrase's receive indices 0 to 10 and 70 to 72, then restores it under Kyoto,
+the node's filters and Electrum. Each wallet is first opened with no route and `gapLimit` 20, and
+addresses to 80 handed out, so the restore's scan watches past 72. 70 to 72 then count only in
+`beyondGap` and their rows say so. A send-max preview takes them, with a `beyond_gap_inputs`
+warning. `set_gap_limit` 60 scans again (Kyoto in place) and counts them as confirmed, and a
+reopen keeps 60.
+
 `esplora`, with Blockstream's electrs (esplora flavour, `--jsonrpc-import`) for history, pending
 payments, broadcast, fees and checks, and the Electrum header chain for the chain: a payment
 pending then confirmed (its anchor checked by Esplora's merkle proof and the block's `tx_count`),
@@ -549,7 +574,7 @@ Linux, 2,053,797 and 511,969.
 
 On 2026-10-12, macOS 27 (aarch64) and Linux (x86_64): `regtest` 64 s and 46 s, `kyoto` 131 s and
 63 s, `node` 235 s and 54 s (the Mac mines slowly), `esplora` 20 s and 18 s, `restore` 120 s and
-25 s, `widen` 120 s and 15 s, `anchors` 49 s and 47 s.
+25 s, `widen` 120 s and 15 s, `anchors` 49 s and 47 s; `gap` 28 s on macOS.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.

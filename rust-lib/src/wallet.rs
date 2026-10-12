@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 
-use bdk_wallet::chain::{BlockId, ChainPosition, ConfirmationBlockTime};
+use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
+use bdk_wallet::chain::{BlockId, CanonicalizationParams, ChainPosition, ConfirmationBlockTime};
 use bdk_wallet::{KeychainKind, PersistedWallet, Wallet};
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -23,6 +24,30 @@ pub struct Cell {
     pub conn: Connection,
     pub network: BNetwork,
     pub family: Family,
+}
+
+/// Where the wallet's gap limit is kept in `core_meta`; 20 when unset.
+pub const GAP_LIMIT_KEY: &str = "gap_limit";
+pub const MAX_GAP_LIMIT: u32 = 1000;
+
+/// The highest address index of each keychain within the gap: past the last used index a scan
+/// from 0 reaches, by the gap limit. A coin further out was found only because a scan watched past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapRule {
+    external: u32,
+    internal: u32,
+}
+
+impl GapRule {
+    pub fn new(index: &KeychainTxOutIndex<KeychainKind>, gap: u32) -> Self {
+        let used = crate::kyoto::reachable_used(index, gap);
+        let last = |k| used.get(&k).map_or(gap.saturating_sub(1), |u: &u32| u.saturating_add(gap));
+        Self { external: last(KeychainKind::External), internal: last(KeychainKind::Internal) }
+    }
+
+    pub fn beyond(&self, keychain: KeychainKind, index: u32) -> bool {
+        index > if keychain == KeychainKind::External { self.external } else { self.internal }
+    }
 }
 
 /// A send that may have left the wallet: its inputs stay locked until it confirms or is abandoned.
@@ -307,27 +332,72 @@ impl Cell {
         tx.output.iter().filter(|o| self.wallet.is_mine(o.script_pubkey.clone())).map(|o| o.value.to_sat()).sum()
     }
 
+    pub fn gap_limit(&self) -> u32 {
+        crate::storage::meta_get(&self.conn, GAP_LIMIT_KEY).ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(GAP_LIMIT)
+    }
+
+    pub fn gap_rule(&self) -> GapRule {
+        GapRule::new(self.wallet.spk_index(), self.gap_limit())
+    }
+
+    /// Whether the wallet takes part in `tx` only through addresses beyond the gap.
+    pub fn only_beyond_gap(&self, rule: &GapRule, tx: &Transaction) -> bool {
+        let index = self.wallet.spk_index();
+        let outputs = tx.output.iter().filter_map(|o| index.index_of_spk(o.script_pubkey.clone()).copied());
+        let inputs = tx.input.iter().filter_map(|i| index.txout(i.previous_output).map(|(ki, _)| ki));
+        let mut any = false;
+        for (k, i) in outputs.chain(inputs) {
+            if !rule.beyond(k, i) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
     /// The height of the checkpoint the wallet's chain starts from.
     pub fn chain_base(&self) -> u32 {
         crate::storage::meta_get(&self.conn, crate::sync::CHAIN_BASE).ok().flatten().and_then(|s| s.parse().ok()).unwrap_or_else(|| self.network.checkpoint().height)
     }
 
-    /// Confirmed, waiting, unchecked, pending, sent and too small, in satoshis as decimal strings.
+    /// Confirmed, waiting, unchecked, pending, sent, too small and beyond the gap, in satoshis as
+    /// decimal strings. Coins beyond the gap count only there.
     pub fn balance(&self, held: &[Held], rate: f64) -> Value {
-        let b = self.wallet.balance();
+        let (b, graph, chain) = (self.wallet.balance(), self.wallet.tx_graph(), self.wallet.local_chain());
         let base = self.chain_base();
-        let ours = |ids: BTreeSet<Txid>| -> u64 { ids.iter().filter_map(|t| self.wallet.tx_graph().get_tx(*t)).map(|tx| self.ours_in(&tx)).sum() };
-        let waiting = ours(held.iter().filter(|h| h.anchor.block_id.height >= base).map(|h| h.txid).collect());
+        let rule = self.gap_rule();
+        let far_ops = self.wallet.spk_index().outpoints().iter().filter(|((k, i), _)| rule.beyond(*k, *i)).cloned();
+        let far = graph.balance(chain, chain.tip().block_id(), CanonicalizationParams::default(), far_ops, |&(k, _), _| k == KeychainKind::Internal);
+        let mut far_coins: BTreeSet<OutPoint> = self.wallet.list_unspent().filter(|u| rule.beyond(u.keychain, u.derivation_index)).map(|u| u.outpoint).collect();
+        let mut far_sat = (far.confirmed + far.trusted_pending + far.untrusted_pending).to_sat();
+        let ours = |ids: BTreeSet<Txid>| -> u64 { ids.iter().filter_map(|t| graph.get_tx(*t)).map(|tx| self.ours_in(&tx)).sum() };
+        let mut waiting = 0;
+        for txid in held.iter().filter(|h| h.anchor.block_id.height >= base).map(|h| h.txid).collect::<BTreeSet<_>>() {
+            let Some(tx) = graph.get_tx(txid) else { continue };
+            for (vout, o) in tx.output.iter().enumerate() {
+                match self.wallet.derivation_of_spk(o.script_pubkey.clone()) {
+                    // A pending coin is in both: counted once.
+                    Some((k, i)) if rule.beyond(k, i) => {
+                        if far_coins.insert(OutPoint::new(txid, vout as u32)) {
+                            far_sat += o.value.to_sat();
+                        }
+                    }
+                    Some(_) => waiting += o.value.to_sat(),
+                    None => {}
+                }
+            }
+        }
         let unchecked = ours(held.iter().filter(|h| h.anchor.block_id.height < base).map(|h| h.txid).collect());
         let (count, sat) = self.too_small(rate);
         json!({
-            "confirmed": b.confirmed.to_sat().to_string(),
+            "confirmed": (b.confirmed - far.confirmed).to_sat().to_string(),
             "waiting": waiting.to_string(),
             "unchecked": unchecked.to_string(),
-            "pending": b.untrusted_pending.to_sat().to_string(),
-            "sent": b.trusted_pending.to_sat().to_string(),
+            "pending": (b.untrusted_pending - far.untrusted_pending).to_sat().to_string(),
+            "sent": (b.trusted_pending - far.trusted_pending).to_sat().to_string(),
             "immature": b.immature.to_sat().to_string(),
             "tooSmall": {"count": count, "sat": sat.to_string()},
+            "beyondGap": {"count": far_coins.len(), "sat": far_sat.to_string(), "confirmedSat": far.confirmed.to_sat().to_string()},
         })
     }
 
@@ -343,7 +413,7 @@ impl Cell {
     /// would not find the coins.
     pub fn next_address(&mut self) -> Result<Value, String> {
         let unused: Vec<_> = self.wallet.list_unused_addresses(KeychainKind::External).collect();
-        let info = if unused.len() as u32 >= GAP_LIMIT {
+        let info = if unused.len() as u32 >= self.gap_limit() {
             unused.into_iter().next().expect("checked")
         } else {
             self.wallet.reveal_next_address(KeychainKind::External)
@@ -431,6 +501,7 @@ impl Cell {
         let mut seen = BTreeSet::new();
         let base = self.chain_base();
         let held_of: BTreeMap<Txid, &Held> = held.iter().map(|h| (h.txid, h)).collect();
+        let rule = self.gap_rule();
         // Held above the chain's tip: waiting; below its start, where nothing links: unchecked,
         // named by the source that reported it.
         let held_state = |h: &Held| if h.anchor.block_id.height < base { "unchecked" } else { "waiting" };
@@ -458,6 +529,7 @@ impl Cell {
                 "via": record.and_then(|s| s.via.clone()),
                 "replacedBy": replaced.get(&txid).map(|t| t.to_string()),
                 "reportedBy": reporters.get(&txid),
+                "beyondGap": self.only_beyond_gap(&rule, tx),
             })
         };
         for wtx in self.wallet.transactions() {
@@ -718,6 +790,58 @@ mod tests {
         assert_eq!((s["sendState"].as_str(), s["broadcast"].as_str(), s["via"].as_str()), (Some("sent"), Some("unknown"), Some("kyoto")), "{s}");
         let r = row(&funding);
         assert!(r["broadcast"].is_null() && r["via"].is_null() && r["sendState"].is_null(), "a receive has no record: {r}");
+    }
+
+    /// Payments to 0..=10 and 70..=72, found by a scan that watched past them, one more pending
+    /// at 73 and one held above the tip at 74: past index 10 plus a gap of 20 they count apart.
+    #[test]
+    fn coins_beyond_the_gap_count_apart_and_a_wider_gap_takes_them_in() {
+        use bdk_wallet::chain::{CheckPoint, TxUpdate};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, TxIn, TxOut};
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[3; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (mut w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let _ = w.reveal_addresses_to(KeychainKind::External, 80).count();
+        let pay = |i: u32| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([i as u8; 32]), vout: 0 }, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(1_000 * u64::from(i + 1)), script_pubkey: w.peek_address(KeychainKind::External, i).script_pubkey() }],
+        };
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let b1 = BlockId { height: 1, hash: BlockHash::from_byte_array([1; 32]) };
+        let mut u = TxUpdate::default();
+        for i in (0..=10).chain(70..=72) {
+            let tx = pay(i);
+            u.anchors.insert((ConfirmationBlockTime { block_id: b1, confirmation_time: 1 }, tx.compute_txid()));
+            u.txs.push(std::sync::Arc::new(tx));
+        }
+        let (pending, held) = (pay(73), pay(74));
+        u.seen_ats.insert((pending.compute_txid(), 5));
+        u.txs.push(std::sync::Arc::new(pending.clone()));
+        u.txs.push(std::sync::Arc::new(held.clone()));
+        let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
+        w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
+        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let held = [Held { txid: held.compute_txid(), anchor: ConfirmationBlockTime { block_id: BlockId { height: 9, hash: BlockHash::from_byte_array([9; 32]) }, confirmation_time: 9 }, source: "electrum-0".into() }];
+        let sat = |is: &mut dyn Iterator<Item = u32>| is.map(|i| 1_000 * u64::from(i + 1)).sum::<u64>().to_string();
+        let b = cell.balance(&held, 1.0);
+        assert_eq!(cell.gap_limit(), GAP_LIMIT);
+        assert_eq!((b["confirmed"].as_str(), b["pending"].as_str(), b["waiting"].as_str()), (Some(sat(&mut (0..=10)).as_str()), Some("0"), Some("0")), "{b}");
+        assert_eq!(b["beyondGap"], json!({"count": 5, "sat": sat(&mut (70..=74)), "confirmedSat": sat(&mut (70..=72))}));
+        let rows = cell.history(0, 50, &held).unwrap()["rows"].as_array().unwrap().clone();
+        let far: BTreeSet<u64> = rows.iter().filter(|r| r["beyondGap"] == true).map(|r| r["amountSat"].as_str().unwrap().parse().unwrap()).collect();
+        assert_eq!(far, (70u64..=74).map(|i| 1_000 * (i + 1)).collect(), "{rows:?}");
+        // From 10 a gap of 60 reaches 70: nothing is beyond it any more.
+        crate::storage::meta_set(&cell.conn, GAP_LIMIT_KEY, "60").unwrap();
+        let b = cell.balance(&held, 1.0);
+        assert_eq!((b["confirmed"].as_str(), b["beyondGap"]["count"].as_u64()), (Some(sat(&mut (0..=10).chain(70..=72)).as_str()), Some(0)), "{b}");
+        assert_eq!(b["pending"], sat(&mut std::iter::once(73)));
+        assert!(cell.history(0, 50, &held).unwrap()["rows"].as_array().unwrap().iter().all(|r| r["beyondGap"] == false));
     }
 
     #[test]
