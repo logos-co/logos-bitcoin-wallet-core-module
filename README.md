@@ -87,7 +87,8 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   scanned with the node's block filters (`getblockfilter`) against the wallet's scripts (the
   revealed ones plus the lookahead), reading only the blocks they match, 1,000 filters a round
   and its finds applied as it goes. Then bdk_bitcoind_rpc's Emitter follows the tip and, there,
-  the mempool; a node without a filter index has every block read by the Emitter. After a reorg
+  the mempool; a node without a filter index has every block read by the Emitter. Every block,
+  however read, must hash as asked and hold its merkle root, or the scan stops there. After a reorg
   under the last block scanned, the scan resumes from the newest scanned block still on the chain.
 - Blocks are applied in height order, so a spend always meets the coin it spends. A scan from the
   birthday keeps the fewest indices it watched (`node_window`); when it reaches the tip and the
@@ -174,7 +175,8 @@ bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with
   fee floor. Kyoto has no fee estimates and no mempool view.
 - Servers in the `check` role are cross-checked against Kyoto's headers: tips, the hash at the
   lower tip, a random header. A server the person enabled for history still syncs alongside, which
-  gives pending payments; its anchors are checked against Kyoto's headers, held above Kyoto's tip.
+  gives pending payments; its anchors are checked against Kyoto's headers, held above Kyoto's tip
+  until its next answer proves them against the header Kyoto brings.
 - Each client runs on a tokio runtime of its own, shut down when it stops: bip157 spawns a task per
   peer, and once its node is dropped those tasks spin on a closed channel for up to the two-hour
   connection limit (135% CPU after one rebuild, before this).
@@ -237,17 +239,24 @@ are applied with `chain: None`. Then (`checks.rs`):
   against the txid it was asked for; a mismatch drops the transaction and its anchors and marks the
   source suspect. Transactions nothing refers to, and anchors for transactions nobody sent, are left
   out too (the Esplora path's check).
-- **Anchors** against the authority: kept on a match; held above its tip and rechecked as it moves
-  (pending meanwhile); dropped on a mismatch, with the source marked suspect and a `sourceAlert`;
-  below the chain's start, kept once the headers link up, else held, shown `unchecked` and named
-  in an `unchecked_anchor` alert. An anchor in a block a reorg just replaced means the server is
-  behind, not lying: it is dropped without blame.
+- **Anchors** against the authority: kept on a match once the proof below holds; held above its
+  tip (`waiting`, pending meanwhile) until the chain reaches the block and the server's next answer
+  proves the transaction against that header, never on the block hash alone; dropped on a
+  mismatch, with the source marked suspect and a `sourceAlert`. Kyoto's and the node's own finds
+  come from blocks checked against their headers as they arrive (merkle root and hash), so theirs
+  count once the chain holds the block. Below the chain's start, an anchor counts once the headers
+  link up and its proof holds against the linked header; whatever fails there is held, shown
+  `unchecked` and named in an `unchecked_anchor` alert, and a lie also marks the source suspect.
+  An anchor in a block a reorg just replaced means the server is behind, not lying: it is dropped
+  without blame.
 - **Merkle proofs.** Electrum: the proof is checked again against the authority's header, and its
   length against the block's depth, taken from a coinbase proof that must reach the same merkle
   root (the 64-byte-transaction trick makes a proof one level off). Esplora: `get_merkle_proof`
-  against the authority's header, and the depth from the block's `tx_count`; below the chain's
-  start, against the block's own header from Esplora, fetched by the hash the walk proved. Without
-  that header the row stays `unchecked`, even when the hash is known.
+  against the authority's header, and the depth from the block's `tx_count`. Below the chain's
+  start, both against the linked header: the one the walk fetched, or the server's own for a block
+  linked before (`blockchain.block.header`, `/block/:hash/header`), which must hash as linked.
+  A request that fails leaves the anchor held for the next answer, without blame; a proof, header
+  or coinbase proof that doesn't fit is a lie.
 - **Evictions** from a sync are dropped; an unconfirmed transaction no server has reported for 14
   days is evicted then.
 - **Address indices** a full scan reports are capped at the revealed index plus the gap limit (20),
@@ -305,7 +314,7 @@ Amounts are decimal strings of satoshis.
 | `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
 | `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat } }`; `unchecked` is what unchecked rows pay the wallet; empty strings while busy |
 | `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once 20 stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
-| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, broadcast, via, confirmedVia }`; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `unchecked` is a block a server reported below the chain's start, which nothing checked, and its `reportedBy` names that server; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState`, `broadcast` (`seen`, `requested` or `unknown`) and `via` come from the wallet's own send record, null without one |
+| `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, broadcast, via, confirmedVia }`; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `waiting` is a block a server reported that the chain doesn't hold yet, or whose proof hasn't come; `unchecked` is a block a server reported below the chain's start, which nothing checked or which failed its check, and its `reportedBy` names that server; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState`, `broadcast` (`seen`, `requested` or `unknown`) and `via` come from the wallet's own send record, null without one |
 | `fee_rates()` | `{ fast, normal, slow, minimum, sources }` sat/vB: the median of the fee sources, never below the highest minimum relay fee |
 | `address_valid(text, network)` | An address or BIP21 URI: `{ valid, address, type, amountSat?, label?, message? }` |
 | `sources_status()`, `exposure()` | `{ chainBy, local, kyoto: { id, route, peers, down }, sources }`: who feeds the chain and per server health and verdicts, with `encrypted` false for plain text outside Tor (the app marks those servers); the servers that learned the addresses |
@@ -431,6 +440,8 @@ ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs R
   cargo test --release --no-default-features --features test-hooks --test restore -- --ignored --nocapture
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test widen -- --ignored --nocapture
+ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
+  cargo test --release --no-default-features --features test-hooks --test anchors -- --ignored --nocapture
 ```
 
 `chain.sh reorg` pays the replacement blocks to a fresh address each time: right after a burst of
@@ -498,6 +509,20 @@ below the checkpoint too: the checkpoint names that block's hash, not its transa
 bdk_kyoto without patch 1 the Kyoto restore misses a sweep of a coin that came the block before;
 without patch 3, payments past the wallet's own lookahead; without both, 8 of 24 transactions.
 
+`anchors` has servers lie about a payment from Core's mempool: confirmed in a real, empty block,
+with its coinbase's empty branch for a proof. Esplora lies through `common::http_front`, which
+rewrites the transaction's status in every answer and serves the proof; Electrum through
+`common::electrum_proxy`, in the history and the proof. The chain comes from Electrum's headers
+through another proxy that can hold its tip. With the tip held a block behind, an honest payment
+and the made-up one in a newer empty block are both `waiting` from Esplora; once the chain moves on,
+the honest one confirms on its proof and the made-up one is refused with an `anchor_mismatch`
+alert, its server suspect, never confirmed in between. Then, with a birthday above a checkpoint, two
+earlier payments link to it and confirm on their proofs against the linked headers, from Esplora
+and from Electrum, and one made up in an empty block below it shows `unchecked` from Esplora.
+bdk_electrum checks a proof against the server's own header before anything else sees it, so
+Electrum's made-up payments never show at all. With held anchors confirmed on their hash alone, as
+before, the made-up one confirms at once.
+
 `esplora`, with Blockstream's electrs (esplora flavour, `--jsonrpc-import`) for history, pending
 payments, broadcast, fees and checks, and the Electrum header chain for the chain: a payment
 pending then confirmed (its anchor checked by Esplora's merkle proof and the block's `tx_count`),
@@ -521,9 +546,10 @@ A pass by a new client receives 577 kB of headers, 194 kB of filter headers, 249
 and the matched blocks; in place, a widening pass receives only the filters and the blocks. The
 two widening passes come to 2,053,320 bytes by a new client and 511,492 in place, 75% less.
 
-On 2026-10-12, macOS 27 (aarch64): `regtest` 59 s, `kyoto` 126 s, `node` 220 s (the Mac mines
-slowly), `esplora` 20 s, `restore` 106 s, `widen` 109 s. On 2026-10-11, before widening in place,
-Linux (x86_64): `regtest` 50 s, `kyoto` 59 s, `node` 54 s, `esplora` 18 s, `restore` 17 s.
+On 2026-10-12, macOS 27 (aarch64): `regtest` 64 s, `kyoto` 131 s, `node` 235 s (the Mac mines
+slowly), `esplora` 20 s, `restore` 120 s, `widen` 120 s, `anchors` 49 s. On 2026-10-11, before
+widening in place and `anchors`, Linux (x86_64): `regtest` 50 s, `kyoto` 59 s, `node` 54 s,
+`esplora` 18 s, `restore` 17 s.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.
@@ -628,9 +654,6 @@ bundle, the keystore side and the core run on Windows and reach it directly unde
 - A scan that starts over, wider, downloads every filter from the birthday again, though no
   header or filter header: Kyoto keeps no filters. A history spread far past the first window can
   take several passes.
-- Two confirmations are taken on a block hash alone, with no Merkle proof against a header: an
-  anchor held above the tip, once the chain reaches its block, and an Electrum anchor below the
-  chain's start, once the headers link up.
 - Mainnet and signet keep their quorum of 3 and 2 however few peers can be dialled, so a single
   peer of the user's own there never meets it; only testnet4 runs below its quorum.
 - bip157's own answer to a filter-header conflict, fetching the block to find which peer lied, is

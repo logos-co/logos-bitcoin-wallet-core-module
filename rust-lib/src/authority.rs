@@ -76,14 +76,15 @@ pub trait Authority: ChainView + Send {
     fn kind(&self) -> &'static str;
     /// Asks the sources for their chains and keeps the most-work valid one.
     fn refresh(&mut self, sources: &[&dyn HeaderSource], now: u32) -> Change;
-    /// Proves heights below the checkpoint by linking a source's headers up to a known hash.
-    fn prove_below(&mut self, heights: &[u32], source: &dyn HeaderSource) -> Result<Vec<(u32, BlockHash)>, String>;
+    /// Proves heights below the checkpoint by linking a source's headers up to a known hash: the
+    /// headers at those heights, or an error for headers that don't link.
+    fn prove_below(&mut self, heights: &[u32], source: &dyn HeaderSource) -> Result<Walked, String>;
     fn summary(&self, now: u64) -> Summary;
     fn chain(&self) -> &HeaderChain;
 }
 
 /// What a walk below the chain's start proved: the headers at the heights asked for, and where
-/// it stopped short of the lowest, if the budget ran out first.
+/// it stopped short of the lowest, if the budget ran out or a fetch failed first.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Walked {
     pub proved: Vec<(u32, Header)>,
@@ -356,13 +357,14 @@ impl Authority for ChainAuthority {
         change
     }
 
-    fn prove_below(&mut self, heights: &[u32], src: &dyn HeaderSource) -> Result<Vec<(u32, BlockHash)>, String> {
+    fn prove_below(&mut self, heights: &[u32], src: &dyn HeaderSource) -> Result<Walked, String> {
         let base = self.chain.base();
         let mut wanted: Vec<u32> = heights.iter().copied().filter(|h| *h < base && !self.old.contains_key(h)).collect();
         wanted.sort_unstable();
         wanted.dedup();
-        let mut proved = vec![];
-        // Highest first, each linking up to the nearest known hash above it.
+        let mut walked = Walked::default();
+        // Highest first, each linking up to the nearest known hash above it; a failed or short
+        // answer stops there, a header that doesn't link is a lie.
         for h in wanted.into_iter().rev() {
             let (above, known) = match self.old.range(h + 1..).next() {
                 Some((k, v)) => (*k, *v),
@@ -371,10 +373,11 @@ impl Authority for ChainAuthority {
             let (mut top, mut expect) = (above, known);
             loop {
                 let start = top.saturating_sub(HEADERS_PER_CALL - 1).max(h);
-                let got = src.headers(start, top - start + 1)?;
-                if got.len() as u32 != top - start + 1 {
-                    return Err(format!("headers {start}..={top} came back short"));
-                }
+                let got = match src.headers(start, top - start + 1) {
+                    Ok(got) if got.len() as u32 == top - start + 1 => got,
+                    Ok(_) => return Ok(Walked { error: Some(format!("headers {start}..={top} came back short")), ..walked }),
+                    Err(e) => return Ok(Walked { error: Some(e), ..walked }),
+                };
                 for (i, hd) in got.iter().enumerate().rev() {
                     if hd.block_hash() != expect {
                         return Err(format!("header {} does not link up to the checkpoint", start + i as u32));
@@ -382,15 +385,14 @@ impl Authority for ChainAuthority {
                     expect = hd.prev_blockhash;
                 }
                 if start == h {
-                    let hash = got[0].block_hash();
-                    self.old.insert(h, hash);
-                    proved.push((h, hash));
+                    self.old.insert(h, got[0].block_hash());
+                    walked.proved.push((h, got[0]));
                     break;
                 }
                 top = start - 1;
             }
         }
-        Ok(proved)
+        Ok(walked)
     }
 
     fn summary(&self, now: u64) -> Summary {
@@ -634,9 +636,14 @@ mod tests {
         // Trust height 10 as if it were the checkpoint.
         let mut a = ChainAuthority::on(HeaderChain::from_checkpoint(BNetwork::Regtest, 10, full[10]));
         let honest = fake("h", full.clone());
-        let proved = a.prove_below(&[7, 3, 12], &honest).unwrap();
-        assert_eq!(proved, vec![(7, full[7].block_hash()), (3, full[3].block_hash())]);
+        let w = a.prove_below(&[7, 3, 12], &honest).unwrap();
+        assert_eq!((w.proved, w.error), (vec![(7, full[7]), (3, full[3])], None));
         assert_eq!(a.hash_at(3), Some(full[3].block_hash()));
+        // A server short of the headers only stops the walk.
+        let mut c = ChainAuthority::on(HeaderChain::from_checkpoint(BNetwork::Regtest, 10, full[10]));
+        let w = c.prove_below(&[2], &fake("short", full[..6].to_vec())).unwrap();
+        assert!(w.proved.is_empty() && w.error.as_deref().is_some_and(|e| e.contains("short")), "{w:?}");
+        assert_eq!(c.hash_at(2), None);
         // A server whose old header doesn't hash into the chain above is refused.
         let mut lie = full.clone();
         lie[5].nonce ^= 1;

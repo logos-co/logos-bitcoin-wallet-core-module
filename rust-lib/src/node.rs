@@ -444,6 +444,11 @@ impl Follower {
             match emitter.next_block().map_err(|e| format!("node: {e}"))? {
                 Some(ev) => {
                     let (height, hash) = (ev.block_height(), ev.block_hash());
+                    // The emitter names the hash it asked for: the block must be that one, whole.
+                    if ev.block.block_hash() != hash || !ev.block.check_merkle_root() {
+                        self.emitter = None;
+                        return Err(format!("block {hash} at {height} doesn't match its header"));
+                    }
                     if authority.hash_at(height) != Some(hash) {
                         // The node moved past the headers just taken: the next poll takes them.
                         ahead = true;

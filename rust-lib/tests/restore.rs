@@ -12,7 +12,7 @@ use bitcoin_wallet_core::engine::Engine;
 use bitcoin_wallet_core::network::{configure_regtest, RegtestCheckpoint, RegtestConfig};
 use bitcoin_wallet_core::routes::Routes;
 use common::history::*;
-use common::{chain, collecting, MockManager, ModuleRpc, T};
+use common::{chain, collecting, http_front, MockManager, ModuleRpc, T};
 use serde_json::json;
 
 #[test]
@@ -89,7 +89,7 @@ fn restores_match_cores_wallet() {
 
     // Through a front that serves no headers nothing links them: unchecked, at their own height,
     // named by the server that reported them, and an alert says so.
-    let front = headerless_front(esplora_port);
+    let front = http_front(esplora_port, Arc::new(|path, body| (body.is_none() && path.starts_with("/block/") && path.ends_with("/header")).then(|| (404, vec![]))));
     let (u, _dir) = restore(&t, esplora_routes(&electrum, &format!("http://127.0.0.1:{front}")), checkpoint + 1, None);
     above_the_checkpoint(&u, &h, checkpoint, "unchecked");
     assert!(u.alerts("unchecked_anchor", "esplora-0") >= 1, "an alert names the unchecked transactions");
@@ -120,51 +120,4 @@ fn above_the_checkpoint(r: &T, h: &History, checkpoint: u32, below: &str) {
         }
     }
     println!("RESTORE esplora above the checkpoint: {} {below} below {checkpoint}", got.values().filter(|r| r["height"].as_u64().is_some_and(|x| x < checkpoint as u64)).count());
-}
-
-/// Esplora's HTTP API on loopback, but every `/block/<hash>/header` answered 404: one request a
-/// connection, forwarded with `Connection: close`.
-fn headerless_front(upstream: u16) -> u16 {
-    use std::io::{BufRead, BufReader, Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for client in listener.incoming().flatten() {
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(client.try_clone().unwrap());
-                let (mut head, mut line, mut length) = (String::new(), String::new(), 0usize);
-                while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = v.trim().parse().unwrap_or(0);
-                    }
-                    if !line.to_ascii_lowercase().starts_with("connection:") {
-                        head.push_str(&line);
-                    }
-                    line.clear();
-                }
-                let mut body = vec![0u8; length];
-                if reader.read_exact(&mut body).is_err() {
-                    return;
-                }
-                let mut out = client;
-                let path = head.split_whitespace().nth(1).unwrap_or_default();
-                if path.starts_with("/block/") && path.ends_with("/header") {
-                    let _ = out.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                    return;
-                }
-                let Ok(mut up) = std::net::TcpStream::connect(("127.0.0.1", upstream)) else { return };
-                let mut request = head.into_bytes();
-                request.extend_from_slice(b"Connection: close\r\n\r\n");
-                request.extend_from_slice(&body);
-                let mut reply = vec![];
-                if up.write_all(&request).is_ok() && up.read_to_end(&mut reply).is_ok() {
-                    let _ = out.write_all(&reply);
-                }
-            });
-        }
-    });
-    port
 }

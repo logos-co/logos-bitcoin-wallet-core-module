@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bdk_electrum::electrum_client::ElectrumApi;
+use bdk_electrum::electrum_client::{ElectrumApi, GetMerkleRes};
 use bdk_electrum::BdkElectrumClient;
 use bdk_esplora::EsploraAsyncExt;
 use bdk_wallet::chain::keychain_txout::{FullScanRequestBuilderExt, SyncRequestBuilderExt};
@@ -58,6 +58,20 @@ pub trait RouteSource: Send + Sync {
 
 /// Headers a sync may fetch from Esplora, one request each, to link old anchors to the chain.
 const ESPLORA_LINK_BUDGET: u32 = 144;
+
+/// What checking a reported confirmation against a header came to.
+enum Inclusion {
+    Proved,
+    /// The source's own answers contradict the header: it lied.
+    Lied(String),
+    /// Nothing to check it with yet: a request failed.
+    Unknown(String),
+}
+
+/// Kyoto and the node find transactions in blocks checked against their headers as they come.
+fn block_checked(source: &str) -> bool {
+    source == KYOTO || source == LOCAL_NODE
+}
 
 /// How long a regtest open or reload waits for the node module's routes before taking
 /// `regtest.json`'s: an unloaded module would hold it for the whole IPC budget.
@@ -1233,7 +1247,8 @@ impl Loop {
         self.alert(source, "unchecked_anchor", detail);
     }
 
-    /// Restates BDK's chain on the authority's and applies held anchors it now covers.
+    /// Restates BDK's chain on the authority's and applies the held anchors it now covers that
+    /// Kyoto or the node found; a server's wait for its next answer, whose proof is checked.
     fn move_chain(&mut self) {
         let mut guard = self.ctx.cell.lock();
         let Some(cell) = guard.as_mut() else { return };
@@ -1244,12 +1259,10 @@ impl Loop {
         let mut ready = TxUpdate::<ConfirmationBlockTime>::default();
         let mut wanted = BTreeSet::new();
         let mut dropped = vec![];
-        let base = self.authority.base_height();
         for h in &held {
             match checks::judge_anchor(&self.authority, h.anchor.block_id.height, h.anchor.block_id.hash) {
-                // Below the chain's start a hash proves the block, not the transaction in it: the
-                // source's next sync checks its proof.
-                checks::AnchorVerdict::Keep if h.anchor.block_id.height < base => {}
+                // A block hash proves the block, not the transaction in it.
+                checks::AnchorVerdict::Keep if !block_checked(&h.source) => {}
                 checks::AnchorVerdict::Keep => {
                     ready.anchors.insert((h.anchor, h.txid));
                     wanted.insert(h.anchor.block_id.height);
@@ -1280,19 +1293,80 @@ impl Loop {
         }
     }
 
-    /// The block's Merkle depth, from a coinbase proof checked against the authority's header.
-    fn depth_electrum(&mut self, id: &str, height: u32, hash: BlockHash) -> Result<usize, String> {
+    /// The block's Merkle depth, from a coinbase proof checked against its header.
+    fn depth_electrum(&mut self, id: &str, height: u32, hash: BlockHash, header: &Header) -> Result<usize, Inclusion> {
         if let Some(d) = self.depths.get(&hash) {
             return Ok(*d);
         }
-        let header = self.authority.header_at(height).ok_or("no authority header at that height")?;
-        let c = self.clients.get(id).ok_or("no client")?;
-        let (coinbase, branch) = coinbase_proof(&c.inner.inner, height)?;
+        let c = self.clients.get(id).ok_or_else(|| Inclusion::Unknown("no client".into()))?;
+        let (coinbase, branch) = coinbase_proof(&c.inner.inner, height).map_err(|e| Inclusion::Unknown(format!("coinbase proof: {}", net::redact(&e))))?;
         if checks::merkle_root(coinbase, 0, &checks::electrum_branch(&branch)) != header.merkle_root.to_byte_array() {
-            return Err(format!("the coinbase proof at {height} doesn't reach the block's merkle root"));
+            return Err(Inclusion::Lied(format!("the coinbase proof at {height} doesn't reach the block's merkle root")));
         }
         self.depths.insert(hash, branch.len());
         Ok(branch.len())
+    }
+
+    /// Whether `txid` is in the block `a` names, by `src`'s Merkle proof against `header`: the
+    /// authority's, or one linked below the chain's start. Without one, `src`'s header for the
+    /// block, which must hash as `a` names it, a hash `judge_anchor` found on the chain.
+    fn inclusion(&mut self, src: &Source, txid: Txid, a: ConfirmationBlockTime, header: Option<Header>, proofs: &HashMap<(Txid, usize), GetMerkleRes>) -> Result<Inclusion, String> {
+        let (height, hash) = (a.block_id.height, a.block_id.hash);
+        let unknown = |what: &str, e: String| Inclusion::Unknown(format!("{what} at {height}: {}", net::redact(&e)));
+        let lied_header = |h: &Header| Inclusion::Lied(format!("its header at {height} hashes to {}", h.block_hash()));
+        let checked = |v: ProofVerdict| if v == ProofVerdict::Valid { Inclusion::Proved } else { Inclusion::Lied(format!("{v:?}")) };
+        match src.kind {
+            Kind::Electrum => {
+                let (header, proof) = {
+                    let c = self.electrum(src)?;
+                    let header = match header {
+                        Some(h) => h,
+                        None => match c.inner.inner.block_header(height as usize) {
+                            Ok(h) if h.block_hash() == hash => h,
+                            Ok(h) => return Ok(lied_header(&h)),
+                            Err(e) => return Ok(unknown("header", e.to_string())),
+                        },
+                    };
+                    let proof = match proofs.get(&(txid, height as usize)) {
+                        Some(p) => p.clone(),
+                        None => match c.inner.inner.transaction_get_merkle(&txid, height as usize) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(unknown("proof", e.to_string())),
+                        },
+                    };
+                    (header, proof)
+                };
+                let depth = match self.depth_electrum(&src.id, height, hash, &header) {
+                    Ok(d) => d,
+                    Err(i) => return Ok(i),
+                };
+                Ok(checked(checks::check_proof(txid, proof.pos, &checks::electrum_branch(&proof.merkle), &header, depth)))
+            }
+            Kind::Esplora => {
+                let c = self.esplora(src)?.clone();
+                let rt = self.ctx.rt.clone();
+                let header = match header {
+                    Some(h) => h,
+                    None => match rt.block_on(c.get_header_by_hash(&hash)) {
+                        Ok(h) if h.block_hash() == hash => h,
+                        Ok(h) => return Ok(lied_header(&h)),
+                        Err(e) => return Ok(unknown("header", e.to_string())),
+                    },
+                };
+                let proof = match rt.block_on(c.get_merkle_proof(&txid)) {
+                    Ok(Some(p)) if p.block_height == height => p,
+                    Ok(Some(p)) => return Ok(Inclusion::Lied(format!("its proof is at height {}", p.block_height))),
+                    Ok(None) => return Ok(Inclusion::Lied("no proof for a transaction it says is confirmed".into())),
+                    Err(e) => return Ok(unknown("proof", e.to_string())),
+                };
+                let info = match rt.block_on(c.get_block_info(&hash)) {
+                    Ok(i) => i,
+                    Err(e) => return Ok(unknown("block", e.to_string())),
+                };
+                let branch: Vec<[u8; 32]> = proof.merkle.iter().map(|t| t.to_byte_array()).collect();
+                Ok(checked(checks::check_proof(txid, proof.pos, &branch, &header, checks::tree_depth(info.tx_count))))
+            }
+        }
     }
 
     /// One history sync through the first healthy history server.
@@ -1386,22 +1460,32 @@ impl Loop {
             tracing::info!(target: "bitcoin", "{}: {} anchor(s) in replaced blocks; behind the reorg", src.id, screened.stale.len());
             self.clients.remove(&src.id);
         }
+        // Below the chain's start, whatever fails shows unchecked; a lie also marks the source.
+        // Above it, a held confirmation found false, or proved, is held no longer.
+        let base = self.authority.base_height();
+        let (mut unchecked, mut settled, mut waiting): (Vec<(Txid, ConfirmationBlockTime)>, Vec<_>, Vec<_>) = (vec![], vec![], vec![]);
         for (txid, a) in &screened.dropped {
             let d = format!("{txid} anchored at {} in block {}, which is not on the chain", a.block_id.height, a.block_id.hash);
             self.alert(&src.id, "anchor_mismatch", d.clone());
             self.mark_suspect(&src.id, &d);
+            if a.block_id.height < base { unchecked.push((*txid, *a)) } else { settled.push((*txid, *a)) }
         }
-        // Old anchors: kept once the server's headers link up to the checkpoint. Esplora serves
-        // headers one at a time: a walk down from the chain links them, a budget a sync; the rest
-        // stay held and unchecked until a later sync reaches them.
+        // Old anchors: kept once the server's headers link up to the checkpoint, walking down
+        // from the chain's start or where the last walk stopped: Electrum's headers in ranges,
+        // Esplora's one at a time, a budget a sync. What nothing links yet stays unchecked.
         let mut linked: HashMap<u32, Header> = HashMap::new();
-        let mut unchecked: Vec<(Txid, ConfirmationBlockTime)> = vec![];
-        if !screened.needs_linkage.is_empty() && src.kind == Kind::Esplora {
+        if !screened.needs_linkage.is_empty() {
             let heights: Vec<u32> = screened.needs_linkage.iter().map(|(_, a)| a.block_id.height).collect();
-            let c = self.esplora(&src)?.clone();
-            let rt = self.ctx.rt.clone();
-            let mut header_of = |hash: BlockHash| rt.block_on(c.get_header_by_hash(&hash)).map_err(|e| net::redact(&e.to_string()));
-            match self.authority.prove_below_by_hash(&heights, &mut header_of, ESPLORA_LINK_BUDGET) {
+            let walked = if src.kind == Kind::Esplora {
+                let c = self.esplora(&src)?.clone();
+                let rt = self.ctx.rt.clone();
+                let mut header_of = |hash: BlockHash| rt.block_on(c.get_header_by_hash(&hash)).map_err(|e| net::redact(&e.to_string()));
+                self.authority.prove_below_by_hash(&heights, &mut header_of, ESPLORA_LINK_BUDGET)
+            } else {
+                let c = self.clients.get(&src.id).ok_or("no client")?;
+                self.authority.prove_below(&heights, &ElectrumHeaders { id: &src.id, client: &c.inner })
+            };
+            match walked {
                 Ok(w) => {
                     let keep: Vec<(u32, BlockHash)> = w.proved.iter().map(|(h, hd)| (*h, hd.block_hash())).chain(w.stopped_at).collect();
                     if let Some(cell) = self.ctx.cell.lock().as_ref() {
@@ -1420,96 +1504,37 @@ impl Loop {
                         update.anchors.insert((*a, *txid));
                     }
                     checks::AnchorVerdict::NeedsLinkage => unchecked.push((*txid, *a)),
-                    _ => self.mark_suspect(&src.id, &format!("an old anchor of {txid} isn't on the chain")),
+                    _ => {
+                        self.mark_suspect(&src.id, &format!("an old anchor of {txid} isn't on the chain"));
+                        unchecked.push((*txid, *a));
+                    }
                 }
             }
         }
-        if !screened.needs_linkage.is_empty() && src.kind == Kind::Electrum {
-            let heights: Vec<u32> = screened.needs_linkage.iter().map(|(_, a)| a.block_id.height).collect();
-            let proved = {
-                let c = self.clients.get(&src.id).ok_or("no client")?;
-                let hs = ElectrumHeaders { id: &src.id, client: &c.inner };
-                self.authority.prove_below(&heights, &hs)
-            };
-            match proved {
-                Ok(p) => {
-                    if let Some(cell) = self.ctx.cell.lock().as_ref() {
-                        let _ = cell.store_old(&p);
-                    }
-                    for (txid, a) in &screened.needs_linkage {
-                        match checks::judge_anchor(&self.authority, a.block_id.height, a.block_id.hash) {
-                            checks::AnchorVerdict::Keep => {
-                                update.anchors.insert((*a, *txid));
-                            }
-                            _ => self.mark_suspect(&src.id, &format!("an old anchor of {txid} doesn't link to the checkpoint")),
-                        }
-                    }
-                }
-                Err(e) => self.mark_suspect(&src.id, &format!("old headers don't link: {e}")),
-            }
-        }
-        // Each new anchor's Merkle proof must reach the authority's header, at the block's depth.
+        // Each new anchor's Merkle proof must reach the authority's header, or below the chain's
+        // start the linked one, at the block's depth; one that can't be checked yet stays held.
         let new_anchors: Vec<(ConfirmationBlockTime, Txid)> = {
             let guard = self.ctx.cell.lock();
             let cell = guard.as_ref().ok_or("closed")?;
             update.anchors.iter().filter(|(a, t)| !cell.wallet.tx_graph().get_tx_node(*t).is_some_and(|n| n.anchors.contains(a))).copied().collect()
         };
-        let mut settled: Vec<(Txid, ConfirmationBlockTime)> = vec![];
         for (a, txid) in new_anchors {
-            let height = a.block_id.height;
+            let (height, below) = (a.block_id.height, a.block_id.height < base);
             let header = self.authority.header_at(height).or_else(|| linked.get(&height).copied());
-            let verdict = match src.kind {
-                Kind::Electrum => {
-                    let proof = match proofs.get(&(txid, height as usize)) {
-                        Some(p) => Some(p.clone()),
-                        None => self.clients.get(&src.id).and_then(|c| c.inner.inner.transaction_get_merkle(&txid, height as usize).ok()),
-                    };
-                    match (proof, header) {
-                        (Some(p), Some(h)) => match self.depth_electrum(&src.id, height, a.block_id.hash) {
-                            Ok(d) => checks::check_proof(txid, p.pos, &checks::electrum_branch(&p.merkle), &h, d),
-                            Err(e) => {
-                                tracing::info!(target: "bitcoin", "depth at {height}: {e}");
-                                ProofVerdict::WrongRoot
-                            }
-                        },
-                        // Below the checkpoint the header isn't held; linkage proved the hash.
-                        (Some(_), None) => ProofVerdict::Valid,
-                        (None, _) => ProofVerdict::WrongRoot,
-                    }
+            match self.inclusion(&src, txid, a, header, &proofs)? {
+                Inclusion::Proved => settled.push((txid, a)),
+                Inclusion::Unknown(why) => {
+                    tracing::info!(target: "bitcoin", "{}: {txid} at {height} not checked yet: {why}", src.id);
+                    update.anchors.remove(&(a, txid));
+                    if below { unchecked.push((txid, a)) } else { waiting.push((txid, a)) }
                 }
-                Kind::Esplora => {
-                    let c = self.esplora(&src)?.clone();
-                    let rt = self.ctx.rt.clone();
-                    // Below the chain's start, a proven hash: its header proves the transaction in it.
-                    let header = match header {
-                        Some(h) => h,
-                        None => match rt.block_on(c.get_header_by_hash(&a.block_id.hash)) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                tracing::info!(target: "bitcoin", "{}: no header for {height}: {}", src.id, net::redact(&e.to_string()));
-                                update.anchors.remove(&(a, txid));
-                                unchecked.push((txid, a));
-                                continue;
-                            }
-                        },
-                    };
-                    let proof = rt.block_on(c.get_merkle_proof(&txid)).ok().flatten();
-                    let info = rt.block_on(c.get_block_info(&a.block_id.hash)).ok();
-                    match (proof, info) {
-                        (Some(p), Some(i)) if p.block_height == height && header.block_hash() == a.block_id.hash => {
-                            let branch: Vec<[u8; 32]> = p.merkle.iter().map(|t| t.to_byte_array()).collect();
-                            checks::check_proof(txid, p.pos, &branch, &header, checks::tree_depth(i.tx_count))
-                        }
-                        _ => ProofVerdict::WrongRoot,
-                    }
+                Inclusion::Lied(why) => {
+                    update.anchors.remove(&(a, txid));
+                    let d = format!("the proof for {txid} at {height} fails: {why}");
+                    self.alert(&src.id, "anchor_mismatch", d.clone());
+                    self.mark_suspect(&src.id, &d);
+                    if below { unchecked.push((txid, a)) } else { settled.push((txid, a)) }
                 }
-            };
-            settled.push((txid, a));
-            if verdict != ProofVerdict::Valid {
-                update.anchors.remove(&(a, txid));
-                let d = format!("the proof for {txid} at {height} fails: {verdict:?}");
-                self.alert(&src.id, "anchor_mismatch", d.clone());
-                self.mark_suspect(&src.id, &d);
             }
         }
         if !unchecked.is_empty() {
@@ -1520,10 +1545,9 @@ impl Loop {
         {
             let mut guard = self.ctx.cell.lock();
             let cell = guard.as_mut().ok_or("closed")?;
-            for (txid, a) in &screened.held {
+            for (txid, a) in screened.held.iter().chain(&waiting) {
                 let _ = cell.hold(&Held { txid: *txid, anchor: *a, source: src.id.clone() });
             }
-            // A held confirmation whose proof was checked now, either way, is held no longer.
             for (txid, a) in &settled {
                 let _ = cell.unhold(&Held { txid: *txid, anchor: *a, source: src.id.clone() });
             }

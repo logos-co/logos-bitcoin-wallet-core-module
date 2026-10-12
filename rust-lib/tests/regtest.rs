@@ -3,9 +3,7 @@
 
 mod common;
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +11,7 @@ use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::Transaction;
 use bitcoin_wallet_core::engine::Engine;
 use bitcoin_wallet_core::network::{configure_regtest, RegtestConfig};
-use common::{chain, collecting, MockManager, T};
+use common::{chain, collecting, electrum_proxy, MockManager, T};
 use serde_json::{json, Value};
 
 // ── A doctoring proxy in front of electrs ────────────────────────────────
@@ -51,47 +49,6 @@ fn doctor_line(doctor: &Mutex<Doctor>, method: &str, params: &Value, mut reply: 
     reply
 }
 
-fn proxy(upstream: SocketAddr, doctor: Arc<Mutex<Doctor>>) -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for client in l.incoming().flatten() {
-            let Ok(up) = TcpStream::connect(upstream) else { continue };
-            let asked: Arc<Mutex<HashMap<u64, (String, Value)>>> = Arc::default();
-            let (mut c_w, mut u_w) = (client.try_clone().unwrap(), up.try_clone().unwrap());
-            let a2 = asked.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(client).lines().map_while(Result::ok) {
-                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                        if let (Some(id), Some(m)) = (v["id"].as_u64(), v["method"].as_str()) {
-                            a2.lock().unwrap().insert(id, (m.to_string(), v["params"].clone()));
-                        }
-                    }
-                    if u_w.write_all(format!("{line}\n").as_bytes()).is_err() {
-                        break;
-                    }
-                }
-            });
-            let d = doctor.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(up).lines().map_while(Result::ok) {
-                    let out = match serde_json::from_str::<Value>(&line) {
-                        Ok(v) => match v["id"].as_u64().and_then(|id| asked.lock().unwrap().remove(&id)) {
-                            Some((m, p)) => doctor_line(&d, &m, &p, v).to_string(),
-                            None => line,
-                        },
-                        Err(_) => line,
-                    };
-                    if c_w.write_all(format!("{out}\n").as_bytes()).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
 #[test]
 #[ignore]
 fn bitcoin_wallet_on_regtest() {
@@ -102,7 +59,8 @@ fn bitcoin_wallet_on_regtest() {
     };
     let servers: Vec<SocketAddr> = std::env::var("REGTEST_ELECTRUM").expect("REGTEST_ELECTRUM").split(',').map(|s| s.trim().trim_start_matches("tcp://").parse().unwrap()).collect();
     let doctor: Arc<Mutex<Doctor>> = Arc::default();
-    let via_proxy = proxy(servers[0], doctor.clone());
+    let d = doctor.clone();
+    let via_proxy = electrum_proxy(servers[0], Arc::new(move |m, p, v| Some(doctor_line(&d, m, p, v))));
     // The proxy is first: it holds the history until it lies, then the honest electrs takes over.
     configure_regtest(RegtestConfig { electrum: vec![format!("tcp://{via_proxy}"), format!("tcp://{}", servers[1])], poll_secs: Some(1), ..Default::default() });
     let (sink, events) = collecting();

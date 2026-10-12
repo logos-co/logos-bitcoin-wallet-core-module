@@ -84,6 +84,10 @@ required-features = ["test-hooks"]
 name = "widen"
 required-features = ["test-hooks"]
 
+[[test]]
+name = "anchors"
+required-features = ["test-hooks"]
+
 # bip157 0.7.0 as published plus patches/bip157, held to an allowlist (tools/kyoto, README).
 [patch.crates-io]
 bip157 = { path = "vendor/bip157" }
