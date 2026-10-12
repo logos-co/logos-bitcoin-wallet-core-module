@@ -82,6 +82,16 @@ pub trait Authority: ChainView + Send {
     fn chain(&self) -> &HeaderChain;
 }
 
+/// What a walk below the chain's start proved: the headers at the heights asked for, and where
+/// it stopped short of the lowest, if the budget ran out first.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Walked {
+    pub proved: Vec<(u32, Header)>,
+    pub stopped_at: Option<(u32, BlockHash)>,
+    /// Why a fetch failed, which stopped the walk.
+    pub error: Option<String>,
+}
+
 /// Blocks a reorg replaced, remembered so a server that lags it isn't taken for a liar.
 const REPLACED_KEPT: usize = 512;
 
@@ -159,6 +169,56 @@ impl ChainAuthority {
         }
         change.tip_moved = self.chain.tip_hash() != before;
         change
+    }
+
+    /// Proves blocks below the chain's start, walking down from the nearest known hash above them
+    /// a header at a time (`header_of`, by hash, as Esplora serves them), each checked to hash as
+    /// its child names it; at most `budget` a call, the next going on from where it stopped. A
+    /// header that hashes otherwise is an error; a failed fetch only stops the walk.
+    pub fn prove_below_by_hash(&mut self, heights: &[u32], header_of: &mut dyn FnMut(BlockHash) -> Result<Header, String>, budget: u32) -> Result<Walked, String> {
+        let base = self.chain.base();
+        let wanted: BTreeSet<u32> = heights.iter().copied().filter(|h| *h < base && !self.old.contains_key(h)).collect();
+        let (Some(&lowest), Some(&highest)) = (wanted.first(), wanted.last()) else { return Ok(Walked::default()) };
+        // A proven hash at `at`; its header, held at the chain's start, else fetched, names the next.
+        let (mut at, mut hash) = match self.old.range(highest + 1..).next() {
+            Some((h, hash)) => (*h, *hash),
+            None => (base, self.chain.hash_at(base).expect("the checkpoint")),
+        };
+        let (mut walked, mut spent) = (Walked::default(), 0u32);
+        loop {
+            let header = match self.chain.header_at(at).filter(|_| at == base) {
+                Some(h) => *h,
+                None if spent == budget => {
+                    self.old.insert(at, hash);
+                    walked.stopped_at = Some((at, hash));
+                    break;
+                }
+                None => match header_of(hash) {
+                    Ok(h) if h.block_hash() == hash => {
+                        spent += 1;
+                        h
+                    }
+                    Ok(h) => return Err(format!("the header for {hash} at {at} hashes to {}", h.block_hash())),
+                    Err(e) => {
+                        self.old.insert(at, hash);
+                        (walked.stopped_at, walked.error) = (Some((at, hash)), Some(e));
+                        break;
+                    }
+                },
+            };
+            if wanted.contains(&at) {
+                self.old.insert(at, hash);
+                walked.proved.push((at, header));
+            }
+            if at == lowest {
+                break;
+            }
+            (at, hash) = (at - 1, header.prev_blockhash);
+            if self.old.get(&at).is_some_and(|known| *known != hash) {
+                return Err(format!("the chain below {at} doesn't link to the one proved before"));
+            }
+        }
+        Ok(walked)
     }
 
     /// A height below the checkpoint, named by Kyoto from its own start or proved by linkage.
@@ -430,6 +490,36 @@ mod tests {
         a.refresh(&[&full], NOW);
         assert_eq!(crate::checks::judge_anchor(&a, 7, honest[7].block_hash()), crate::checks::AnchorVerdict::Keep);
         assert_eq!(crate::checks::judge_anchor(&a, 7, honest[8].block_hash()), crate::checks::AnchorVerdict::Drop);
+    }
+
+    #[test]
+    fn old_blocks_link_to_the_chain_header_by_header_within_a_budget() {
+        let honest = chain_of(40, 1);
+        let by_hash: std::collections::HashMap<BlockHash, Header> = honest.iter().map(|h| (h.block_hash(), *h)).collect();
+        let at = |h: usize| crate::network::Checkpoint { height: h as u32, header: honest[h] };
+        let mut a = ChainAuthority::restore(BNetwork::Regtest, at(30), (31..=40).map(|h| (h as u32, honest[h])).collect(), vec![], NOW);
+        let mut asked = 0;
+        let mut serve = |hash: BlockHash| {
+            asked += 1;
+            by_hash.get(&hash).copied().ok_or_else(|| "404".to_string())
+        };
+        // Five headers a call: 29 to 25, then 24 to 20, then the rest down to 10.
+        let w = a.prove_below_by_hash(&[10, 20], &mut serve, 5).unwrap();
+        assert_eq!((w.proved.len(), w.stopped_at), (0, Some((24, honest[24].block_hash()))));
+        let w = a.prove_below_by_hash(&[10, 20], &mut serve, 5).unwrap();
+        assert_eq!(w.proved, vec![(20, honest[20])]);
+        let w = a.prove_below_by_hash(&[10, 20], &mut serve, 20).unwrap();
+        assert_eq!((w.proved, w.stopped_at), (vec![(10, honest[10])], None));
+        assert_eq!(asked, 20, "each header fetched once");
+        assert_eq!(crate::checks::judge_anchor(&a, 10, honest[10].block_hash()), crate::checks::AnchorVerdict::Keep);
+        assert_eq!(crate::checks::judge_anchor(&a, 10, honest[11].block_hash()), crate::checks::AnchorVerdict::Drop);
+        // A server that answers with another block's header is caught; one that fails only stops.
+        let mut lying = |_: BlockHash| Ok(honest[3]);
+        assert!(a.prove_below_by_hash(&[5], &mut lying, 10).is_err());
+        let mut failing = |_: BlockHash| Err("timed out".to_string());
+        let w = a.prove_below_by_hash(&[5], &mut failing, 10).unwrap();
+        assert_eq!((w.proved.len(), w.error.as_deref()), (0, Some("timed out")));
+        assert_eq!(crate::checks::judge_anchor(&a, 5, honest[5].block_hash()), crate::checks::AnchorVerdict::NeedsLinkage, "unchecked");
     }
 
     #[test]

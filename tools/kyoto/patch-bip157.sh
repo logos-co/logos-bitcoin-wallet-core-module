@@ -11,7 +11,8 @@ patches=$(cd "${3:-$(dirname "$0")/../../patches/bip157}" && pwd)
 # The files our patches may touch, each for a reason; a patch touching any other file fails
 # the build until it is added here (README, "Kyoto patches").
 allowed=(
-  src/chain/chain.rs      # 1, 2: the filter-header vote
+  src/chain/chain.rs      # 1, 2: the filter-header vote; 5: a rescan keeps the filter headers
+  src/chain/graph.rs      # 5: the filter state a rescan resets
   src/chain/mod.rs        # 1: one vote per peer
   src/network/peer.rs     # 1, 3: unsolicited cfheaders, the batch deadline
   src/network/mod.rs      # 3: the batch deadline setting

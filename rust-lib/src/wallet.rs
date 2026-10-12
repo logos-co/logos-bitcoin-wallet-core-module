@@ -709,7 +709,7 @@ mod tests {
         u.seen_ats.insert((spend.compute_txid(), 2));
         let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
-        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
         let record = SendRecord { txid: spend.compute_txid(), tx: spend.clone(), inputs: vec![coin], state: "sent".into(), created: 2, replaces: None, via: Some("kyoto".into()), broadcast: Some("unknown".into()) };
         cell.store_send(&record).unwrap();
         let h = cell.history(0, 50, &[]).unwrap();

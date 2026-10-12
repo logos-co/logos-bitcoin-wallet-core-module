@@ -2,6 +2,9 @@
 //! drives the engine against tools/regtest/chain.sh's chain.
 #![allow(dead_code)]
 
+#[cfg(feature = "test-hooks")]
+pub mod history;
+
 use std::collections::HashMap;
 use std::process::Command;
 use std::str::FromStr;

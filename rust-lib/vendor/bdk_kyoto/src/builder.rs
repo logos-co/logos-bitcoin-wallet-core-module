@@ -67,6 +67,16 @@ pub trait BuilderExt {
         sync_config: SyncConfig<P>,
     ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError>;
 
+    /// As [`build_with_wallet`](BuilderExt::build_with_wallet), but the node starts from
+    /// `chain_state`, such as a snapshot of headers the caller already holds and checked, instead
+    /// of the policy's checkpoint, so it downloads none of them again.
+    fn build_with_wallet_from<P: SyncPolicyType>(
+        self,
+        wallet: &Wallet,
+        sync_config: SyncConfig<P>,
+        chain_state: ChainState,
+    ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError>;
+
     /// Attempt to build the node with scripts from multiple [`Wallet`]s and following a [`SyncConfig`].
     ///
     /// Only [`SyncFromLastCheckpoint`] configs are permitted. New and recovering wallets
@@ -79,53 +89,20 @@ pub trait BuilderExt {
 
 impl BuilderExt for Builder {
     fn build_with_wallet<P: SyncPolicyType>(
-        mut self,
+        self,
         wallet: &Wallet,
         sync_config: SyncConfig<P>,
     ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
-        let network = wallet.network();
-        if self.network().ne(&network) {
-            return Err(BuilderError::NetworkMismatch);
-        }
-        match sync_config.0 {
-            SyncPolicy::NewWallet => {
-                self = self
-                    .chain_state(ChainState::Checkpoint(new_wallet_anchor(network)))
-                    .headers_only_sync();
-            }
-            SyncPolicy::SyncFromLast { lookahead: _ } => {
-                let sync_start = walk_back_max_reorg(wallet.latest_checkpoint());
-                self = self.chain_state(ChainState::Checkpoint(sync_start));
-            }
-            SyncPolicy::Recovery { cp, .. } => {
-                self = self.chain_state(ChainState::Checkpoint(cp));
-            }
-        }
-        let (node, client) = self.build();
-        let bip157::Client {
-            requester,
-            info_rx,
-            warn_rx,
-            event_rx,
-        } = client;
-        let indexed_graph = IndexedTxGraph::new(wallet.spk_index().clone());
-        let update_subscriber = UpdateSubscriber::<crate::wallets::Single>::new(
-            requester.clone(),
-            sync_config.0,
-            event_rx,
-            wallet.latest_checkpoint(),
-            indexed_graph,
-        );
-        let client = LightClient::new(
-            requester,
-            LoggingSubscribers {
-                info_subscriber: info_rx,
-                warning_subscriber: warn_rx,
-            },
-            update_subscriber,
-            node,
-        );
-        Ok(client)
+        build_single(self, wallet, sync_config, None)
+    }
+
+    fn build_with_wallet_from<P: SyncPolicyType>(
+        self,
+        wallet: &Wallet,
+        sync_config: SyncConfig<P>,
+        chain_state: ChainState,
+    ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
+        build_single(self, wallet, sync_config, Some(chain_state))
     }
 
     fn build_with_wallets(
@@ -187,6 +164,60 @@ impl BuilderExt for Builder {
         );
         Ok(client)
     }
+}
+
+fn build_single<P: SyncPolicyType>(
+    mut builder: Builder,
+    wallet: &Wallet,
+    sync_config: SyncConfig<P>,
+    chain_state: Option<ChainState>,
+) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
+    let network = wallet.network();
+    if builder.network().ne(&network) {
+        return Err(BuilderError::NetworkMismatch);
+    }
+    match (sync_config.0, chain_state) {
+        (_, Some(state)) => {
+            builder = builder.chain_state(state);
+        }
+        (SyncPolicy::NewWallet, None) => {
+            builder = builder
+                .chain_state(ChainState::Checkpoint(new_wallet_anchor(network)))
+                .headers_only_sync();
+        }
+        (SyncPolicy::SyncFromLast { lookahead: _ }, None) => {
+            let sync_start = walk_back_max_reorg(wallet.latest_checkpoint());
+            builder = builder.chain_state(ChainState::Checkpoint(sync_start));
+        }
+        (SyncPolicy::Recovery { cp, .. }, None) => {
+            builder = builder.chain_state(ChainState::Checkpoint(cp));
+        }
+    }
+    let (node, client) = builder.build();
+    let bip157::Client {
+        requester,
+        info_rx,
+        warn_rx,
+        event_rx,
+    } = client;
+    let indexed_graph = IndexedTxGraph::new(wallet.spk_index().clone());
+    let update_subscriber = UpdateSubscriber::<crate::wallets::Single>::new(
+        requester.clone(),
+        sync_config.0,
+        event_rx,
+        wallet.latest_checkpoint(),
+        indexed_graph,
+    );
+    let client = LightClient::new(
+        requester,
+        LoggingSubscribers {
+            info_subscriber: info_rx,
+            warning_subscriber: warn_rx,
+        },
+        update_subscriber,
+        node,
+    );
+    Ok(client)
 }
 
 fn new_wallet_anchor(network: Network) -> HashCheckpoint {

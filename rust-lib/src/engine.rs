@@ -187,6 +187,10 @@ pub struct Engine {
     /// Routes for regtest opens in place of regtest.json's; tests only.
     #[cfg(any(test, feature = "test-hooks"))]
     test_routes: Mutex<Option<Routes>>,
+    /// Kyoto widens by a new client, as before widening in place; set by tests only.
+    widen_by_restart: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    on_widen: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
@@ -274,6 +278,9 @@ impl Engine {
             closed: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             test_routes: Mutex::new(None),
+            widen_by_restart: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            on_widen: Mutex::new(None),
         });
         let weak = Arc::downgrade(&engine);
         let q = engine.queue.clone();
@@ -559,6 +566,11 @@ impl Engine {
             rt: self.rt_handle.clone(),
             routes_src: self.routes_src.clone(),
             node_src: self.node_src.get().cloned(),
+            widen_by_restart: self.widen_by_restart.load(Ordering::SeqCst),
+            #[cfg(any(test, feature = "test-hooks"))]
+            on_widen: self.on_widen.lock().clone(),
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            on_widen: None,
         };
         let thread = sync::spawn(ctx, authority).map_err(|e| e.to_string())?;
         let result = json!({
@@ -1132,6 +1144,20 @@ impl Engine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_regtest_routes(&self, routes: Routes) {
         *self.test_routes.lock() = Some(routes);
+    }
+
+    /// The next opens widen Kyoto's scan by a new client from the birthday, the old way, to
+    /// compare against widening in place; tests only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_widen_by_restart(&self, on: bool) {
+        self.widen_by_restart.store(on, Ordering::SeqCst);
+    }
+
+    /// Called at each widening of a scan from the birthday, before the wider scan starts; tests
+    /// only, to measure each pass.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_on_widen(&self, f: Arc<dyn Fn() + Send + Sync>) {
+        *self.on_widen.lock() = Some(f);
     }
 
     /// Reveals `n` receive addresses at once, as a scan elsewhere might; tests only.

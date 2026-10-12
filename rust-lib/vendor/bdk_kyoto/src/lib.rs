@@ -35,6 +35,7 @@
 #![warn(missing_docs)]
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use bdk_wallet::chain::BlockId;
 use bdk_wallet::chain::CheckPoint;
@@ -263,6 +264,8 @@ pub struct UpdateSubscriber<W: Wallets> {
     // filters checked since the last update, and how many make an update before the tip
     filters_since: u32,
     checkpoint_every: Option<u32>,
+    // the last index to watch per keychain, asked for while running, taken before the next event
+    widen: Arc<Mutex<BTreeMap<KeychainKind, u32>>>,
     // processes events for the wallet.
     single_update_builder: Option<UpdateBuilder>,
     // process events for multiple wallets.
@@ -292,6 +295,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
             synced: false,
             filters_since: 0,
             checkpoint_every: None,
+            widen: Arc::default(),
             _marker: core::marker::PhantomData,
         }
     }
@@ -327,12 +331,14 @@ impl<W: Wallets> UpdateSubscriber<W> {
             synced: false,
             filters_since: 0,
             checkpoint_every: None,
+            widen: Arc::default(),
             _marker: core::marker::PhantomData,
         }
     }
 
     async fn sync(&mut self) -> Result<(), UpdateError> {
         while let Some(message) = self.receiver.recv().await {
+            self.apply_widen();
             match message {
                 Event::IndexedFilter(filter) => {
                     let block_hash = filter.block_hash();
@@ -386,6 +392,32 @@ impl<W: Wallets> UpdateSubscriber<W> {
     /// The height of the last filter checked against the wallet's scripts, as of the last update.
     pub fn scanned(&self) -> Option<u32> {
         self.scanned
+    }
+
+    /// A handle to widen the scripts filters are checked against while the node runs: insert
+    /// the last index to watch per keychain, such as one the wallet revealed since the node was
+    /// built, then rescan if earlier blocks matter (`Requester::rescan_from`). It is taken
+    /// before the next event.
+    pub fn widen_handle(&self) -> Arc<Mutex<BTreeMap<KeychainKind, u32>>> {
+        self.widen.clone()
+    }
+
+    fn apply_widen(&mut self) {
+        let targets = match self.widen.lock() {
+            Ok(mut w) => std::mem::take(&mut *w),
+            Err(_) => return,
+        };
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(single) = self.single_update_builder.as_mut() {
+            self.spk_cache.extend(single.watch_to(&targets));
+        }
+        if let Some(multiple) = self.multiple_updates_builder.as_mut() {
+            for builder in multiple.values_mut() {
+                self.spk_cache.extend(builder.watch_to(&targets));
+            }
+        }
     }
 
     /// Whether the last update came with filters synced to the tip, not at a checkpoint.
@@ -515,6 +547,18 @@ impl UpdateBuilder {
                 let _ = self.graph.index.lookahead_to_target(keychain, top);
             }
         }
+    }
+
+    // Indexes each keychain's scripts through its target, and returns them all from index 0.
+    fn watch_to(&mut self, targets: &BTreeMap<KeychainKind, u32>) -> HashSet<ScriptBuf> {
+        let mut scripts = HashSet::new();
+        for (keychain, top) in targets {
+            let _ = self.graph.index.lookahead_to_target(*keychain, *top);
+            if let Some(spks) = self.graph.index.unbounded_spk_iter(*keychain) {
+                scripts.extend(spks.take(*top as usize + 1).map(|(_, script)| script));
+            }
+        }
+        scripts
     }
 
     fn apply_block_event(&mut self, block: &IndexedBlock) {

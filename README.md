@@ -64,9 +64,11 @@ header }`) for the tests. Every header passes the same checks wherever it comes 
 - BDK's local chain is restated only from it (`authority::chain_update`): every height BDK holds
   from the top down to the first that agrees, the anchor heights, and the tip;
 - heights below the chain's start count once a server's headers link up to a known hash, or when
-  Kyoto names them. Esplora has no header ranges to link with: what it reports there is held, shown
-  `unchecked`, and named in a `sourceAlert` (`unchecked_anchor`), never dropped; an earlier
-  birthday then checks it.
+  Kyoto names them. Esplora serves headers one at a time, by hash: a walk down from the chain's
+  start, or from where the last walk stopped, fetches each and checks it hashes as its child names
+  it, at most 144 a sync. What it reports below the walk's reach is held, shown `unchecked`, and
+  named in a `sourceAlert` (`unchecked_anchor`), never dropped, until a later sync's walk or an
+  earlier birthday checks it.
 
 The authority changes as the route table and the node's state change; the header chain carries
 over, and `status.authority.kind` says which feeds it: `local_node`, `kyoto` or `electrum_headers`.
@@ -114,7 +116,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.0 with three patches on bip157 0.7.0 (published from 0169dc3) with four, below
+bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with five, below
 (`kyoto.rs`):
 
 - Peers come from the route table's `peers`: every peer the node module's verified peer list
@@ -135,13 +137,16 @@ bdk_kyoto 0.18.0 with three patches on bip157 0.7.0 (published from 0169dc3) wit
 - When Kyoto runs out of peers (`NoReachablePeers`) it restarts on a fresh subset: after 2 s when the
   run got somewhere, else backing off up to 2 minutes.
 - bdk_kyoto copies the wallet's address index when the client is built, so it watches the revealed
-  addresses plus 25, or more after a rescan. When the wallet reveals past those, the client is
-  rebuilt. Matched blocks are applied in height order (patch 1), so a spend meets its coin.
+  addresses plus 25, or more after a rescan. When the wallet reveals past those, the running client
+  watches them from its next filter on (bdk_kyoto patch 4; `status.kyoto.rebuilds` counts these).
+  Matched blocks are applied in height order (patch 1), so a spend meets its coin.
 - A scan from the birthday keeps the fewest indices any of its clients watched (`kyoto_window`).
   When it reaches the tip and the wallet used an address within the gap limit (20) of them, earlier
   blocks may pay addresses it never watched: it scans again from the birthday, watching about twice
   the highest used index (patch 3 indexes every one), until the window holds
-  (`status.kyoto.rescans`); the regtest restores below, to index 150 out of order, take two. Only
+  (`status.kyoto.rescans`); the regtest restores below, to index 150 out of order, take two. Each
+  pass after the first runs in place: the client keeps its header chain and the filter headers its
+  quorum agreed on (bip157 patch 5) and fetches only the filters again (`widen` below). Only
   used addresses a gap-limit scan reaches count, from index 0 and never past 20 unused in a row:
   the public test phrase also has payments far beyond (testnet4 index 313 after 151), which a
   window happens to hold now and then, and which would otherwise widen it again and again.
@@ -151,7 +156,11 @@ bdk_kyoto 0.18.0 with three patches on bip157 0.7.0 (published from 0169dc3) wit
   chain reaches it; otherwise Kyoto syncs headers from the chain's tip first, taken into the chain
   2,016 or more at a time as they come, so a restart starts from the stored chain, then scans
   filters from the birthday (`rescan_from`). The chain starts at or below the birthday, so Kyoto
-  always starts on it.
+  always starts on it. Kyoto's chain is built from the authority's headers from its start to 8
+  below the tip (`ChainState::Snapshot`, bdk_kyoto patch 4): it downloads only those 8, so a reorg
+  among them shows in its update. While a scan from the birthday runs, a restart holds the headers
+  from the block before the birthday and goes on scanning from where it stopped, so the scan can
+  still start over in place.
 - A filter-header conflict between peers (bip157 can't tell which lies, and disconnects one): the
   peers connected then are skipped for 24 hours and a fresh subset starts at once
   (`status.kyoto.lastConflict: { at, peers }`). bip157's own resolution, fetching the block to
@@ -177,7 +186,7 @@ bdk_kyoto 0.18.0 with three patches on bip157 0.7.0 (published from 0169dc3) wit
 
 ### Kyoto patches
 
-`patches/bip157/` holds four patches on bip157 0.7.0 as published, in `git format-patch` form, each
+`patches/bip157/` holds five patches on bip157 0.7.0 as published, in `git format-patch` form, each
 with unit tests:
 
 1. distinct peers count toward the filter-header quorum, and unsolicited `cfheaders` are dropped
@@ -186,9 +195,12 @@ with unit tests:
 2. no false conflict when the tip moves between two answers (`chain/chain.rs`);
 3. a configurable deadline for filter batches, `Builder::filter_batch_timeout` (`network/mod.rs`,
    `network/peer.rs`, `builder.rs`);
-4. a random nonce in each version message (`network/outbound.rs`); the user agent still names Kyoto.
+4. a random nonce in each version message (`network/outbound.rs`); the user agent still names Kyoto;
+5. a rescan keeps the filter headers the quorum agreed on and checks only the filters again
+   (`chain/graph.rs`, `chain/chain.rs`): `rescan_from` cleared them, so a scan that started over
+   downloaded every filter header from there again.
 
-`tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those six files: a patch
+`tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those seven files: a patch
 touching any other file fails the build until the file is added there, with a reason.
 `rust-lib/vendor/bip157` is the result, used through `[patch.crates-io]`. `nix build
 .#bip157-check` rebuilds it from the published crate (fetched by hash) and diffs it byte for byte,
@@ -196,8 +208,8 @@ and the module's Rust build depends on that check; `tools/kyoto/check-bip157.sh`
 without Nix (`--update` rewrites the vendored tree). Run against the published crate, the quorum
 and tip tests fail: that is the bug. Nothing has been sent upstream.
 
-`patches/bdk_kyoto/` holds three on bdk_kyoto 0.18.0, all in `src/lib.rs`, the one file
-`tools/kyoto/patch-bdk_kyoto.sh` allows:
+`patches/bdk_kyoto/` holds four on bdk_kyoto 0.18.0, in `src/lib.rs` and `src/builder.rs`, the two
+files `tools/kyoto/patch-bdk_kyoto.sh` allows:
 
 1. matched blocks applied oldest first: the published crate drains them newest first
    (`queued_blocks.last()`, `pop()`), and bdk_chain counts a spend only once its coin is indexed,
@@ -206,7 +218,11 @@ and tip tests fail: that is the bug. Nothing has been sent upstream.
    `scanned()` (the last filter's height) and `synced()` (at the tip or not);
 3. every script the filters are checked against is indexed (`lookahead_to_target`): with a
    recovery lookahead past the wallet's own 25, a matched block's transaction read as irrelevant
-   and was dropped.
+   and was dropped;
+4. widening in place: `UpdateSubscriber::widen_handle()` takes the last index to watch per
+   keychain, one the wallet revealed since the node was built included, and the scripts through it
+   are indexed and checked from the next event on; `BuilderExt::build_with_wallet_from` builds a
+   node on a given `ChainState`, such as headers the wallet already holds.
 
 `rust-lib/vendor/bdk_kyoto` is the result, checked the same way (`nix build .#bdk_kyoto-check`,
 `tools/kyoto/check-bdk_kyoto.sh`); the regtest restores below fail without patches 1 and 3. Nothing
@@ -229,7 +245,9 @@ are applied with `chain: None`. Then (`checks.rs`):
 - **Merkle proofs.** Electrum: the proof is checked again against the authority's header, and its
   length against the block's depth, taken from a coinbase proof that must reach the same merkle
   root (the 64-byte-transaction trick makes a proof one level off). Esplora: `get_merkle_proof`
-  against the authority's header, and the depth from the block's `tx_count`.
+  against the authority's header, and the depth from the block's `tx_count`; below the chain's
+  start, against the block's own header from Esplora, fetched by the hash the walk proved. Without
+  that header the row stays `unchecked`, even when the hash is known.
 - **Evictions** from a sync are dropped; an unconfirmed transaction no server has reported for 14
   days is evicted then.
 - **Address indices** a full scan reports are capped at the revealed index plus the gap limit (20),
@@ -411,6 +429,8 @@ ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs R
   cargo test --release --no-default-features --features test-hooks --test esplora -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
   cargo test --release --no-default-features --features test-hooks --test restore -- --ignored --nocapture
+REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
+  --test widen -- --ignored --nocapture
 ```
 
 `chain.sh reorg` pays the replacement blocks to a fresh address each time: right after a burst of
@@ -471,7 +491,10 @@ Electrum, and Esplora for history with Electrum's headers; each must show every 
 Core's wallet at its height and nothing else, and the same confirmed balance, on a chain that
 starts at genesis, below the birthday. Kyoto scans twice more and the node once more; the taproot
 restore needs one pass. Last, Esplora with a birthday above the checkpoint: the 12 transactions
-below it show as `unchecked` at their own heights, with an `unchecked_anchor` alert. Against
+below it link to the checkpoint through Esplora's header endpoint and show confirmed at their own
+heights, with no alert. Behind a front that answers no header they show `unchecked`, with an
+`unchecked_anchor` alert, and stay so when a new block moves the chain, the one in the block just
+below the checkpoint too: the checkpoint names that block's hash, not its transactions. Against
 bdk_kyoto without patch 1 the Kyoto restore misses a sweep of a coin that came the block before;
 without patch 3, payments past the wallet's own lookahead; without both, 8 of 24 transactions.
 
@@ -482,9 +505,25 @@ a send broadcast through Esplora, Esplora's fee estimates (the floor on regtest)
 server behind a TLS front with a self-signed version 1 certificate: its `certSha256` opens it, and
 another pin is refused.
 
-On 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): `regtest` 70 s and 50 s, `kyoto` 131 s and
-59 s, `node` 253 s and 54 s (the Mac mines slowly), `esplora` 21 s and 18 s, `restore` 121 s and
-17 s.
+`widen` mines 3,000 empty blocks past the birthday, then the restore's segwit history, and
+restores it twice under Kyoto with its peers behind counting proxies (`examples/p2p_proxy.rs`):
+first with each wider scan started over by a new client from the birthday, as before (a test
+hook), then in place; both must show Core's wallet. A hook marks each widening, so each pass's
+traffic is its own; the scan takes three passes either way. On 2026-10-12, on macOS:
+
+| Pass | By a new client | In place |
+|---|---|---|
+| 1 | 1.24 s, 1,032,013 B | 1.29 s, 1,032,013 B |
+| 2 | 1.22 s, 1,025,205 B | 0.17 s, 254,291 B |
+| 3 | 1.48 s, 1,028,115 B | 0.21 s, 257,201 B |
+
+A pass by a new client receives 577 kB of headers, 194 kB of filter headers, 249 kB of filters
+and the matched blocks; in place, a widening pass receives only the filters and the blocks. The
+two widening passes come to 2,053,320 bytes by a new client and 511,492 in place, 75% less.
+
+On 2026-10-12, macOS 27 (aarch64): `regtest` 59 s, `kyoto` 126 s, `node` 220 s (the Mac mines
+slowly), `esplora` 20 s, `restore` 106 s, `widen` 109 s. On 2026-10-11, before widening in place,
+Linux (x86_64): `regtest` 50 s, `kyoto` 59 s, `node` 54 s, `esplora` 18 s, `restore` 17 s.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.
@@ -586,8 +625,12 @@ bundle, the keystore side and the core run on Windows and reach it directly unde
 ## Not yet
 
 - Kyoto reports its progress only as whole batches finish.
-- A scan that starts over, wider, downloads every filter from the birthday again: Kyoto keeps no
-  filters. A history spread far past the first window can take several passes.
+- A scan that starts over, wider, downloads every filter from the birthday again, though no
+  header or filter header: Kyoto keeps no filters. A history spread far past the first window can
+  take several passes.
+- Two confirmations are taken on a block hash alone, with no Merkle proof against a header: an
+  anchor held above the tip, once the chain reaches its block, and an Electrum anchor below the
+  chain's start, once the headers link up.
 - Mainnet and signet keep their quorum of 3 and 2 however few peers can be dialled, so a single
   peer of the user's own there never meets it; only testnet4 runs below its quorum.
 - bip157's own answer to a filter-header conflict, fetching the block to find which peer lied, is

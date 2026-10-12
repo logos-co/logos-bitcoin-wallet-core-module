@@ -404,7 +404,7 @@ impl Chain {
         self.request_state.pending_batch = None;
     }
 
-    // Clear the filter header cache to rescan the filters for new scripts.
+    // Check every filter again for new scripts; the agreed filter headers stay.
     pub(crate) fn clear_filters(&mut self) {
         self.header_chain.reset_filter_state();
     }

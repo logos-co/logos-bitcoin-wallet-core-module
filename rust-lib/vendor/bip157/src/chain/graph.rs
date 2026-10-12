@@ -420,11 +420,11 @@ impl BlockTree {
         false
     }
 
+    // Filter headers the quorum agreed on stay: a rescan only fetches the filters again.
     pub(crate) fn reset_filter_state(&mut self) {
         for node in self.headers.values_mut() {
             node.filter_checked = false;
             node.cf_header_assumed = false;
-            node.filter_commitment = None;
         }
     }
 
@@ -542,6 +542,35 @@ mod tests {
         let file = File::open("./tests/data/graph_scenarios.json").unwrap();
         let graph_cases: GraphTestFile = serde_json::from_reader(&file).unwrap();
         graph_cases.scenarios[index].clone()
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_filter_headers_and_checks_the_filters_again() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::FilterHeader;
+        let GraphScenario { base, .. } = get_graph_scenario(0);
+        let tip = Tip::from_checkpoint(
+            7,
+            BlockHash::from_str("62c28f380692524a3a8f1fc66252bc0eb31d6b6a127d2263bdcbee172529fe16")
+                .unwrap(),
+        );
+        let mut chain = BlockTree::new(tip, Network::Regtest);
+        for header in &base {
+            chain.accept_header(header.0);
+        }
+        let hashes: Vec<BlockHash> = base.iter().map(|h| h.0.block_hash()).collect();
+        for hash in &hashes {
+            let commitment = FilterCommitment {
+                header: FilterHeader::from_byte_array([1; 32]),
+                filter_hash: FilterHash::from_byte_array([2; 32]),
+            };
+            chain.set_commitment(commitment, *hash);
+            chain.check_filter(*hash);
+        }
+        assert!(hashes.iter().all(|h| chain.is_filter_checked(h)));
+        chain.reset_filter_state();
+        assert!(hashes.iter().all(|h| !chain.is_filter_checked(h)), "the filters are checked again");
+        assert!(hashes.iter().all(|h| chain.filter_commitment(*h).is_some()), "the agreed filter headers stay");
     }
 
     #[test]

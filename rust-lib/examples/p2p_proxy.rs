@@ -45,14 +45,16 @@ pub struct Proxy {
     live: Arc<Mutex<Vec<TcpStream>>>,
     /// Commands seen from upstream, and how many batches were forged.
     pub seen: Arc<Mutex<HashMap<String, usize>>>,
+    /// Bytes of each command from upstream, headers included.
+    pub bytes: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Proxy {
     pub fn start(listen: &str, upstream: SocketAddr, mode: Mode) -> Proxy {
         let listener = TcpListener::bind(listen).expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let p = Proxy { addr, mode: Arc::new(Mutex::new(mode)), live: Arc::default(), seen: Arc::default() };
-        let (mode, live, seen) = (p.mode.clone(), p.live.clone(), p.seen.clone());
+        let p = Proxy { addr, mode: Arc::new(Mutex::new(mode)), live: Arc::default(), seen: Arc::default(), bytes: Arc::default() };
+        let (mode, live, seen, bytes) = (p.mode.clone(), p.live.clone(), p.seen.clone(), p.bytes.clone());
         std::thread::spawn(move || {
             for client in listener.incoming().flatten() {
                 if *mode.lock().unwrap() == Mode::Down {
@@ -66,8 +68,8 @@ impl Proxy {
                 live.lock().unwrap().extend([client.try_clone().unwrap(), up.try_clone().unwrap()]);
                 let (c2, u2) = (client.try_clone().unwrap(), up.try_clone().unwrap());
                 std::thread::spawn(move || pump(client, u2, None));
-                let (m, s) = (mode.clone(), seen.clone());
-                std::thread::spawn(move || pump(up, c2, Some((m, s))));
+                let (m, s, b) = (mode.clone(), seen.clone(), bytes.clone());
+                std::thread::spawn(move || pump(up, c2, Some((m, s, b))));
             }
         });
         p
@@ -85,6 +87,12 @@ impl Proxy {
 
     pub fn count(&self, command: &str) -> usize {
         self.seen.lock().unwrap().get(command).copied().unwrap_or(0)
+    }
+
+    /// Messages and bytes from upstream so far, by command.
+    pub fn traffic(&self) -> HashMap<String, (usize, usize)> {
+        let (seen, bytes) = (self.seen.lock().unwrap(), self.bytes.lock().unwrap());
+        seen.iter().map(|(c, n)| (c.clone(), (*n, bytes.get(c).copied().unwrap_or(0)))).collect()
     }
 }
 
@@ -113,7 +121,7 @@ fn reframe(header: &[u8; 24], payload: &[u8]) -> Vec<u8> {
     out
 }
 
-type Watch = (Arc<Mutex<Mode>>, Arc<Mutex<HashMap<String, usize>>>);
+type Watch = (Arc<Mutex<Mode>>, Arc<Mutex<HashMap<String, usize>>>, Arc<Mutex<HashMap<String, usize>>>);
 
 /// Copies messages from `from` to `to`; upstream's, with `watch`, as the mode says.
 fn pump(mut from: TcpStream, mut to: TcpStream, watch: Option<Watch>) {
@@ -121,9 +129,10 @@ fn pump(mut from: TcpStream, mut to: TcpStream, watch: Option<Watch>) {
         let Ok((header, payload)) = read_message(&mut from) else { break };
         let mut copies = 1;
         let mut bytes = None;
-        if let Some((mode, seen)) = &watch {
+        if let Some((mode, seen, sizes)) = &watch {
             let cmd = command(&header);
             *seen.lock().unwrap().entry(cmd.clone()).or_default() += 1;
+            *sizes.lock().unwrap().entry(cmd.clone()).or_default() += header.len() + payload.len();
             let m = mode.lock().unwrap().clone();
             match m {
                 Mode::Down => break,

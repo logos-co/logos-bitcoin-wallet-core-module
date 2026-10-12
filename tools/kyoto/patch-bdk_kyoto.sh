@@ -11,7 +11,9 @@ patches=$(cd "${3:-$(dirname "$0")/../../patches/bdk_kyoto}" && pwd)
 # The files our patches may touch, each for a reason; a patch touching any other file fails
 # the build until it is added here (README, "Kyoto patches").
 allowed=(
-  src/lib.rs  # 1: matched blocks oldest first; 2: updates before the tip, and the height scanned; 3: every watched script indexed
+  src/lib.rs      # 1: matched blocks oldest first; 2: updates before the tip, and the height scanned;
+                  # 3: every watched script indexed; 4: widening in place
+  src/builder.rs  # 4: a node built from a given chain state
 )
 
 work=$(mktemp -d)

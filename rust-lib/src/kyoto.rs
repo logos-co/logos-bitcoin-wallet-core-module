@@ -8,6 +8,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bdk_kyoto::bip157::chain::{ChainState, IndexedHeader};
 use bdk_kyoto::bip157::{self, AddrV2, Builder, HashCheckpoint, Header, Info, ServiceFlags, TrustedPeer, Warning};
 use bdk_kyoto::builder::BuilderExt;
 use bdk_kyoto::{Requester, SyncConfig};
@@ -218,11 +219,13 @@ pub fn proxy_addr(p: &Proxy) -> Result<SocketAddr, String> {
     Ok(SocketAddr::new(ip, p.port))
 }
 
-/// Where a start begins: strictly after `from`; headers only up to the tip first when the
-/// wallet's birthday is above the chain known so far, then a rescan from `rescan_from`.
+/// Where a start begins: strictly after `from`, Kyoto's chain holding the authority's headers up
+/// to `known_to` (a snapshot, none downloaded again); headers only up to the tip first, then a
+/// rescan from `rescan_from`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Start {
     pub from: (u32, BlockHash),
+    pub known_to: u32,
     pub headers_only: bool,
     pub rescan_from: Option<u32>,
 }
@@ -270,8 +273,9 @@ pub struct Client {
     best_header: Arc<Mutex<u32>>,
     /// The wallet's last revealed indices when the client cloned its address index.
     pub revealed: [Option<u32>; 2],
-    /// The highest index of each keychain this client watched from its first filter.
+    /// The highest index of each keychain this client watches now.
     pub window: [u32; 2],
+    widen: Arc<Mutex<BTreeMap<KeychainKind, u32>>>,
     pub start: Start,
     pub started: Instant,
     /// An update came, at a checkpoint or the tip; one came with filters synced to the tip.
@@ -284,9 +288,9 @@ const KEYCHAINS: [KeychainKind; 2] = [KeychainKind::External, KeychainKind::Inte
 impl Client {
     /// Builds and starts a client for `wallet`, dialling `peers` on `route`; `wake` is set when
     /// an update or a stop waits for the sync thread. It watches each keychain's revealed index
-    /// plus `lookahead`.
+    /// plus `lookahead`. `snapshot` holds the headers from `start.from` to `start.known_to`.
     #[allow(clippy::too_many_arguments)]
-    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, lookahead: u32, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
         let net = wallet.network();
         let default_port = match net {
             bitcoin::Network::Bitcoin => 8333,
@@ -324,7 +328,13 @@ impl Client {
         let cp = HashCheckpoint::new(start.from.0, start.from.1);
         let lookahead = lookahead.max(LOOKAHEAD);
         let config = SyncConfig::wallet_recovery_sync(cp, lookahead).build();
-        let client = b.build_with_wallet(wallet, config).map_err(|e| e.to_string())?;
+        let client = if snapshot.len() > 1 {
+            let headers = snapshot.into_iter().enumerate().map(|(i, header)| IndexedHeader { height: start.from.0 + i as u32, header }).collect();
+            b.build_with_wallet_from(wallet, config, ChainState::Snapshot(headers))
+        } else {
+            b.build_with_wallet(wallet, config)
+        }
+        .map_err(|e| e.to_string())?;
         let revealed = KEYCHAINS.map(|k| wallet.derivation_index(k));
         let window = revealed.map(|r| r.unwrap_or(0) + lookahead - 1);
         let (client, logging, mut updates) = client.subscribe();
@@ -340,6 +350,7 @@ impl Client {
         });
         let updated = tx.clone();
         updates.checkpoint_every(CHECKPOINT_FILTERS);
+        let widen = updates.widen_handle();
         rt.spawn(async move {
             while let Ok(u) = updates.update().await {
                 if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), synced: updates.synced() }).is_err() {
@@ -352,9 +363,10 @@ impl Client {
         let (seen, connected, best_header) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)), Arc::new(Mutex::new(start.from.0)));
         let now = Arc::new(Mutex::new(vec![]));
         rt.spawn(watch_peers(requester.clone(), dial.clone(), Watched { seen: seen.clone(), now: now.clone(), connected: connected.clone(), best_header: best_header.clone() }));
-        tracing::info!(target: "bitcoin", "kyoto: started after {} with {} peers, quorum {required}{}", start.from.0, dial.len(), if start.headers_only { ", headers first" } else { "" });
+        tracing::info!(target: "bitcoin", "kyoto: started after {} holding headers to {} with {} peers, quorum {required}{}", start.from.0, start.known_to, dial.len(),
+            if start.headers_only { ", headers first" } else { "" });
         let lan = dial.iter().filter(|(_, p)| matches!(p, Peer::Lan(..))).map(|(t, _)| t.clone()).collect();
-        Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, now, connected, best_header, revealed, window, start, started: Instant::now(), updated: false, synced: false })
+        Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, now, connected, best_header, revealed, window, widen, start, started: Instant::now(), updated: false, synced: false })
     }
 
     pub fn poll(&mut self) -> Vec<Feed> {
@@ -393,7 +405,27 @@ impl Client {
         self.now.lock().unwrap().clone()
     }
 
-    /// The wallet revealed an address past what the client watches: it must be rebuilt.
+    /// Whether this client's chain holds the block at `height`, so it can scan again from there.
+    pub fn covers(&self, height: u32) -> bool {
+        self.start.from.0 <= height
+    }
+
+    /// Watches `lookahead` past each keychain's revealed index in the wallet from the next filter
+    /// on, and with `rescan_from`, checks the filters again after that height. Nothing is
+    /// downloaded but them.
+    pub fn widen(&mut self, wallet: &Wallet, lookahead: u32, rescan_from: Option<u32>) -> Result<(), String> {
+        let lookahead = lookahead.max(LOOKAHEAD);
+        let wider = KEYCHAINS.map(|k| wallet.derivation_index(k).unwrap_or(0) + lookahead - 1);
+        self.window = [self.window[0].max(wider[0]), self.window[1].max(wider[1])];
+        *self.widen.lock().map_err(|e| e.to_string())? = KEYCHAINS.into_iter().zip(self.window).collect();
+        if let Some(h) = rescan_from {
+            self.requester.rescan_from(h).map_err(|e| e.to_string())?;
+            self.synced = false;
+        }
+        Ok(())
+    }
+
+    /// The wallet revealed an address past what the client watches: it must watch further.
     pub fn needs_rebuild(&self, wallet: &Wallet) -> bool {
         KEYCHAINS.iter().zip(self.window).any(|(k, w)| wallet.derivation_index(*k).is_some_and(|i| i > w))
     }

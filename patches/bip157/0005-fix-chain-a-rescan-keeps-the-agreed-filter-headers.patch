@@ -1,0 +1,83 @@
+From 035408f442ec26b8463e3061a07f37be1bf8ff15 Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Sun, 11 Oct 2026 17:48:22 -0300
+Subject: [PATCH 5/5] fix(chain): a rescan keeps the agreed filter headers
+
+Requester::rescan and rescan_from cleared every filter commitment along with
+the filter checks, so a rescan for new scripts downloaded all the filter
+headers again before the filters. The filter headers the quorum agreed on
+don't change with the scripts: a rescan now only checks the filters again.
+---
+ src/chain/chain.rs |  2 +-
+ src/chain/graph.rs | 31 ++++++++++++++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/src/chain/chain.rs b/src/chain/chain.rs
+index 2231231..382e044 100644
+--- a/src/chain/chain.rs
++++ b/src/chain/chain.rs
+@@ -404,7 +404,7 @@ impl Chain {
+         self.request_state.pending_batch = None;
+     }
+ 
+-    // Clear the filter header cache to rescan the filters for new scripts.
++    // Check every filter again for new scripts; the agreed filter headers stay.
+     pub(crate) fn clear_filters(&mut self) {
+         self.header_chain.reset_filter_state();
+     }
+diff --git a/src/chain/graph.rs b/src/chain/graph.rs
+index eeed8c4..ffcac61 100644
+--- a/src/chain/graph.rs
++++ b/src/chain/graph.rs
+@@ -420,11 +420,11 @@ impl BlockTree {
+         false
+     }
+ 
++    // Filter headers the quorum agreed on stay: a rescan only fetches the filters again.
+     pub(crate) fn reset_filter_state(&mut self) {
+         for node in self.headers.values_mut() {
+             node.filter_checked = false;
+             node.cf_header_assumed = false;
+-            node.filter_commitment = None;
+         }
+     }
+ 
+@@ -544,6 +544,35 @@ mod tests {
+         graph_cases.scenarios[index].clone()
+     }
+ 
++    #[test]
++    fn a_rescan_keeps_the_filter_headers_and_checks_the_filters_again() {
++        use bitcoin::hashes::Hash;
++        use bitcoin::FilterHeader;
++        let GraphScenario { base, .. } = get_graph_scenario(0);
++        let tip = Tip::from_checkpoint(
++            7,
++            BlockHash::from_str("62c28f380692524a3a8f1fc66252bc0eb31d6b6a127d2263bdcbee172529fe16")
++                .unwrap(),
++        );
++        let mut chain = BlockTree::new(tip, Network::Regtest);
++        for header in &base {
++            chain.accept_header(header.0);
++        }
++        let hashes: Vec<BlockHash> = base.iter().map(|h| h.0.block_hash()).collect();
++        for hash in &hashes {
++            let commitment = FilterCommitment {
++                header: FilterHeader::from_byte_array([1; 32]),
++                filter_hash: FilterHash::from_byte_array([2; 32]),
++            };
++            chain.set_commitment(commitment, *hash);
++            chain.check_filter(*hash);
++        }
++        assert!(hashes.iter().all(|h| chain.is_filter_checked(h)));
++        chain.reset_filter_state();
++        assert!(hashes.iter().all(|h| !chain.is_filter_checked(h)), "the filters are checked again");
++        assert!(hashes.iter().all(|h| chain.filter_commitment(*h).is_some()), "the agreed filter headers stay");
++    }
++
+     #[test]
+     fn test_depth_one_reorg() {
+         let GraphScenario { base, stale, new } = get_graph_scenario(0);
+-- 
+2.54.0 (Apple Git-157)
+

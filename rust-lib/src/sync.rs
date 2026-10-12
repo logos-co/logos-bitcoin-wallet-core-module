@@ -16,6 +16,7 @@ use bdk_wallet::chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use bdk_wallet::{KeychainKind, Update};
 use bitcoin::hashes::Hash;
+use bitcoin::block::Header;
 use bitcoin::{BlockHash, ScriptBuf, Txid};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -54,6 +55,9 @@ pub trait RouteSource: Send + Sync {
         Ok(None)
     }
 }
+
+/// Headers a sync may fetch from Esplora, one request each, to link old anchors to the chain.
+const ESPLORA_LINK_BUDGET: u32 = 144;
 
 /// How long a regtest open or reload waits for the node module's routes before taking
 /// `regtest.json`'s: an unloaded module would hold it for the whole IPC budget.
@@ -163,6 +167,10 @@ pub struct Ctx {
     pub routes_src: Option<Arc<dyn RouteSource>>,
     /// `bitcoind_module`'s rpc, for the local node.
     pub node_src: Option<Arc<dyn NodeRpc>>,
+    /// Tests only: Kyoto widens by a new client from the birthday, as before widening in place.
+    pub widen_by_restart: bool,
+    /// Tests only: called when a scan from the birthday ends and a wider one is about to start.
+    pub on_widen: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 const ROUTES_EVERY: Duration = Duration::from_secs(300);
@@ -600,35 +608,74 @@ impl Loop {
         self.ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, key).ok().flatten())
     }
 
-    /// Where Kyoto starts: below the last height it scanned; else from the birthday, after a
-    /// headers-only phase when the chain doesn't reach it yet; else from Kyoto's own checkpoint.
-    fn kyoto_start(&self) -> Start {
+    /// Where Kyoto starts, holding the authority's headers from there to 8 below its tip: from
+    /// the block before the birthday while a scan from it runs, so the scan can start over in
+    /// place; else 8 blocks below the last height scanned (README, "Kyoto").
+    fn kyoto_start(&self) -> (Start, Vec<Header>) {
+        if self.ctx.widen_by_restart {
+            return (self.kyoto_start_by_checkpoint(), vec![]);
+        }
         let a = &self.authority;
-        let base = a.base_height();
+        let (base, tip) = (a.base_height(), a.chain().tip_height());
+        // From `s`, holding the authority's headers but the top few, which Kyoto downloads so a
+        // reorg there shows in its update; filters after `resume`.
+        let top = tip.saturating_sub(kyoto::RESTART_DEPTH);
+        let held = |s: u32, resume: u32| -> Option<(Start, Vec<Header>)> {
+            let hash = a.hash_at(s)?;
+            let known_to = top.max(s);
+            let snapshot: Vec<Header> = (s..=known_to).map(|h| a.chain().header_at(h).copied()).collect::<Option<_>>()?;
+            let (headers_only, rescan_from) = if resume > s { (true, Some(resume)) } else { (false, None) };
+            Some((Start { from: (s, hash), known_to, headers_only, rescan_from }, snapshot))
+        };
+        let want = self.birthday().saturating_sub(1);
         // Covering a pruned node's gap: from its first block, whatever Kyoto scanned before.
         if let Some(g) = self.node_gap.as_ref().filter(|_| self.gap_pending(KYOTO)) {
             let s = g.heights.iter().copied().min().unwrap_or(g.from).min(g.from).saturating_sub(1).max(base);
-            if let Some(hash) = a.hash_at(s) {
-                return Start { from: (s, hash), headers_only: false, rescan_from: None };
+            if let Some(x) = held(s, s) {
+                return x;
             }
         }
         if let Some((h, hash)) = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned) {
             if a.hash_at(h) == Some(hash) {
-                let s = h.saturating_sub(kyoto::RESTART_DEPTH).max(base);
-                if let Some(sh) = a.hash_at(s) {
-                    return Start { from: (s, sh), headers_only: false, rescan_from: None };
+                let resume = h.saturating_sub(kyoto::RESTART_DEPTH).max(base);
+                let in_pass = self.kyoto_meta(KYOTO_WINDOW).is_some_and(|w| !w.is_empty());
+                let from = if in_pass && want >= base && want < resume { want } else { resume };
+                if let Some(x) = held(from, resume).or_else(|| held(resume, resume)) {
+                    return x;
                 }
+            }
+        }
+        if want >= base {
+            if let Some(x) = held(want, want) {
+                return x;
+            }
+            return (Start { from: (tip, a.chain().tip_hash()), known_to: tip, headers_only: true, rescan_from: Some(want) }, vec![]);
+        }
+        let from = kyoto::builtin_checkpoint(self.ctx.net, want);
+        (Start { from, known_to: from.0, headers_only: false, rescan_from: None }, vec![])
+    }
+
+    /// Where Kyoto started before it held the authority's headers, downloading every one from its
+    /// start: kept for the tests that compare the two (`Ctx::widen_by_restart`).
+    fn kyoto_start_by_checkpoint(&self) -> Start {
+        let a = &self.authority;
+        let base = a.base_height();
+        let at = |s: u32| a.hash_at(s).map(|hash| Start { from: (s, hash), known_to: s, headers_only: false, rescan_from: None });
+        if let Some((h, hash)) = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned) {
+            if let Some(s) = (a.hash_at(h) == Some(hash)).then(|| at(h.saturating_sub(kyoto::RESTART_DEPTH).max(base))).flatten() {
+                return s;
             }
         }
         let want = self.birthday().saturating_sub(1);
         if want >= base {
-            if let Some(hash) = a.hash_at(want) {
-                return Start { from: (want, hash), headers_only: false, rescan_from: None };
+            if let Some(s) = at(want) {
+                return s;
             }
             let tip = a.chain().tip_height();
-            return Start { from: (tip, a.chain().tip_hash()), headers_only: true, rescan_from: Some(want) };
+            return Start { from: (tip, a.chain().tip_hash()), known_to: tip, headers_only: true, rescan_from: Some(want) };
         }
-        Start { from: kyoto::builtin_checkpoint(self.ctx.net, want), headers_only: false, rescan_from: None }
+        let from = kyoto::builtin_checkpoint(self.ctx.net, want);
+        Start { from, known_to: from.0, headers_only: false, rescan_from: None }
     }
 
     fn save_book(&self) {
@@ -707,10 +754,23 @@ impl Loop {
             next
         };
         let Some(n) = next else { return false };
+        if let Some(f) = &self.ctx.on_widen {
+            f();
+        }
         if source == KYOTO {
-            self.stop_kyoto(None);
-            (self.kyoto_lookahead, self.kyoto_retry_at) = (n, Instant::now());
             self.kyoto_status.rescans += 1;
+            self.kyoto_lookahead = n;
+            // In place when the client holds the block before the birthday: no headers again.
+            if !self.ctx.widen_by_restart && self.widen_kyoto(n, Some(self.birthday().saturating_sub(1))) {
+                self.kyoto_scanning = true;
+                if let (Some(c), Some(cell)) = (&self.kyoto, self.ctx.cell.lock().as_ref()) {
+                    let _ = meta_set(&cell.conn, KYOTO_WINDOW, &format!("{},{}", c.window[0], c.window[1]));
+                }
+            } else {
+                self.stop_kyoto(None);
+                self.kyoto_retry_at = Instant::now();
+            }
+            self.ctx.progress.lock().kyoto = Some(self.kyoto_status.clone());
         } else {
             self.node = None;
             self.node_lookahead = n;
@@ -720,6 +780,27 @@ impl Loop {
         p.synced_tip = None;
         p.rescan_from = Some(self.birthday());
         true
+    }
+
+    /// Widens the running client's scripts to `lookahead`, and with `rescan_from`, scans its
+    /// filters again from there; false when it can't (no client, or its chain starts later).
+    fn widen_kyoto(&mut self, lookahead: u32, rescan_from: Option<u32>) -> bool {
+        let guard = self.ctx.cell.lock();
+        let (Some(c), Some(cell)) = (self.kyoto.as_mut(), guard.as_ref()) else { return false };
+        if rescan_from.is_some_and(|h| !c.covers(h)) {
+            return false;
+        }
+        match c.widen(&cell.wallet, lookahead, rescan_from) {
+            Ok(()) => {
+                self.kyoto_status.window = c.window;
+                tracing::info!(target: "bitcoin", "kyoto: watching to {:?}{}", c.window, rescan_from.map(|h| format!(", scanning filters again after {h}")).unwrap_or_default());
+                true
+            }
+            Err(e) => {
+                tracing::info!(target: "bitcoin", "kyoto: no widening in place: {e}");
+                false
+            }
+        }
     }
 
     /// While Kyoto syncs headers only, takes them into the authority as they come, checked as
@@ -770,14 +851,14 @@ impl Loop {
         }
         let now = now_secs();
         if self.kyoto.is_none() && Instant::now() >= self.kyoto_retry_at {
-            let start = self.kyoto_start();
+            let (start, snapshot) = self.kyoto_start();
             let peers = self.kyoto_book.pick(&route.peers, now, &mut rand::thread_rng());
             let required = kyoto::required(self.ctx.net, quorum, peers.len());
             (self.kyoto_status.quorum, self.kyoto_status.one_peer_decides) = (required, required == 1);
             let started = {
                 let guard = self.ctx.cell.lock();
                 match guard.as_ref() {
-                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, self.kyoto_lookahead, self.ctx.wake.clone()),
+                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, snapshot, self.kyoto_lookahead, self.ctx.wake.clone()),
                     None => Err("closed".into()),
                 }
             };
@@ -791,7 +872,7 @@ impl Loop {
                     self.kyoto_status.running = true;
                     self.kyoto_status.phase = "syncing";
                     self.kyoto_status.progress = 0.0;
-                    self.kyoto_status.headers = start.from.0;
+                    self.kyoto_status.headers = start.known_to;
                     self.kyoto = Some(c);
                 }
                 Err(e) => {
@@ -843,16 +924,18 @@ impl Loop {
         if let Some(why) = stopped {
             self.stop_kyoto(Some(why));
         }
-        // Addresses revealed past what the client watches need a client that watches them.
+        // Addresses revealed past what the client watches: it watches them from now on, in place.
         let rebuild = match (&self.kyoto, self.ctx.cell.lock().as_ref()) {
             (Some(c), Some(cell)) => c.needs_rebuild(&cell.wallet),
             _ => false,
         };
         if rebuild {
-            tracing::info!(target: "bitcoin", "kyoto: rebuilding for addresses revealed past its lookahead");
-            self.stop_kyoto(None);
             self.kyoto_status.rebuilds += 1;
-            self.kyoto_retry_at = Instant::now();
+            if self.ctx.widen_by_restart || !self.widen_kyoto(self.kyoto_lookahead, None) {
+                tracing::info!(target: "bitcoin", "kyoto: rebuilding for addresses revealed past its lookahead");
+                self.stop_kyoto(None);
+                self.kyoto_retry_at = Instant::now();
+            }
         }
         if self.kyoto_rescan.is_some() {
             change = merge(change, self.mirror_kyoto_headers());
@@ -877,10 +960,10 @@ impl Loop {
             None => return Ok((Change::default(), vec![])),
         };
         let Some(cp) = u.chain else { return Ok((Change::default(), vec![])) };
-        let mut ids: Vec<(u32, BlockHash)> = cp.iter().map(|c| (c.height(), c.hash())).take_while(|(h, _)| *h > start.from.0).collect();
+        let mut ids: Vec<(u32, BlockHash)> = cp.iter().map(|c| (c.height(), c.hash())).take_while(|(h, _)| *h > start.known_to).collect();
         ids.reverse();
-        // Kyoto's own headers run contiguously from its start; anything past a gap is BDK's.
-        let run = ids.iter().enumerate().take_while(|(i, (h, _))| *h == start.from.0 + 1 + *i as u32).count();
+        // Kyoto's own headers run contiguously past what it held; anything past a gap is BDK's.
+        let run = ids.iter().enumerate().take_while(|(i, (h, _))| *h == start.known_to + 1 + *i as u32).count();
         ids.truncate(run);
         let base = self.authority.base_height();
         if let Some((_, hash)) = ids.iter().find(|(h, _)| *h == base) {
@@ -889,7 +972,7 @@ impl Loop {
             }
         }
         let above: Vec<(u32, BlockHash)> = ids.iter().filter(|(h, _)| *h > base).copied().collect();
-        let fork = above.iter().rev().find(|(h, hash)| self.authority.hash_at(*h) == Some(*hash)).map_or(start.from.0.max(base), |(h, _)| *h);
+        let fork = above.iter().rev().find(|(h, hash)| self.authority.hash_at(*h) == Some(*hash)).map_or(start.known_to.max(base), |(h, _)| *h);
         if self.authority.hash_at(fork).is_none() {
             return Err(format!("Kyoto's chain doesn't meet the wallet's at {fork}"));
         }
@@ -913,7 +996,7 @@ impl Loop {
         // Filters checked through `scanned`: the tip, or a checkpoint on the way there.
         let tip = match scanned {
             Some(h) => self.authority.hash_at(h).map(|hash| (h, hash)),
-            None => ids.last().copied().or_else(|| self.authority.hash_at(start.from.0).map(|h| (start.from.0, h))),
+            None => ids.last().copied().or_else(|| self.authority.hash_at(start.known_to).map(|h| (start.known_to, h))),
         }
         .filter(|_| mirrored);
         let at_tip = synced;
@@ -1161,8 +1244,12 @@ impl Loop {
         let mut ready = TxUpdate::<ConfirmationBlockTime>::default();
         let mut wanted = BTreeSet::new();
         let mut dropped = vec![];
+        let base = self.authority.base_height();
         for h in &held {
             match checks::judge_anchor(&self.authority, h.anchor.block_id.height, h.anchor.block_id.hash) {
+                // Below the chain's start a hash proves the block, not the transaction in it: the
+                // source's next sync checks its proof.
+                checks::AnchorVerdict::Keep if h.anchor.block_id.height < base => {}
                 checks::AnchorVerdict::Keep => {
                     ready.anchors.insert((h.anchor, h.txid));
                     wanted.insert(h.anchor.block_id.height);
@@ -1304,10 +1391,38 @@ impl Loop {
             self.alert(&src.id, "anchor_mismatch", d.clone());
             self.mark_suspect(&src.id, &d);
         }
-        // Old anchors: kept once the server's headers link up to the checkpoint. Esplora serves no
-        // header ranges to link with: its old anchors are held, shown unchecked, and an alert says so.
+        // Old anchors: kept once the server's headers link up to the checkpoint. Esplora serves
+        // headers one at a time: a walk down from the chain links them, a budget a sync; the rest
+        // stay held and unchecked until a later sync reaches them.
+        let mut linked: HashMap<u32, Header> = HashMap::new();
+        let mut unchecked: Vec<(Txid, ConfirmationBlockTime)> = vec![];
         if !screened.needs_linkage.is_empty() && src.kind == Kind::Esplora {
-            self.hold_unchecked(&src.id, &screened.needs_linkage);
+            let heights: Vec<u32> = screened.needs_linkage.iter().map(|(_, a)| a.block_id.height).collect();
+            let c = self.esplora(&src)?.clone();
+            let rt = self.ctx.rt.clone();
+            let mut header_of = |hash: BlockHash| rt.block_on(c.get_header_by_hash(&hash)).map_err(|e| net::redact(&e.to_string()));
+            match self.authority.prove_below_by_hash(&heights, &mut header_of, ESPLORA_LINK_BUDGET) {
+                Ok(w) => {
+                    let keep: Vec<(u32, BlockHash)> = w.proved.iter().map(|(h, hd)| (*h, hd.block_hash())).chain(w.stopped_at).collect();
+                    if let Some(cell) = self.ctx.cell.lock().as_ref() {
+                        let _ = cell.store_old(&keep);
+                    }
+                    if let Some(e) = &w.error {
+                        tracing::info!(target: "bitcoin", "{}: old headers not fetched: {e}", src.id);
+                    }
+                    linked.extend(w.proved);
+                }
+                Err(e) => self.mark_suspect(&src.id, &format!("old headers don't link: {e}")),
+            }
+            for (txid, a) in &screened.needs_linkage {
+                match checks::judge_anchor(&self.authority, a.block_id.height, a.block_id.hash) {
+                    checks::AnchorVerdict::Keep => {
+                        update.anchors.insert((*a, *txid));
+                    }
+                    checks::AnchorVerdict::NeedsLinkage => unchecked.push((*txid, *a)),
+                    _ => self.mark_suspect(&src.id, &format!("an old anchor of {txid} isn't on the chain")),
+                }
+            }
         }
         if !screened.needs_linkage.is_empty() && src.kind == Kind::Electrum {
             let heights: Vec<u32> = screened.needs_linkage.iter().map(|(_, a)| a.block_id.height).collect();
@@ -1339,9 +1454,10 @@ impl Loop {
             let cell = guard.as_ref().ok_or("closed")?;
             update.anchors.iter().filter(|(a, t)| !cell.wallet.tx_graph().get_tx_node(*t).is_some_and(|n| n.anchors.contains(a))).copied().collect()
         };
+        let mut settled: Vec<(Txid, ConfirmationBlockTime)> = vec![];
         for (a, txid) in new_anchors {
             let height = a.block_id.height;
-            let header = self.authority.header_at(height);
+            let header = self.authority.header_at(height).or_else(|| linked.get(&height).copied());
             let verdict = match src.kind {
                 Kind::Electrum => {
                     let proof = match proofs.get(&(txid, height as usize)) {
@@ -1364,24 +1480,40 @@ impl Loop {
                 Kind::Esplora => {
                     let c = self.esplora(&src)?.clone();
                     let rt = self.ctx.rt.clone();
+                    // Below the chain's start, a proven hash: its header proves the transaction in it.
+                    let header = match header {
+                        Some(h) => h,
+                        None => match rt.block_on(c.get_header_by_hash(&a.block_id.hash)) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                tracing::info!(target: "bitcoin", "{}: no header for {height}: {}", src.id, net::redact(&e.to_string()));
+                                update.anchors.remove(&(a, txid));
+                                unchecked.push((txid, a));
+                                continue;
+                            }
+                        },
+                    };
                     let proof = rt.block_on(c.get_merkle_proof(&txid)).ok().flatten();
                     let info = rt.block_on(c.get_block_info(&a.block_id.hash)).ok();
-                    match (proof, info, header) {
-                        (Some(p), Some(i), Some(h)) if p.block_height == height => {
+                    match (proof, info) {
+                        (Some(p), Some(i)) if p.block_height == height && header.block_hash() == a.block_id.hash => {
                             let branch: Vec<[u8; 32]> = p.merkle.iter().map(|t| t.to_byte_array()).collect();
-                            checks::check_proof(txid, p.pos, &branch, &h, checks::tree_depth(i.tx_count))
+                            checks::check_proof(txid, p.pos, &branch, &header, checks::tree_depth(i.tx_count))
                         }
-                        (Some(_), Some(_), None) => ProofVerdict::Valid,
                         _ => ProofVerdict::WrongRoot,
                     }
                 }
             };
+            settled.push((txid, a));
             if verdict != ProofVerdict::Valid {
                 update.anchors.remove(&(a, txid));
                 let d = format!("the proof for {txid} at {height} fails: {verdict:?}");
                 self.alert(&src.id, "anchor_mismatch", d.clone());
                 self.mark_suspect(&src.id, &d);
             }
+        }
+        if !unchecked.is_empty() {
+            self.hold_unchecked(&src.id, &unchecked);
         }
         // Apply: the chain gets a checkpoint at each anchor's height, then the screened answer.
         let pending: Vec<Txid> = update.seen_ats.iter().map(|(t, _)| *t).collect();
@@ -1390,6 +1522,10 @@ impl Loop {
             let cell = guard.as_mut().ok_or("closed")?;
             for (txid, a) in &screened.held {
                 let _ = cell.hold(&Held { txid: *txid, anchor: *a, source: src.id.clone() });
+            }
+            // A held confirmation whose proof was checked now, either way, is held no longer.
+            for (txid, a) in &settled {
+                let _ = cell.unhold(&Held { txid: *txid, anchor: *a, source: src.id.clone() });
             }
             let wanted: BTreeSet<u32> = update.anchors.iter().map(|(a, _)| a.block_id.height).collect();
             apply_chain(cell, &self.authority, &wanted)?;
