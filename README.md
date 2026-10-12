@@ -572,9 +572,11 @@ and the matched blocks; in place, a widening pass receives only the filters and 
 two widening passes come to 2,053,320 bytes by a new client and 511,492 in place, 75% less; on
 Linux, 2,053,797 and 511,969.
 
-On 2026-10-12, macOS 27 (aarch64) and Linux (x86_64): `regtest` 64 s and 46 s, `kyoto` 131 s and
-63 s, `node` 235 s and 54 s (the Mac mines slowly), `esplora` 20 s and 18 s, `restore` 120 s and
-25 s, `widen` 120 s and 15 s, `anchors` 49 s and 47 s; `gap` 28 s on macOS.
+On 2026-10-12, macOS 27 (aarch64) and Linux (x86_64): `regtest` 64 s and 51 s, `kyoto` 131 s and
+61 s, `node` 235 s and 54 s (the Mac mines slowly), `esplora` 20 s and 18 s, `restore` 120 s and
+17 s, `widen` 120 s and 14 s, `anchors` 49 s and 47 s, `gap` 28 s and 18 s. After `kyoto`'s birthday
+restart the peers refuse a reconnect or two; on the Mac each refusal backs off longer, so that suite
+takes 125 to 245 s there.
 
 `invalidateblock` on the node electrs follows is avoided on purpose: electrs 0.11 then waits forever
 on that node for the invalidated block, and stops answering.

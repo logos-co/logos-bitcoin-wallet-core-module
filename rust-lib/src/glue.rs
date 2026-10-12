@@ -18,7 +18,8 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, version, crates }`.
     fn version(&self) -> String;
     /// `{ ok, jobId, receipt }` for open_wallet, close_wallet, build_send, bump_fee, rebroadcast, and
-    /// for the backend sign_and_broadcast, cancel_send, abandon_send and set_birthday (README, Job kinds).
+    /// for the backend sign_and_broadcast, cancel_send, abandon_send, set_birthday and set_gap_limit
+    /// (README, Job kinds). open_wallet's params and result carry `gapLimit`, 20 to 1000.
     fn start_job(&self, kind: String, params: String) -> String;
     /// `{ ok, jobId, kind, state: queued|running|done|failed|cancelled, error }`.
     fn job_status(&self, job_id: String, receipt: String) -> String;
@@ -27,10 +28,10 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     fn ack_job(&self, job_id: String, receipt: String) -> bool;
     fn cancel_job(&self, job_id: String, receipt: String) -> bool;
     /// `{ ok, state, network, group, family, authority: { kind, height, tipAgeSecs, peers }, synced,
-    /// busy, needsBirthday, openHandle?, approvalHandle?, ... }`. Never waits on the wallet.
+    /// busy, needsBirthday, gapLimit, openHandle?, approvalHandle?, ... }`. Never waits on the wallet.
     fn status(&self) -> String;
-    /// `{ ok, confirmed, waiting, pending, sent, immature, tooSmall: { count, sat } }`, satoshis as
-    /// decimal strings; empty strings while busy, never zero.
+    /// `{ ok, confirmed, waiting, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count,
+    /// sat, confirmedSat } }`, satoshis as decimal strings; empty strings while busy, never zero.
     fn balance(&self) -> String;
     /// `{ ok, address, index }`: a fresh receive address.
     fn next_address(&self) -> String;
@@ -39,7 +40,7 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, utxos: [...] }`, outputs confirmed on the authority's chain.
     fn utxos(&self) -> String;
     /// `{ ok, rows: [{ txid, intent: send|self|combine|fee_bump|receive, amountSat, feeSat,
-    /// counterparties, height, confirmations, time, state, reportedBy }] }`, newest first.
+    /// counterparties, height, confirmations, time, state, reportedBy, beyondGap }] }`, newest first.
     fn history(&self, page: i64) -> String;
     /// `{ ok, fast, normal, slow, minimum, sources }` in sat/vB.
     fn fee_rates(&self) -> String;
