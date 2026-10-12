@@ -5,7 +5,8 @@
 
 mod common;
 
-use std::net::SocketAddr;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use bitcoin_wallet_core::engine::Engine;
 use bitcoin_wallet_core::network::{configure_regtest, RegtestCheckpoint, RegtestConfig};
 use bitcoin_wallet_core::routes::Routes;
 use common::history::{restore, TPRV};
-use common::{chain, collecting, electrum_proxy, http_front, MockManager, T};
+use common::{body_of, chain, collecting, electrum_proxy, http_front, MockManager, T};
 use serde_json::{json, Value};
 
 /// A confirmation a server makes up: `txid` in a block it isn't in.
@@ -68,6 +69,28 @@ fn empty_block(t: &T) -> (u64, String, u64) {
 /// Where Core's wallet confirmed a payment it made.
 fn height_of(t: &T, txid: &str) -> u64 {
     t.wallet_rpc("gettransaction", json!([txid]))["blockheight"].as_u64().unwrap()
+}
+
+/// Waits until Esplora and electrs both index the node's tip, so a wallet's first scan sees it.
+fn indexed(t: &T, esplora_port: u16, electrs: SocketAddr) {
+    let esplora = || -> Option<u64> {
+        let mut s = TcpStream::connect(("127.0.0.1", esplora_port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        s.write_all(b"GET /blocks/tip/height HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").ok()?;
+        let mut reply = vec![];
+        s.read_to_end(&mut reply).ok()?;
+        String::from_utf8(body_of(&reply)?).ok()?.trim().parse().ok()
+    };
+    let electrum = || -> Option<u64> {
+        let mut s = TcpStream::connect(electrs).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        s.write_all(b"{\"id\":1,\"method\":\"blockchain.headers.subscribe\",\"params\":[]}\n").ok()?;
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).ok()?;
+        serde_json::from_str::<Value>(&line).ok()?["result"]["height"].as_u64()
+    };
+    let tip = t.tip();
+    t.wait("Esplora and electrs at the node's tip", 60, || esplora() == Some(tip) && electrum() == Some(tip));
 }
 
 /// Waits for `what`, failing the moment `txid` shows confirmed.
@@ -213,12 +236,13 @@ fn confirmations_count_once_proved() {
     // on its proof against the chain's header once the chain reaches it. One made up in an empty
     // block waits too from Esplora, and is refused there; Electrum's client drops it at once. These
     // wallets' chains start at genesis.
+    indexed(&t, esplora_port, electrs);
     let (e1, _d1) = restore(&t, routes(&chain_url, &esplora), 1, None);
     let (e3, _d3) = restore(&t, routes(&chain_url, &electrum), 1, None);
     for r in [&e1, &e3] {
+        r.engine.reveal_for_test(10).unwrap();
         r.synced();
         r.wait("the early payments", 60, || r.sats("confirmed") == 110_000_000);
-        r.engine.reveal_for_test(10).unwrap();
     }
     hold();
     let paid = t.fund(&address(&t, 1), 0.4).to_string();
@@ -261,7 +285,9 @@ fn confirmations_count_once_proved() {
     let (lied, signed) = payment(&t, &address(&t, 3), 0.2);
     *lie.lock().unwrap() = Some(Lie { txid: lied.clone(), height, hash, time });
     t.rpc("sendrawtransaction", json!([signed]));
+    indexed(&t, esplora_port, electrs);
     let below = |r: &T, name: &str| {
+        r.engine.reveal_for_test(10).unwrap();
         r.synced();
         assert_eq!(r.engine.status()["authority"]["base"], checkpoint);
         for (txid, h) in &early {

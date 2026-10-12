@@ -577,7 +577,7 @@ fn answer(out: &mut TcpStream, status: u16, body: &[u8]) {
 }
 
 /// An HTTP reply's body, chunked or not.
-fn body_of(reply: &[u8]) -> Option<Vec<u8>> {
+pub fn body_of(reply: &[u8]) -> Option<Vec<u8>> {
     let at = reply.windows(4).position(|w| w == b"\r\n\r\n")?;
     let (head, mut rest) = (String::from_utf8_lossy(&reply[..at]).to_ascii_lowercase(), &reply[at + 4..]);
     if !head.contains("transfer-encoding: chunked") {
