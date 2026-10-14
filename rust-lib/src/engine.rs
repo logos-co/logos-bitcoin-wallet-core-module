@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use crate::authority::{Authority, ChainAuthority, KYOTO, LOCAL_NODE};
+use crate::authority::{Authority, ChainAuthority, KYOTO, LOCAL_NODE, RPC_NODE};
 use crate::jobs::Jobs;
 use crate::ledger::Ledger;
 use crate::manager::{self, ManagerRef, Settled, Ticket};
@@ -577,7 +577,7 @@ impl Engine {
             ledger.suspect(&s, &why);
         }
         let (routes, routes_err) = self.routes_for(network);
-        let netstate = Arc::new(Mutex::new(NetState { routes, ledger, iso: HashMap::new(), chain_by: crate::authority::ELECTRUM_HEADERS, kyoto: None }));
+        let netstate = Arc::new(Mutex::new(NetState { routes, ledger, iso: HashMap::new(), chain_by: crate::authority::ELECTRUM_HEADERS, kyoto: None, node_rpc: None, node_id: String::new() }));
         let progress = Arc::new(Mutex::new(Progress { full_scan_done, authority: authority.summary(now), last_error: routes_err.clone(), ..Default::default() }));
         let cell = Arc::new(Mutex::new(Some(cell)));
         let (stop, wake, reload) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(routes_err.is_some())));
@@ -1006,7 +1006,7 @@ impl Engine {
         let mut tried = 0;
         for a in by {
             let sent: Result<Outcome, String> = match a {
-                routes::Authority::Local if chain_by == LOCAL_NODE => match self.node_src.get() {
+                routes::Authority::Local | routes::Authority::Rpc if chain_by == LOCAL_NODE || chain_by == RPC_NODE => match netstate.lock().node_rpc.clone() {
                     Some(rpc) => crate::node::broadcast(&NodeClient::new(rpc.clone()), tx).map(|_| Outcome::Seen),
                     None => continue,
                 },
@@ -1017,7 +1017,8 @@ impl Engine {
                 _ => continue,
             };
             tried += 1;
-            let via = if a == routes::Authority::Local { "local" } else { KYOTO };
+            let node_id = netstate.lock().node_id.clone();
+            let via = if matches!(a, routes::Authority::Local | routes::Authority::Rpc) { node_id.as_str() } else { KYOTO };
             match sent {
                 Ok(o) => return Ok((o, via.to_string())),
                 Err(e) if send::already_known(&e) => return Ok((Outcome::Seen, via.to_string())),
@@ -1034,6 +1035,7 @@ impl Engine {
         for s in sources {
             let iso = netstate.lock().iso(&s.id);
             let sent: Result<Outcome, String> = match s.kind {
+                Kind::Rpc => Err("RPC broadcast uses the active Core connection".into()),
                 Kind::Electrum => crate::net::electrum(&s, proxy.as_ref(), &iso).and_then(|c| match c.transaction_broadcast(tx) {
                     Ok(_) => Ok(if c.transaction_get(&txid).is_ok() { Outcome::Seen } else { Outcome::Requested }),
                     Err(e) => Err(e.to_string()),

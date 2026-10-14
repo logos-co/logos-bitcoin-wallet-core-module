@@ -99,6 +99,7 @@ const REPLACED_KEPT: usize = 512;
 pub const ELECTRUM_HEADERS: &str = "electrum_headers";
 pub const KYOTO: &str = "kyoto";
 pub const LOCAL_NODE: &str = "local_node";
+pub const RPC_NODE: &str = "rpc_node";
 
 /// The wallet's header chain and who feeds it: `refresh` for Electrum servers, `adopt` for Kyoto
 /// and the local node, whose headers pass the same checks.

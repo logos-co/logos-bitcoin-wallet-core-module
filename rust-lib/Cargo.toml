@@ -69,6 +69,10 @@ name = "kyoto"
 required-features = ["test-hooks"]
 
 [[test]]
+name = "rpc"
+required-features = ["test-hooks"]
+
+[[test]]
 name = "node"
 required-features = ["test-hooks"]
 
