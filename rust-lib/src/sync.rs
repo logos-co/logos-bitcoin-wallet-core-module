@@ -21,7 +21,7 @@ use bitcoin::{BlockHash, ScriptBuf, Txid};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE};
+use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
 use crate::checks::{self, ChainView, ProofVerdict};
 use crate::crosscheck::{self, Answer, Verdict};
 use crate::fees::{self, SourceEstimate};
@@ -74,7 +74,7 @@ enum Inclusion {
 
 /// Kyoto and the node find transactions in blocks checked against their headers as they come.
 fn block_checked(source: &str) -> bool {
-    source == KYOTO || source == LOCAL_NODE
+    source == KYOTO || source == LOCAL_NODE || source == RPC_NODE
 }
 
 /// How long a regtest open or reload waits for the node module's routes before taking
@@ -101,6 +101,8 @@ pub struct NetState {
     pub chain_by: &'static str,
     /// The running Kyoto client, for broadcasts.
     pub kyoto: Option<bdk_kyoto::Requester>,
+    pub node_rpc: Option<Arc<dyn NodeRpc>>,
+    pub node_id: String,
 }
 
 impl NetState {
@@ -275,6 +277,7 @@ struct Loop {
     node_rescans: u32,
     node_ok: bool,
     node_probe: Option<Instant>,
+    remote_source: Option<Source>,
     /// Blocks a pruned node couldn't give, until a history server or Kyoto has scanned them.
     node_gap: Option<PrunedGap>,
     clients: HashMap<String, Electrum>,
@@ -463,6 +466,9 @@ impl Loop {
                     if (Routes { kyoto: r.kyoto.clone(), ..ns.routes.clone() }) != r {
                         self.clients.clear();
                         self.esplora.clear();
+                        self.node = None;
+                        self.node_ok = false;
+                        self.node_probe = None;
                     }
                     ns.routes = r;
                     drop(ns);
@@ -510,48 +516,71 @@ impl Loop {
         tracing::info!(target: "bitcoin", "source {id}: {e}");
     }
 
-    /// The local node while it is synced, else Kyoto, else the Electrum header chain.
+    /// The bundled node first, then a configured RPC node, Kyoto, and Electrum.
     fn choose(&mut self) -> Feeder {
-        let (local, kyoto) = {
+        let (local, remote, kyoto, proxy) = {
             let ns = self.ctx.netstate.lock();
-            (ns.routes.local.is_some(), ns.routes.kyoto.is_some())
+            (ns.routes.local.is_some(), ns.routes.rpc.clone(), ns.routes.kyoto.is_some(), ns.routes.proxy.clone())
         };
-        if local && self.ctx.node_src.is_some() {
-            let due = self.feeder == Feeder::Node || self.node_probe.is_none_or(|t| t.elapsed() >= NODE_PROBE_EVERY);
-            if due && self.feeder != Feeder::Node {
+        let remote = if local && self.ctx.node_src.is_some() { None } else { remote };
+        if self.remote_source != remote {
+            self.node = None;
+            self.node_probe = None;
+            self.node_ok = false;
+            self.remote_source = remote.clone();
+            self.ctx.netstate.lock().node_rpc = None;
+        }
+        if (local && self.ctx.node_src.is_some()) || remote.is_some() {
+            if self.node_probe.is_none_or(|t| t.elapsed() >= NODE_PROBE_EVERY) {
                 self.node_probe = Some(Instant::now());
-                let c = NodeClient::new(self.ctx.node_src.clone().expect("checked"));
-                match node::status(&c, self.ctx.net) {
-                    Ok(st) => {
+                let id = remote.as_ref().map_or("local", |s| s.id.as_str()).to_string();
+                let connection: Result<Arc<dyn NodeRpc>, String> = (|| {
+                    if let Some(src) = &remote {
+                        let iso = self.ctx.netstate.lock().iso(&src.id);
+                        let creds = match (&self.ctx.routes_src, src.credentials) {
+                            (Some(r), true) => r.source_credentials(self.ctx.net.name(), &src.id)?,
+                            (_, true) => return Err("RPC credentials are unavailable".into()),
+                            _ => None,
+                        };
+                        Ok(Arc::new(crate::rpc::RemoteRpc::new(src, proxy.as_ref(), &iso, creds, self.ctx.rt.clone())?) as Arc<dyn NodeRpc>)
+                    } else { self.ctx.node_src.clone().ok_or_else(|| "bundled node unavailable".into()) }
+                })();
+                let checked = connection.and_then(|rpc| node::status(&NodeClient::new(rpc.clone()), self.ctx.net).map(|st| (rpc, st)));
+                match checked {
+                    Ok((rpc, st)) => {
                         self.node_ok = st.synced;
                         self.ctx.progress.lock().node = Some(st);
+                        let mut ns = self.ctx.netstate.lock();
+                        ns.node_rpc = Some(rpc);
+                        ns.node_id = id;
                     }
                     Err(e) => {
                         self.node_ok = false;
-                        tracing::info!(target: "bitcoin", "local node: {e}");
+                        self.ctx.netstate.lock().node_rpc = None;
+                        self.ctx.progress.lock().last_error = Some(format!("Bitcoin Core RPC: {e}"));
+                        self.failed(&id, &e);
                     }
                 }
             }
             if self.node_ok {
-                // Blocks the pruned node couldn't give: Kyoto holds the chain until it has scanned them.
-                if kyoto && self.gap_pending(KYOTO) {
-                    return Feeder::Kyoto;
-                }
+                if kyoto && self.gap_pending(KYOTO) { return Feeder::Kyoto; }
                 return Feeder::Node;
             }
         } else {
             self.node_ok = false;
+            self.ctx.netstate.lock().node_rpc = None;
         }
-        if kyoto {
-            Feeder::Kyoto
-        } else {
-            Feeder::Servers
-        }
+        if kyoto { Feeder::Kyoto } else { Feeder::Servers }
     }
 
     /// Hands the chain to another feeder: the header chain stays, the old feeder stops.
     fn switch(&mut self, to: Feeder) {
         if to == self.feeder {
+            if to == Feeder::Node {
+                let kind = if self.remote_source.is_some() { RPC_NODE } else { LOCAL_NODE };
+                self.authority.set_kind(kind);
+                self.ctx.netstate.lock().chain_by = kind;
+            }
             return;
         }
         tracing::info!(target: "bitcoin", "the chain authority is now {to:?}, was {:?}", self.feeder);
@@ -565,7 +594,7 @@ impl Loop {
         let kind = match to {
             Feeder::Servers => ELECTRUM_HEADERS,
             Feeder::Kyoto => KYOTO,
-            Feeder::Node => LOCAL_NODE,
+            Feeder::Node => if self.remote_source.is_some() { RPC_NODE } else { LOCAL_NODE },
         };
         self.authority.set_kind(kind);
         self.ctx.netstate.lock().chain_by = kind;
@@ -581,8 +610,8 @@ impl Loop {
             Feeder::Node => match self.follow_node() {
                 Ok(x) => x,
                 Err(e) => {
-                    tracing::info!(target: "bitcoin", "local node: {e}");
-                    self.ctx.progress.lock().last_error = Some(format!("local node: {e}"));
+                    tracing::info!(target: "bitcoin", "Bitcoin Core node: {e}");
+                    self.ctx.progress.lock().last_error = Some(format!("Bitcoin Core node: {e}"));
                     self.node_ok = false;
                     self.node = None;
                     (Change::default(), vec![])
@@ -847,7 +876,7 @@ impl Loop {
     fn end_pass(&mut self, source: &str) -> bool {
         let (window_key, scanned_key) = match source {
             KYOTO => (KYOTO_WINDOW, KYOTO_SCANNED),
-            LOCAL_NODE => (NODE_WINDOW, NODE_SCANNED),
+            LOCAL_NODE | RPC_NODE => (NODE_WINDOW, NODE_SCANNED),
             _ => return false,
         };
         let next = {
@@ -1178,7 +1207,7 @@ impl Loop {
 
     /// Takes the node's headers up to its tip, then the wallet's transactions in its blocks and mempool.
     fn follow_node(&mut self) -> Result<(Change, Vec<Found>), String> {
-        let rpc = self.ctx.node_src.clone().ok_or("no local node")?;
+        let rpc = self.ctx.netstate.lock().node_rpc.clone().ok_or("no Bitcoin Core connection")?;
         if self.node.is_none() {
             let scanned = self.kyoto_meta(NODE_SCANNED).as_deref().and_then(parse_scanned).filter(|(h, hash)| self.authority.hash_at(*h) == Some(*hash));
             self.node = Some(Follower::new(Arc::new(NodeClient::new(rpc)), scanned));
@@ -1187,14 +1216,14 @@ impl Loop {
         let st = node::status(follower.client(), self.ctx.net)?;
         self.ctx.progress.lock().node = Some(st.clone());
         if !st.synced {
-            return Err(format!("the local node is not synced ({} of {} blocks)", st.blocks, st.headers));
+            return Err(format!("the Bitcoin Core node is not synced ({} of {} blocks)", st.blocks, st.headers));
         }
         let mut change = Change::default();
         while self.authority.chain().tip_height() < st.blocks || self.authority.tip_height().is_none() {
             let c = self.node.as_ref().expect("set").headers(&mut self.authority, st.blocks, now_secs() as u32)?;
             let progressed = c.tip_moved;
             change = merge(change, c);
-            if !progressed || self.stopped() {
+            if !progressed || self.stopped() || self.remote_source.is_some() {
                 break;
             }
         }
@@ -1202,6 +1231,11 @@ impl Loop {
             return Err(format!("the node's headers fail the checks: {}", change.suspects[0].1));
         }
         self.authority.set_peers(1);
+        if let Some(src) = &self.remote_source { self.ctx.netstate.lock().ledger.ok(&src.id, now_secs()); }
+        if self.remote_source.is_some() && self.authority.chain().tip_height() < st.blocks {
+            self.ctx.wake.store(true, Ordering::SeqCst);
+            return Ok((change, vec![]));
+        }
         let (index, expected) = {
             let guard = self.ctx.cell.lock();
             let cell = guard.as_ref().ok_or("closed")?;
@@ -1220,7 +1254,7 @@ impl Loop {
                 self.note_gap(&f.missing, f.unscanned, st.prune_height.unwrap_or(0));
             }
             let hit = !f.tx_update.txs.is_empty();
-            found.push(Found { source: LOCAL_NODE, tx_update: f.tx_update, last_active: f.last_active, evicted: f.evicted, scanned: f.scanned.map(|s| (NODE_SCANNED, s)), at_tip: f.at_tip });
+            found.push(Found { source: if self.remote_source.is_some() { RPC_NODE } else { LOCAL_NODE }, tx_update: f.tx_update, last_active: f.last_active, evicted: f.evicted, scanned: f.scanned.map(|s| (NODE_SCANNED, s)), at_tip: f.at_tip });
             if done || self.stopped() {
                 break;
             }
@@ -1234,6 +1268,8 @@ impl Loop {
         let mut st = st;
         (st.filters, st.matched, st.from_peers, st.pruned_gap) = (f.filters, f.matched, f.from_peers, self.node_gap.clone());
         (st.rescans, st.window) = (self.node_rescans, node::window(&index));
+        st.pending_scan_remaining = f.pending_scan_remaining;
+        if st.pending_scan_remaining > 0 { self.ctx.wake.store(true, Ordering::SeqCst); }
         self.ctx.progress.lock().node = Some(st);
         Ok((change, found))
     }
@@ -1449,6 +1485,7 @@ impl Loop {
         let lied_header = |h: &Header| Inclusion::Lied(format!("its header at {height} hashes to {}", h.block_hash()));
         let checked = |v: ProofVerdict| if v == ProofVerdict::Valid { Inclusion::Proved } else { Inclusion::Lied(format!("{v:?}")) };
         match src.kind {
+            Kind::Rpc => return Err("RPC sources use the Core scanner".into()),
             Kind::Electrum => {
                 let (header, proof) = {
                     let c = self.electrum(src)?;
@@ -1554,6 +1591,7 @@ impl Loop {
             tracing::info!(target: "bitcoin", "{} now knows the wallet's addresses", src.id);
         }
         let (mut update, last_active, mismatched, proofs) = match src.kind {
+            Kind::Rpc => return Err("RPC sources use the Core scanner".into()),
             Kind::Electrum => {
                 let c = self.electrum(&src)?;
                 c.populate_tx_cache(known_txs);
@@ -1740,6 +1778,7 @@ impl Loop {
             let lower_of = |tip: u32| tip.min(auth_tip);
             let random = crosscheck::random_height(birthday, auth_tip.saturating_sub(1), &|h| anchor_heights.contains(&h));
             let answer: Result<Answer, String> = match s.kind {
+                Kind::Rpc => Err("RPC sources use the Core scanner".into()),
                 Kind::Electrum => (|| {
                     let c = self.electrum(&s)?;
                     let tip = c.inner.inner.block_headers_subscribe().map_err(|e| e.to_string())?;
@@ -1803,6 +1842,7 @@ impl Loop {
         let mut estimates = vec![];
         for s in sources {
             let r: Result<SourceEstimate, String> = match s.kind {
+                Kind::Rpc => Err("RPC sources use the Core scanner".into()),
                 Kind::Electrum => (|| {
                     let c = self.electrum(&s)?;
                     let e = c.inner.inner.batch_estimate_fee(fees::TARGETS.iter().map(|t| *t as usize)).map_err(|e| e.to_string())?;
@@ -1825,12 +1865,13 @@ impl Loop {
         // The local node estimates; Kyoto's peers only state the floor they relay at.
         let (local, kyoto) = {
             let ns = self.ctx.netstate.lock();
-            (ns.routes.fees_local && self.feeder == Feeder::Node, ns.kyoto.clone())
+            ((ns.routes.fees_local || ns.routes.rpc.is_some()) && self.feeder == Feeder::Node, ns.kyoto.clone())
         };
-        if let (true, Some(rpc)) = (local, self.ctx.node_src.clone()) {
-            match node::fees(&NodeClient::new(rpc), "local") {
+        let (rpc, node_id) = { let ns = self.ctx.netstate.lock(); (ns.node_rpc.clone(), ns.node_id.clone()) };
+        if let (true, Some(rpc)) = (local, rpc) {
+            match node::fees(&NodeClient::new(rpc), &node_id) {
                 Ok(e) => estimates.push(e),
-                Err(e) => tracing::info!(target: "bitcoin", "local node fees: {e}"),
+                Err(e) => tracing::info!(target: "bitcoin", "Bitcoin Core fees: {e}"),
             }
         }
         if let Some(m) = kyoto.and_then(|r| kyoto::min_fee_rate(&self.ctx.rt, &r)) {
@@ -1988,6 +2029,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             node_rescans: 0,
             node_ok: false,
             node_probe: None,
+            remote_source: None,
             node_gap,
             clients: HashMap::new(),
             esplora: HashMap::new(),

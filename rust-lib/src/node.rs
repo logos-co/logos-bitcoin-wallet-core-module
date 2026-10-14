@@ -2,7 +2,7 @@
 //! IPC behind bitcoincore_rpc's RpcApi, followed with bdk_bitcoind_rpc's Emitter. A backlog is
 //! scanned with the node's block filters; a pruned block that matches is asked of its peers.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +26,10 @@ use crate::network::BNetwork;
 /// One call into the node's RPC table, as `bitcoind_module.rpc` makes it: `params` is a JSON
 /// array, and the reply is Core's, `{"result": .., "error": null | {code, message}}`.
 pub trait NodeRpc: Send + Sync {
+    fn remote(&self) -> bool { false }
+    fn batch(&self, method: &str, params: &[Value]) -> Result<Vec<String>, String> {
+        params.iter().map(|p| self.rpc(method, &p.to_string())).collect()
+    }
     fn rpc(&self, method: &str, params: &str) -> Result<String, String>;
 }
 
@@ -67,11 +71,30 @@ impl NodeClient {
         let v: Value = serde_json::from_str(&reply).map_err(|e| Failure::Transport(format!("{method}: not JSON: {e}")))?;
         match &v["error"] {
             Value::Null => Ok(v["result"].clone()),
-            e => Err(Failure::Rpc { code: e["code"].as_i64().unwrap_or(0), message: e["message"].as_str().unwrap_or("refused").to_string() }),
+            e => {
+                let message = e["message"].as_str().unwrap_or("refused");
+                // Keep only the capability categories the scanner needs from a remote service.
+                let message = if !self.remote() { message }
+                    else if method == "getblockfilter" && message.contains("not enabled") { "block filter index not enabled" }
+                    else if method == "getblock" && message.contains("pruned") { "block pruned" }
+                    else if method == "getblockfrompeer" && message.contains("already") { "block already requested" }
+                    else { "RPC request refused" };
+                Err(Failure::Rpc { code: e["code"].as_i64().unwrap_or(0), message: message.to_string() })
+            },
         }
     }
 
+    fn batch(&self, method: &str, params: &[Value]) -> Result<Vec<Value>, String> {
+        self.rpc.batch(method, params)?.iter().map(|s| {
+            let v: Value = serde_json::from_str(s).map_err(|_| "RPC response is not JSON")?;
+            if !v["error"].is_null() { return Err(format!("{method}: RPC error {}", v["error"]["code"])); }
+            v.get("result").cloned().ok_or_else(|| "RPC result missing".into())
+        }).collect()
+    }
+
     /// Mempool transactions can't be read while the module refuses getrawtransaction.
+    pub fn remote(&self) -> bool { self.rpc.remote() }
+
     pub fn reads_mempool(&self) -> bool {
         !self.no_rawtx.load(Ordering::SeqCst)
     }
@@ -130,6 +153,7 @@ pub struct NodeStatus {
     /// Scans started over from the birthday with a wider window, and the highest index the scan
     /// watches per keychain (external, internal).
     pub rescans: u32,
+    pub pending_scan_remaining: usize,
     pub window: [u32; 2],
 }
 
@@ -152,7 +176,7 @@ pub fn status(c: &NodeClient, net: BNetwork) -> Result<NodeStatus, String> {
     let i = c.raw("getblockchaininfo", &[]).map_err(|e| e.to_string())?;
     let chain = i["chain"].as_str().unwrap_or_default();
     if chain != chain_name(net) {
-        return Err(format!("the local node runs {chain}, not {}", chain_name(net)));
+        return Err(format!("the Bitcoin Core node runs {chain}, not {}", chain_name(net)));
     }
     let n = |k: &str| i[k].as_u64().unwrap_or(0) as u32;
     let initial_sync = i["initialblockdownload"].as_bool().unwrap_or(true);
@@ -196,6 +220,8 @@ pub struct Follower {
     pub filters: Option<bool>,
     pub matched: u32,
     pub from_peers: u32,
+    remote_seen: HashSet<Txid>,
+    pub pending_scan_remaining: usize,
 }
 
 /// Headers fetched per call to `headers`: two calls each over IPC.
@@ -256,7 +282,7 @@ fn decode_block(v: &Value, hash: &BlockHash) -> Result<Block, String> {
 
 impl Follower {
     pub fn new(client: Arc<NodeClient>, scanned: Option<(u32, BlockHash)>) -> Self {
-        Self { client, emitter: None, scanned, recent: VecDeque::new(), filters: None, matched: 0, from_peers: 0 }
+        Self { client, emitter: None, scanned, recent: VecDeque::new(), filters: None, matched: 0, from_peers: 0, remote_seen: HashSet::new(), pending_scan_remaining: 0 }
     }
 
     fn mark(&mut self, height: u32, hash: BlockHash) {
@@ -345,12 +371,17 @@ impl Follower {
         let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(index.clone());
         let mut spks = watched(&graph.index);
         let mut found = Found::default();
-        for h in start..=end.min(start + FILTERS_PER_POLL - 1) {
+        let end = end.min(start + if self.client.remote() { 64 } else { FILTERS_PER_POLL } - 1);
+        let filters = if self.client.remote() {
+            let params: Result<Vec<_>, String> = (start..=end).map(|h| authority.hash_at(h).map(|hash| json!([hash.to_string()])).ok_or_else(|| format!("no header at {h}"))).collect();
+            Some(self.client.batch("getblockfilter", &params?)?)
+        } else { None };
+        for h in start..=end {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
             let hash = authority.hash_at(h).ok_or_else(|| format!("no header at {h} yet"))?;
-            let f = match self.client.raw("getblockfilter", &[json!(hash.to_string())]) {
+            let f = match filters.as_ref().map(|v| Ok(v[(h-start) as usize].clone())).unwrap_or_else(|| self.client.raw("getblockfilter", &[json!(hash.to_string())])) {
                 Ok(f) => f,
                 Err(e) => {
                     // The index hasn't reached it yet: this round ends here, the next goes on.
@@ -385,7 +416,7 @@ impl Follower {
     pub fn headers(&self, authority: &mut ChainAuthority, node_tip: u32, now: u32) -> Result<Change, String> {
         let base = authority.base_height();
         if node_tip < base {
-            return Err(format!("the local node is at {node_tip}, below the wallet's checkpoint {base}"));
+            return Err(format!("the Bitcoin Core node is at {node_tip}, below the wallet's checkpoint {base}"));
         }
         let mut fork = authority.chain().tip_height().min(node_tip);
         loop {
@@ -393,14 +424,23 @@ impl Follower {
                 break;
             }
             if fork == base {
-                return Err("the local node's chain does not contain the wallet's checkpoint".into());
+                return Err("the Bitcoin Core node's chain does not contain the wallet's checkpoint".into());
             }
             fork -= 1;
         }
-        let end = node_tip.min(fork + HEADERS_PER_POLL);
+        let end = node_tip.min(fork + if self.client.remote() { 128 } else { HEADERS_PER_POLL });
         let mut branch = Vec::with_capacity((end - fork) as usize);
-        for h in fork + 1..=end {
-            branch.push(header_of(&self.client, &hash_at(&self.client, h)?)?);
+        if self.client.remote() && end > fork {
+            let params: Vec<_> = (fork+1..=end).map(|h| json!([h])).collect();
+            let hashes = self.client.batch("getblockhash", &params)?;
+            let params: Vec<_> = hashes.iter().map(|h| json!([h, false])).collect();
+            for (raw, hash) in self.client.batch("getblockheader", &params)?.iter().zip(hashes.iter()) {
+                let header: Header = deserialize_hex(raw.as_str().ok_or("RPC header is not hex")?).map_err(|e| e.to_string())?;
+                if header.block_hash().to_string() != hash.as_str().unwrap_or_default() { return Err("RPC header hash mismatch".into()); }
+                branch.push(header);
+            }
+        } else {
+            for h in fork + 1..=end { branch.push(header_of(&self.client, &hash_at(&self.client, h)?)?); }
         }
         Ok(authority.adopt(fork, &branch, now))
     }
@@ -430,7 +470,7 @@ impl Follower {
             let below = start - 1;
             let hash = authority.hash_at(below).ok_or_else(|| format!("no header at {below} yet"))?;
             let cp = CheckPoint::new(BlockId { height: below, hash });
-            self.emitter = Some(Emitter::new(self.client.clone(), cp, below, expected));
+            self.emitter = Some(Emitter::new(self.client.clone(), cp, below, expected.clone()));
         }
         let emitter = self.emitter.as_mut().expect("set above");
         let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(index.clone());
@@ -438,7 +478,7 @@ impl Follower {
         let mut emitted = vec![];
         let mut ahead = false;
         loop {
-            if emitted.len() == BLOCKS_PER_POLL {
+            if stop.load(Ordering::SeqCst) || emitted.len() == if self.client.remote() { 2 } else { BLOCKS_PER_POLL } {
                 break;
             }
             match emitter.next_block().map_err(|e| format!("node: {e}"))? {
@@ -472,8 +512,32 @@ impl Follower {
             }
             found.scanned = self.scanned;
         }
-        if found.at_tip {
-            if let Some(e) = self.emitter.as_mut() {
+        if found.at_tip && !stop.load(Ordering::SeqCst) {
+            if self.client.remote() {
+                // A public node can have a large mempool. Scan bounded batches, never one
+                // blocking Emitter pass over every transaction. Check every returned txid.
+                let pool = self.client.get_raw_mempool().map_err(|_| "RPC mempool unavailable")?;
+                let current: HashSet<_> = pool.iter().copied().collect();
+                self.remote_seen.retain(|id| current.contains(id));
+                let pending: Vec<_> = pool.iter().filter(|id| !self.remote_seen.contains(*id)).copied().collect();
+                let ids: Vec<_> = pending.iter().take(32).copied().collect();
+                let params: Vec<_> = ids.iter().map(|id| json!([id.to_string(), false])).collect();
+                let replies = self.client.rpc.batch("getrawtransaction", &params)?;
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let mut txs = vec![];
+                for (id, reply) in ids.iter().zip(replies) {
+                    let v: Value = serde_json::from_str(&reply).map_err(|_| "invalid RPC transaction reply")?;
+                    if v["error"]["code"] == -5 { continue; } // mined/evicted between the two calls
+                    if !v["error"].is_null() { return Err("RPC mempool transaction unavailable".into()); }
+                    let tx: Transaction = deserialize_hex(v["result"].as_str().ok_or("RPC transaction is not hex")?).map_err(|_| "invalid RPC transaction")?;
+                    if tx.compute_txid() != *id { return Err("RPC transaction ID mismatch".into()); }
+                    txs.push((tx, now));
+                    self.remote_seen.insert(*id);
+                }
+                self.pending_scan_remaining = current.len().saturating_sub(self.remote_seen.len());
+                let _ = graph.batch_insert_relevant_unconfirmed(txs);
+                found.evicted = expected.iter().map(|tx| tx.compute_txid()).filter(|id| !current.contains(id)).map(|id| (id, now)).collect();
+            } else if let Some(e) = self.emitter.as_mut() {
                 let m = e.mempool().map_err(|e| format!("node mempool: {e}"))?;
                 let _ = graph.batch_insert_relevant_unconfirmed(m.update.into_iter().map(|(tx, at)| (tx, at)));
                 found.evicted = m.evicted;

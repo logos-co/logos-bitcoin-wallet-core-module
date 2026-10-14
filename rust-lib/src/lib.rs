@@ -86,3 +86,5 @@ mod contract {
         assert_eq!(banned(&trait_params(fake)[0]), Some("password"));
     }
 }
+
+mod rpc;

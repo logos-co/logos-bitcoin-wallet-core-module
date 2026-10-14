@@ -743,3 +743,23 @@ bundle, the keystore side and the core run on Windows and reach it directly unde
   restarts or the wallet is opened again.
 - Signet checks proof of work against each header's own target only: its block signatures need
   the blocks.
+
+## Remote Bitcoin Core RPC
+
+A route-table source with `kind: "rpc"` uses the node scanner over HTTP/HTTPS. Public hosts
+require HTTPS; user-added LAN endpoints can use HTTP. Optional basic authentication comes from
+the node module's `source_credentials`; it never becomes a signing credential. TLS pins and
+per-source Tor routes are honored, redirects and ambient proxies are disabled, and error messages
+do not include credentials or response bodies. The bundled node takes priority if also enabled.
+
+The core verifies the network and headers, scans compact block filters when available, and falls
+back to full blocks without a filter index. Public RPC services without filters can require a large
+download and very slow historical restores. Nodes must retain the blocks needed by the wallet.
+No descriptor import or server-side Core wallet is required: keys and signing stay in the signer.
+Header/filter queries are batched; pending transactions are scanned in bounded batches, with
+`node.pendingScanRemaining` indicating unfinished pending-transaction scanning.
+
+`tests/rpc.rs` runs receive (including unconfirmed payments), restore, signing and broadcast
+through an authenticated HTTP endpoint, without Electrum or Esplora. Run with `--features
+test-hooks --test rpc -- --ignored`, the standard regtest environment, and `RPC_TEST_FILTERS=0`
+when the test node runs without `-blockfilterindex`.

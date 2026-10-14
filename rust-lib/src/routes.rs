@@ -22,6 +22,7 @@ pub enum Route {
 pub enum Kind {
     Electrum,
     Esplora,
+    Rpc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -81,6 +82,7 @@ pub struct KyotoRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authority {
     Local,
+    Rpc,
     Kyoto,
 }
 
@@ -128,6 +130,8 @@ pub struct Routes {
     pub proxy: Option<Proxy>,
     /// The local node enabled for the chain (`bitcoind_module`): the authority while it is synced.
     pub local: Option<String>,
+    /// Remote Bitcoin Core, independent of the bundled node.
+    pub rpc: Option<Source>,
     /// Kyoto enabled for the chain: the authority when the local node isn't.
     pub kyoto: Option<KyotoRoute>,
     /// Electrum servers for the header chain, used only when neither authority is enabled.
@@ -187,7 +191,7 @@ fn kind_of(url: &str) -> Option<Kind> {
 
 /// TLS servers take a pin: `ssl://` Electrum, `https://` Esplora.
 fn pinnable(kind: Kind, url: &str) -> bool {
-    matches!((kind, url.split_once("://").map(|(s, _)| s)), (Kind::Electrum, Some("ssl")) | (Kind::Esplora, Some("https")))
+    matches!((kind, url.split_once("://").map(|(s, _)| s)), (Kind::Electrum, Some("ssl")) | (Kind::Esplora | Kind::Rpc, Some("https")))
 }
 
 fn plaintext(url: &str) -> bool {
@@ -208,6 +212,7 @@ pub fn resolve(e: &Entry, proxy: Option<&Proxy>) -> Option<Source> {
     let kind = match e.kind.as_deref() {
         Some("electrum") => Kind::Electrum,
         Some("esplora") => Kind::Esplora,
+        Some("rpc") => Kind::Rpc,
         // Kyoto and the local node are authorities, read apart.
         Some(_) => return None,
         None => kind_of(&e.url)?,
@@ -291,24 +296,27 @@ impl Routes {
                 _ => Ok(vec![]),
             }
         };
-        let servers = |name: &str| -> Result<Vec<Source>, String> { Ok(entries(name)?.iter().filter_map(|e| resolve(e, proxy.as_ref())).collect()) };
+        let servers = |name: &str| -> Result<Vec<Source>, String> { Ok(entries(name)?.iter().filter_map(|e| resolve(e, proxy.as_ref())).filter(|s| s.kind != Kind::Rpc).collect()) };
         let kind = |e: &Entry, k: &str| e.kind.as_deref() == Some(k);
         let chain = entries("chain")?;
         let (peers, listed) = parse_peers(v.get("peers"));
         let kyoto = chain.iter().find(|e| kind(e, "kyoto")).map(|e| KyotoRoute { listed: listed.clone(), ..resolve_kyoto(&e.id, e.route, peers.clone(), proxy.as_ref()) });
         let local = chain.iter().find(|e| kind(e, "local")).map(|e| e.id.clone());
+        let rpc = chain.iter().find(|e| kind(e, "rpc")).and_then(|e| resolve(e, proxy.as_ref()));
         let broadcast_by = entries("broadcast")?
             .iter()
             .filter_map(|e| match e.kind.as_deref() {
                 Some("local") => Some(Authority::Local),
+                Some("rpc") => Some(Authority::Rpc),
                 Some("kyoto") => Some(Authority::Kyoto),
                 _ => None,
             })
             .collect();
-        let authority = kyoto.is_some() || local.is_some();
+        let authority = kyoto.is_some() || local.is_some() || rpc.is_some();
         Ok(Routes {
             chain: if authority { vec![] } else { chain.iter().filter_map(|e| resolve(e, proxy.as_ref())).filter(|s| s.kind == Kind::Electrum).collect() },
             local,
+            rpc,
             kyoto,
             history: servers("history")?,
             pending: servers("pending")?,
@@ -353,6 +361,7 @@ impl Routes {
             chain: if authority { vec![] } else { sources.iter().filter(|s| s.kind == Kind::Electrum).cloned().collect() },
             fees_local: local.is_some(),
             local,
+            rpc: None,
             kyoto,
             history: syncing.clone(),
             pending: syncing.clone(),
@@ -368,7 +377,7 @@ impl Routes {
 
     /// Whether the table routes anything: a server, Kyoto or the local node.
     pub fn has_entries(&self) -> bool {
-        !self.every().is_empty() || self.kyoto.is_some() || self.local.is_some()
+        !self.every().is_empty() || self.kyoto.is_some() || self.local.is_some() || self.rpc.is_some()
     }
 
     /// Regtest: the node module's table when it holds entries, with regtest.json's poll and
@@ -391,11 +400,13 @@ impl Routes {
         [&self.chain, &self.history, &self.pending, &self.fees, &self.broadcast, &self.check]
             .into_iter()
             .flatten()
+            .chain(self.rpc.iter())
             .filter(|s| seen.insert(s.id.clone()))
             .collect()
     }
 
     pub fn roles_of(&self, id: &str) -> Vec<&'static str> {
+        if self.rpc.as_ref().is_some_and(|s| s.id == id) { return vec!["chain", "history", "pending", "fees", "broadcast"]; }
         [("chain", &self.chain), ("history", &self.history), ("pending", &self.pending), ("fees", &self.fees), ("broadcast", &self.broadcast), ("check", &self.check)]
             .into_iter()
             .filter(|(_, l)| l.iter().any(|s| s.id == id))
@@ -572,5 +583,19 @@ mod tests {
         assert!(r.cross_check);
         assert_eq!(r.poll_secs, 1);
         assert_ne!(Isolation::fresh(), Isolation::fresh());
+    }
+}
+
+#[cfg(test)]
+mod rpc_tests {
+    use super::*;
+    #[test]
+    fn rpc_never_becomes_an_esplora_address_query() {
+        let e=serde_json::json!({"id":"rpc","kind":"rpc","url":"https://rpc.example","route":"direct"});
+        let r=Routes::from_table(&serde_json::json!({"chain":[e],"history":[e],"pending":[e],"fees":[e],"broadcast":[e],"check":[e]}).to_string()).unwrap();
+        assert_eq!(r.rpc.as_ref().unwrap().kind,Kind::Rpc);
+        assert!(r.history.is_empty() && r.pending.is_empty() && r.fees.is_empty() && r.check.is_empty());
+        assert_eq!(r.broadcast_by,vec![Authority::Rpc]);
+        assert_eq!(r.every().len(),1);
     }
 }
