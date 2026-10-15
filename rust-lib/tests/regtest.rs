@@ -288,7 +288,7 @@ fn bitcoin_wallet_on_regtest() {
     assert!(root.path().join("wallets/regtest").join(device).join("wallet.db").exists());
     t.synced();
     t.wait("the device account's coins", 60, || t.sats("confirmed") == segwit);
-    let (_, dsent) = t.send(&theirs, 1_000_000, None);
+    let (_, dsent) = t.send(&theirs, 1_000_000, Some(2.0));
     let dtxid = dsent["txid"].as_str().unwrap().to_string();
     t.mine(1);
     t.synced();
