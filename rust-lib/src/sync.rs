@@ -347,6 +347,10 @@ impl Loop {
             if rebase {
                 let _ = c.clear_headers();
                 let _ = meta_set(&c.conn, CHAIN_BASE, &want.height.to_string());
+                // The shared store may hold the lower start already.
+                if let Some(shared) = c.shared.as_mut().and_then(|s| s.load(now_secs() as u32)) {
+                    self.authority.seed(&shared, None, now_secs() as u32);
+                }
             }
         }
         let n = kyoto::lookahead_for(self.gap());
@@ -680,6 +684,70 @@ impl Loop {
             (self.ctx.notify)(Note::State);
         }
         moved
+    }
+
+    /// Headers the shared store gave past what this wallet checked itself: the first source that
+    /// holds the same block at their first height vouches for them all. A source holding another
+    /// block there disowns them, and they are read from the sources again.
+    fn vouch_seed(&mut self) {
+        let Some(at) = self.authority.seed_from() else { return };
+        let Some(ours) = self.authority.hash_at(at) else { return self.authority.vouch() };
+        let sources: Vec<Source> = {
+            let ns = self.ctx.netstate.lock();
+            let mut seen = HashSet::new();
+            ns.routes.chain.iter().chain(&ns.routes.check)
+                .filter(|s| s.down.is_none() && ns.ledger.may_ask(&s.id, now_secs()) && seen.insert(s.id.clone()))
+                .cloned()
+                .collect()
+        };
+        let mut disowned = vec![];
+        for s in sources {
+            let theirs: Result<BlockHash, String> = match s.kind {
+                Kind::Electrum => self.electrum(&s).and_then(|c| c.inner.inner.block_header(at as usize).map(|h| h.block_hash()).map_err(|e| e.to_string())),
+                Kind::Esplora => match self.esplora(&s).map(|c| c.clone()) {
+                    Ok(c) => self.ctx.rt.block_on(c.get_block_hash(at)).map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                },
+                Kind::Rpc => continue,
+            };
+            match theirs {
+                Ok(h) if h == ours => {
+                    tracing::info!(target: "bitcoin", "{} holds the shared headers from {at}", s.id);
+                    return self.vouched();
+                }
+                Ok(_) => disowned.push(s.id.clone()),
+                // Behind, or not answering: no word either way.
+                Err(_) => {}
+            }
+        }
+        let node = self.ctx.netstate.lock().node_rpc.clone();
+        if let Some(rpc) = node {
+            match node::hash_at(&NodeClient::new(rpc), at) {
+                Ok(h) if h == ours => return self.vouched(),
+                Ok(_) => disowned.push("the node".to_string()),
+                Err(_) => {}
+            }
+        }
+        if disowned.is_empty() {
+            return;
+        }
+        tracing::warn!(target: "bitcoin", "{} hold(s) another block at {at} than the shared header store: its headers from there are dropped and read again", disowned.join(", "));
+        if let Some((from, hash)) = self.authority.disown() {
+            if let Some(shared) = self.ctx.cell.lock().as_mut().and_then(|c| c.shared.as_mut()) {
+                if let Err(e) = shared.disown(from, hash) {
+                    tracing::warn!(target: "bitcoin", "{e}");
+                }
+            }
+        }
+        self.ctx.progress.lock().authority = self.authority.summary(now_secs());
+    }
+
+    /// The shared headers are the wallet's own now: its tip says so in its database.
+    fn vouched(&mut self) {
+        self.authority.vouch();
+        if let Some(c) = self.ctx.cell.lock().as_ref() {
+            let _ = c.note_tip(self.authority.chain());
+        }
     }
 
     /// Asks the Electrum header sources and keeps the most-work valid chain.
@@ -1166,6 +1234,10 @@ impl Loop {
         let fork = above.iter().rev().find(|(h, hash)| self.authority.hash_at(*h) == Some(*hash)).map_or(start.known_to.max(base), |(h, _)| *h);
         if self.authority.hash_at(fork).is_none() {
             return Err(format!("Kyoto's chain doesn't meet the wallet's at {fork}"));
+        }
+        // Kyoto's peers built on the shared headers: they hold them.
+        if !above.is_empty() && self.authority.seed_from().is_some_and(|s| fork >= s) {
+            self.vouched();
         }
         let wanted: Vec<(u32, BlockHash)> = above.into_iter().filter(|(h, _)| *h > fork).collect();
         // Without the headers, the update's transactions still count: anchors above the chain's
@@ -1948,12 +2020,15 @@ impl Loop {
             if self.ctx.reload_routes.swap(false, Ordering::SeqCst) || self.last_routes.elapsed() >= due {
                 self.reload_routes();
             }
+            self.vouch_seed();
             let moved = self.refresh_authority();
             if self.stopped() {
                 break;
             }
             let woken = self.ctx.wake.swap(false, Ordering::SeqCst);
-            if self.servers_hold_history() && (moved || woken || self.last_history.is_none_or(|t| t.elapsed() >= history_every)) {
+            // Until a source vouches for the shared headers, history syncs and cross-checks wait.
+            let vouched = self.authority.seed_from().is_none();
+            if vouched && self.servers_hold_history() && (moved || woken || self.last_history.is_none_or(|t| t.elapsed() >= history_every)) {
                 if let Err(e) = self.sync_history() {
                     tracing::info!(target: "bitcoin", "history: {e}");
                     self.ctx.progress.lock().last_error = Some(e);
@@ -1963,7 +2038,7 @@ impl Loop {
             if self.stopped() {
                 break;
             }
-            if moved || self.last_cross.is_none_or(|t| t.elapsed() >= self.cross_delay) {
+            if vouched && (moved || self.last_cross.is_none_or(|t| t.elapsed() >= self.cross_delay)) {
                 self.cross_check();
             }
             if self.last_fees.is_none_or(|t| t.elapsed() >= FEES_EVERY) {

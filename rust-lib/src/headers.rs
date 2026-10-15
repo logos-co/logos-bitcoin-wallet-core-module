@@ -208,6 +208,33 @@ impl HeaderChain {
         *self.work.last().expect("never empty")
     }
 
+    /// The work of the headers above `height`; none at or past the tip.
+    pub fn work_after(&self, height: u32) -> Work {
+        match height.checked_sub(self.base).map(|i| i as usize).filter(|i| *i < self.work.len()) {
+            Some(i) => self.total_work() - self.work[i],
+            None => Work::from_be_bytes([0; 32]),
+        }
+    }
+
+    /// The chain from `height` up, `height` its start; nothing is checked again.
+    pub fn suffix(&self, height: u32) -> Option<HeaderChain> {
+        let i = height.checked_sub(self.base)? as usize;
+        if i >= self.headers.len() {
+            return None;
+        }
+        let below = i.checked_sub(1).map(|j| self.work[j]);
+        let work = self.work[i..].iter().map(|w| below.map_or(*w, |b| *w - b)).collect();
+        Some(Self { net: self.net, base: height, headers: self.headers[i..].to_vec(), hashes: self.hashes[i..].to_vec(), work })
+    }
+
+    /// Drops the headers above `height`; the start always stays.
+    pub fn truncate(&mut self, height: u32) {
+        let keep = (height.saturating_sub(self.base) as usize + 1).min(self.headers.len());
+        self.headers.truncate(keep);
+        self.hashes.truncate(keep);
+        self.work.truncate(keep);
+    }
+
     /// Headers above `height`, for storing.
     pub fn headers_from(&self, height: u32) -> impl Iterator<Item = (u32, &Header)> {
         let start = height.saturating_sub(self.base) as usize;
@@ -511,6 +538,22 @@ pub(crate) mod tests {
         // Only retarget blocks: between them, the median time past is the rule.
         assert!(timewarp_ok(120_961, &prev, &early));
         assert_eq!(validate(BNetwork::Testnet4, 120_960, &prev, &boundary, &|_| None, NOW), Ok(()));
+    }
+
+    #[test]
+    fn a_suffix_keeps_its_hashes_and_its_own_work() {
+        let mut c = HeaderChain::new(BNetwork::Regtest);
+        c.try_extend(0, &regtest_branch(&genesis(), 30, genesis().time, 9), NOW);
+        let s = c.suffix(10).unwrap();
+        assert_eq!((s.base(), s.tip_height(), s.hash_at(10), s.tip_hash()), (10, 30, c.hash_at(10), c.tip_hash()));
+        assert_eq!(s.work_after(10), c.work_after(10));
+        assert_eq!(s.total_work(), c.work_after(9));
+        assert!(c.suffix(31).is_none() && c.suffix(0).is_some());
+        let mut t = c.clone();
+        t.truncate(12);
+        assert_eq!((t.tip_height(), t.tip_hash(), t.work_after(12)), (12, c.hash_at(12).unwrap(), Work::from_be_bytes([0; 32])));
+        t.truncate(0);
+        assert_eq!(t.tip_height(), 0);
     }
 
     #[test]

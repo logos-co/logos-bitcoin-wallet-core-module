@@ -56,7 +56,8 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
 
 Only the authority moves the wallet's chain, in this order: the local node while it is enabled and
 synced, then Kyoto, then the Electrum header chain. Whichever it is feeds one validated header
-chain, stored in the encrypted database, from a checkpoint (`network.rs`). Each network has
+chain from a checkpoint (`network.rs`), kept in the network's shared header store ("Shared
+headers", below). Each network has
 several, each a full header: genesis; on mainnet also 481,823 and 709,631, the blocks before
 segwit's and taproot's activation (bip157's own checkpoints, hashes checked in the tests), and
 935,424 (a retarget boundary whose headers link down to Bitcoin Core 31.1's assumeutxo block
@@ -437,14 +438,56 @@ budget), do `regtest.json`'s own loopback sources serve; other networks keep fai
 "local": false, "kyotoRequired": 2, "checkOnly": false, "pollSecs": 1 }`. So pins, `userAdded` and
 the plain-text rule run end to end on regtest (`tools/e2e/pins.sh`).
 
+## Shared headers
+
+Headers are public, and every wallet on a network reads the same chain, so the core keeps one
+store per network beside the wallets: `<instance>/headers/<network>.db` (`headerstore.rs`), plain
+SQLite (WAL, 0600, the directory 0700). A new wallet, a second one, or one reopened under a new
+database key (its database set aside) reads its headers there instead of from the network; each
+still starts from its own checkpoint, the one below its birthday, taking the store's chain from
+there when the store holds that checkpoint.
+
+- **Nothing is taken as stored.** Each open loads the store's chain from its checkpoint, a header
+  of this build, through the same checks as a source's headers: linkage, proof of work against
+  each header's target, the network's difficulty rules, median time past, no more than two hours
+  ahead. The first header that fails is cut off with every one above it, logged, and read from
+  the sources again; a file that isn't a database of this network and format starts again. The
+  store's chain is taken only where it holds more work than the wallet's own, as a source's branch
+  would be.
+- **The sources vouch for it.** Past what the wallet checked itself (its own stored chain, or its
+  last tip, `chain_tip` in `core_meta`), the store's headers wait for a source: each round, the
+  servers in the `chain` and `check` roles and the node are asked for the block at the first such
+  height, and the first that holds the same one vouches for them all (Kyoto does too, once its
+  update builds on them). A source holding another block there disowns them: they are dropped,
+  from the wallet's chain and from the store, and read from the sources, which is what a regtest
+  chain started over in the same data directory, or a chain written into the store with valid
+  work (cheap on signet and regtest), comes to. Until they are vouched for, history syncs and
+  cross-checks wait. A source that is behind, or doesn't answer, says nothing either way.
+- **Writes keep the most work.** A write, in one immediate transaction, finds where the wallet's
+  chain and the stored one part and replaces the stored headers above that only when the wallet's
+  hold more work; ties keep the store's. A reorg is a write like any other, and two engines writing
+  wallets of the same network take turns on SQLite's lock (5 s busy timeout), the heavier chain
+  ending up stored. A wallet's chain from a lower checkpoint (an earlier birthday) takes the store
+  down to it once it reaches the store's checkpoint; until then, or when the two share no
+  checkpoint, the wallet keeps its headers in its own database, as before.
+- **Migration.** A wallet that kept its headers itself (`core_headers`) opens on them, and its next
+  write puts them in the store and deletes them from its database. The store fills as wallets sync;
+  nothing is copied at open.
+- **What the file shows.** That the person uses the network, how far the chain is synced and when,
+  and the lowest checkpoint a wallet on it starts from: on mainnet, whether some wallet's birthday
+  is before 481,824, 709,632 or 935,424. Wallet ids sit in plain `wallet.json` already. Nothing of a
+  wallet's is in it: its scripts, addresses, history, held anchors, the old hashes proved for its
+  transactions (`core_old_hashes`) and its tip stay in its encrypted database.
+
 ## Persistence
 
-`<instance>/core.log`, and `<instance>/wallets/` (0700), with per wallet
-`<network>/<group>/wallet.json` (group, family, network, created; 0600) and `wallet.db` (SQLCipher,
-0600): BDK's tables plus `core_headers`, `core_old_hashes`, `core_held` (anchors above the tip,
+`<instance>/core.log`, `<instance>/headers/` ("Shared headers"), and `<instance>/wallets/` (0700),
+with per wallet `<network>/<group>/wallet.json` (group, family, network, created; 0600) and
+`wallet.db` (SQLCipher, 0600): BDK's tables plus `core_headers` (only while the shared store can't
+take the wallet's chain, or until a wallet from before it writes again), `core_old_hashes`, `core_held` (anchors above the tip,
 and unchecked ones below the chain's start), `core_exposure`, `core_suspects`, `core_reported`,
 `core_sends` (state `broadcasting`, `sent`, `replaced`, `confirmed`, `conflicted`, `abandoned` or
-`failed`) and `core_meta`, which keeps the birthday, the gap limit (`gap_limit`), the chain's checkpoint (`chain_base`), the last
+`failed`) and `core_meta`, which keeps the birthday, the gap limit (`gap_limit`), the chain's checkpoint (`chain_base`) and its last stored tip (`chain_tip`), the last
 heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`), the indices a scan from the
 birthday watched (`kyoto_window`, `node_window`), a pruned node's gap (`node_gap`), Kyoto's peer
 failures on `regtest.json`'s peers (`kyoto_peers`) and whom each learned peer the wallet reported
@@ -502,6 +545,8 @@ REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --fe
   --test widen -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
   cargo test --release --no-default-features --features test-hooks --test anchors -- --ignored --nocapture
+REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
+  --test shared_headers -- --ignored --nocapture
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test gap -- --ignored --nocapture
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
@@ -595,6 +640,15 @@ and from Electrum, and one made up in an empty block below it shows `unchecked` 
 bdk_electrum checks a proof against the server's own header before anything else sees it, so
 Electrum's made-up payments never show at all. With held anchors confirmed on their hash alone, as
 before, the made-up one confirms at once.
+
+`shared_headers` mines 8,000 blocks and counts the headers electrs sends through a proxy. The
+first wallet on the network reads all 8,102; a second wallet, and the first reopened under a new
+database key (`reset`), read none, the server vouching for the store's with one header. With a
+stored header at 5,000 that no longer links, the next wallet reads from 5,000 up (5,118, the
+server's last 2,016 included to find where the chains meet) and the store is whole again; a store
+file of random bytes starts again; and a store holding another chain 500 blocks longer, valid on
+regtest's work, is disowned by the server at height 1 and replaced by the server's chain, with no
+blame on the server.
 
 `gap` pays the test phrase's receive indices 0 to 10 and 70 to 72, then restores it under Kyoto,
 the node's filters and Electrum. Each wallet is first opened with no route and `gapLimit` 20, and

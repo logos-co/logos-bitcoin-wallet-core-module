@@ -186,7 +186,7 @@ pub fn status(c: &NodeClient, net: BNetwork) -> Result<NodeStatus, String> {
     Ok(NodeStatus { blocks, headers, initial_sync, synced: !initial_sync && blocks + 1 >= headers, pruned, prune_height, ..Default::default() })
 }
 
-fn hash_at(c: &NodeClient, height: u32) -> Result<BlockHash, String> {
+pub(crate) fn hash_at(c: &NodeClient, height: u32) -> Result<BlockHash, String> {
     c.get_block_hash(u64::from(height)).map_err(|e| format!("getblockhash {height}: {e}"))
 }
 
