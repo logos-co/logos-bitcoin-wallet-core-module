@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use bdk_electrum::electrum_client::raw_client::{ElectrumSslStream, RawClient};
 use bdk_electrum::electrum_client::socks::Socks5Stream;
-use bdk_electrum::electrum_client::{ElectrumApi, Param};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
@@ -152,12 +151,28 @@ impl ServerCertVerifier for Capture {
     }
 }
 
-fn tcp(host: &str, port: u16, proxy: Option<(&Proxy, &Isolation)>, timeout: Duration) -> Result<TcpStream, String> {
+/// A TCP connection to `host:port`, through the proxy when given; directly, each address the name
+/// resolves to in turn, the first ones with a share of the timeout, as electrum-client does.
+pub(crate) fn tcp(host: &str, port: u16, proxy: Option<(&Proxy, &Isolation)>, timeout: Duration) -> Result<TcpStream, String> {
     let tcp = match proxy {
         Some((p, iso)) => Socks5Stream::connect_with_password(p.addr(), (host, port), &iso.user, &iso.pass, Some(timeout)).map_err(|e| e.to_string())?.into_inner(),
         None => {
-            let addr = (host, port).to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("the server's name resolves to nothing")?;
-            TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?
+            let addrs: Vec<_> = (host, port).to_socket_addrs().map_err(|e| e.to_string())?.collect();
+            let (mut left, mut last) = (timeout, "the server's name resolves to nothing".to_string());
+            let mut found = None;
+            for (i, addr) in addrs.iter().enumerate() {
+                if i + 1 < addrs.len() {
+                    left = left.div_f32(2.0);
+                }
+                match TcpStream::connect_timeout(addr, left) {
+                    Ok(t) => {
+                        found = Some(t);
+                        break;
+                    }
+                    Err(e) => last = e.to_string(),
+                }
+            }
+            found.ok_or(last)?
         }
     };
     tcp.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
@@ -219,20 +234,24 @@ pub fn client_config(pin: [u8; 32]) -> Result<ClientConfig, String> {
 /// proxy with its own circuit when `proxy` is given.
 pub fn connect(url: &str, pin: [u8; 32], proxy: Option<(&Proxy, &Isolation)>, timeout: Duration) -> Result<RawClient<ElectrumSslStream>, String> {
     let (host, port) = host_port(url)?;
-    let tcp = tcp(&host, port, proxy, timeout)?;
+    over(tcp(&host, port, proxy, timeout)?, &host, pin)
+}
+
+/// The pinned TLS client on a connected socket.
+pub(crate) fn over(tcp: TcpStream, host: &str, pin: [u8; 32]) -> Result<RawClient<ElectrumSslStream>, String> {
     let config = client_config(pin)?;
-    let name = ServerName::try_from(host.clone()).map_err(|_| format!("{host} is not a server name"))?;
+    let name = ServerName::try_from(host.to_string()).map_err(|_| format!("{host} is not a server name"))?;
     let session = ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
     let client = RawClient::from(StreamOwned::new(session, tcp));
     // Electrum asks for server.version first; electrum-client does the same on its own clients.
-    let versions = vec!["1.4".to_string(), "1.6".to_string()];
-    client.raw_call("server.version", vec![Param::String("bitcoin-wallet".into()), Param::StringVec(versions)]).map_err(|e| e.to_string())?;
+    crate::net::negotiate(&client, "bitcoin-wallet")?;
     Ok(client)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bdk_electrum::electrum_client::ElectrumApi;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 

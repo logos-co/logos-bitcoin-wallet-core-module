@@ -186,6 +186,8 @@ pub struct Ctx {
     pub netstate: Arc<Mutex<NetState>>,
     pub progress: Arc<Mutex<Progress>>,
     pub stop: Arc<AtomicBool>,
+    /// The sync's Electrum sockets, cut at close.
+    pub cancel: net::Cancel,
     pub wake: Arc<AtomicBool>,
     pub reload_routes: Arc<AtomicBool>,
     pub notify: Notify,
@@ -486,7 +488,8 @@ impl Loop {
                 let mut ns = self.ctx.netstate.lock();
                 (ns.routes.proxy.clone(), ns.iso(&s.id))
             };
-            let c = net::electrum(s, proxy.as_ref(), &iso)?;
+            let (src, cancel) = (s.clone(), self.ctx.cancel.clone());
+            let c = net::off_thread(&self.ctx.stop, move || net::electrum(&src, proxy.as_ref(), &iso, &cancel))?;
             self.clients.insert(s.id.clone(), BdkElectrumClient::new(Checked::new(c)));
         }
         Ok(&self.clients[&s.id])
@@ -512,6 +515,10 @@ impl Loop {
         let e = &net::redact(e);
         self.clients.remove(id);
         self.esplora.remove(id);
+        // A call a close cut short says nothing of the source.
+        if self.stopped() {
+            return;
+        }
         self.ctx.netstate.lock().ledger.failed(id, e, now_secs());
         tracing::info!(target: "bitcoin", "source {id}: {e}");
     }
@@ -542,7 +549,7 @@ impl Loop {
                             (_, true) => return Err("RPC credentials are unavailable".into()),
                             _ => None,
                         };
-                        Ok(Arc::new(crate::rpc::RemoteRpc::new(src, proxy.as_ref(), &iso, creds, self.ctx.rt.clone())?) as Arc<dyn NodeRpc>)
+                        Ok(Arc::new(crate::rpc::RemoteRpc::new(src, proxy.as_ref(), &iso, creds, self.ctx.rt.clone())?.until(self.ctx.stop.clone())) as Arc<dyn NodeRpc>)
                     } else { self.ctx.node_src.clone().ok_or_else(|| "bundled node unavailable".into()) }
                 })();
                 let checked = connection.and_then(|rpc| node::status(&NodeClient::new(rpc.clone()), self.ctx.net).map(|st| (rpc, st)));
@@ -1523,22 +1530,22 @@ impl Loop {
             }
             Kind::Esplora => {
                 let c = self.esplora(src)?.clone();
-                let rt = self.ctx.rt.clone();
+                let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
                 let header = match header {
                     Some(h) => h,
-                    None => match rt.block_on(c.get_header_by_hash(&hash)) {
+                    None => match net::block_on_until(&rt, &stop, c.get_header_by_hash(&hash))? {
                         Ok(h) if h.block_hash() == hash => h,
                         Ok(h) => return Ok(lied_header(&h)),
                         Err(e) => return Ok(unknown("header", e.to_string())),
                     },
                 };
-                let proof = match rt.block_on(c.get_merkle_proof(&txid)) {
+                let proof = match net::block_on_until(&rt, &stop, c.get_merkle_proof(&txid))? {
                     Ok(Some(p)) if p.block_height == height => p,
                     Ok(Some(p)) => return Ok(Inclusion::Lied(format!("its proof is at height {}", p.block_height))),
                     Ok(None) => return Ok(Inclusion::Lied("no proof for a transaction it says is confirmed".into())),
                     Err(e) => return Ok(unknown("proof", e.to_string())),
                 };
-                let info = match rt.block_on(c.get_block_info(&hash)) {
+                let info = match net::block_on_until(&rt, &stop, c.get_block_info(&hash))? {
                     Ok(i) => i,
                     Err(e) => return Ok(unknown("block", e.to_string())),
                 };
@@ -1616,10 +1623,10 @@ impl Loop {
             }
             Kind::Esplora => {
                 let c = self.esplora(&src)?.clone();
-                let rt = self.ctx.rt.clone();
+                let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
                 let r = match (sync_req, full_req) {
-                    (Some(req), _) => rt.block_on(c.sync(req, 4)).map(|r| (r.tx_update, BTreeMap::new())),
-                    (_, Some(req)) => rt.block_on(c.full_scan(req, gap as usize, 4)).map(|r| (r.tx_update, r.last_active_indices)),
+                    (Some(req), _) => net::block_on_until(&rt, &stop, c.sync(req, 4))?.map(|r| (r.tx_update, BTreeMap::new())),
+                    (_, Some(req)) => net::block_on_until(&rt, &stop, c.full_scan(req, gap as usize, 4))?.map(|r| (r.tx_update, r.last_active_indices)),
                     _ => unreachable!(),
                 };
                 let (update, last) = r.map_err(|e| e.to_string())?;
@@ -1659,8 +1666,8 @@ impl Loop {
             let heights: Vec<u32> = screened.needs_linkage.iter().map(|(_, a)| a.block_id.height).collect();
             let walked = if src.kind == Kind::Esplora {
                 let c = self.esplora(&src)?.clone();
-                let rt = self.ctx.rt.clone();
-                let mut header_of = |hash: BlockHash| rt.block_on(c.get_header_by_hash(&hash)).map_err(|e| net::redact(&e.to_string()));
+                let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
+                let mut header_of = |hash: BlockHash| net::block_on_until(&rt, &stop, c.get_header_by_hash(&hash))?.map_err(|e| net::redact(&e.to_string()));
                 self.authority.prove_below_by_hash(&heights, &mut header_of, ESPLORA_LINK_BUDGET)
             } else {
                 let c = self.clients.get(&src.id).ok_or("no client")?;
@@ -1802,12 +1809,12 @@ impl Loop {
                 })(),
                 Kind::Esplora => (|| {
                     let c = self.esplora(&s)?.clone();
-                    let rt = self.ctx.rt.clone();
-                    let tip_h = rt.block_on(c.get_height()).map_err(|e| e.to_string())?;
+                    let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
+                    let tip_h = net::block_on_until(&rt, &stop, c.get_height())?.map_err(|e| e.to_string())?;
                     let lower = lower_of(tip_h);
-                    let at_lower = rt.block_on(c.get_block_hash(lower)).map_err(|e| e.to_string())?;
+                    let at_lower = net::block_on_until(&rt, &stop, c.get_block_hash(lower))?.map_err(|e| e.to_string())?;
                     let random = match random.filter(|r| *r <= lower) {
-                        Some(r) => Some((r, rt.block_on(c.get_block_hash(r)).map_err(|e| e.to_string())?)),
+                        Some(r) => Some((r, net::block_on_until(&rt, &stop, c.get_block_hash(r))?.map_err(|e| e.to_string())?)),
                         None => None,
                     };
                     Ok(Answer { tip: tip_h, hash_at_lower: Some(at_lower), random })
@@ -1861,7 +1868,7 @@ impl Loop {
                 })(),
                 Kind::Esplora => (|| {
                     let c = self.esplora(&s)?.clone();
-                    let m = self.ctx.rt.block_on(c.get_fee_estimates()).map_err(|e| e.to_string())?;
+                    let m = net::block_on_until(&self.ctx.rt, &self.ctx.stop, c.get_fee_estimates())?.map_err(|e| e.to_string())?;
                     let at = |t: u16| m.get(&t).copied();
                     Ok(SourceEstimate { source: s.id.clone(), rates: [at(fees::TARGETS[0]), at(fees::TARGETS[1]), at(fees::TARGETS[2])], minimum: None })
                 })(),
@@ -2018,6 +2025,8 @@ fn cap(cell: &Cell, claimed: &BTreeMap<KeychainKind, u32>, update: &TxUpdate<Con
 /// Starts the sync thread for an open wallet.
 pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name("bitcoin-sync".into()).spawn(move || {
+        #[cfg(any(test, feature = "test-hooks"))]
+        let _live = Live::new();
         let meta = |key: &str| ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, key).ok().flatten());
         let book = meta(KYOTO_PEERS).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         let mut peer_reports = PeerReports::default();
@@ -2059,6 +2068,25 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
         };
         l.run();
     })
+}
+
+/// Counts the running sync threads for the tests (`engine::hooks::SYNC_THREADS`).
+#[cfg(any(test, feature = "test-hooks"))]
+struct Live;
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Live {
+    fn new() -> Self {
+        crate::engine::hooks::SYNC_THREADS.fetch_add(1, Ordering::SeqCst);
+        Live
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for Live {
+    fn drop(&mut self) {
+        crate::engine::hooks::SYNC_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A status fragment for the progress figures.
