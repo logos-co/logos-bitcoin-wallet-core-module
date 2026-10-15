@@ -21,7 +21,7 @@ use bitcoin::{BlockHash, ScriptBuf, Txid};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
+use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderProgress, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
 use crate::checks::{self, ChainView, ProofVerdict};
 use crate::crosscheck::{self, Answer, Verdict};
 use crate::fees::{self, SourceEstimate};
@@ -340,7 +340,7 @@ impl Loop {
             tracing::info!(target: "bitcoin", "the chain starts again at {}, was {}", want.height, self.authority.base_height());
             self.authority.rebase(want);
             self.clients.clear();
-            self.ctx.progress.lock().authority = self.authority.summary(now_secs());
+            self.ctx.progress.lock().authority = self.summary();
         }
         if let Some(c) = self.ctx.cell.lock().as_mut() {
             let _ = forget_scans(&c.conn);
@@ -424,6 +424,21 @@ impl Loop {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The authority's figures for `status`; while Kyoto syncs headers only, its own best header.
+    fn summary(&self) -> authority::Summary {
+        let mut s = self.authority.summary(now_secs());
+        if self.feeder == Feeder::Kyoto && self.kyoto_rescan.is_some() {
+            s.headers = Some(HeaderProgress { have: self.kyoto_status.headers.max(s.height.unwrap_or(0)), target: None });
+        }
+        s
+    }
+
+    /// Puts the authority's figures in `status` now, for the app.
+    fn publish(&self) {
+        self.ctx.progress.lock().authority = self.summary();
+        (self.ctx.notify)(Note::State);
     }
 
     fn alert(&self, source: &str, kind: &'static str, detail: String) {
@@ -678,7 +693,7 @@ impl Loop {
                 }
             }
         }
-        self.ctx.progress.lock().authority = self.authority.summary(now_secs());
+        self.ctx.progress.lock().authority = self.summary();
         if reorged {
             // The app hears of it now, not after this round's history sync.
             (self.ctx.notify)(Note::State);
@@ -739,7 +754,7 @@ impl Loop {
                 }
             }
         }
-        self.ctx.progress.lock().authority = self.authority.summary(now_secs());
+        self.ctx.progress.lock().authority = self.summary();
     }
 
     /// The shared headers are the wallet's own now: its tip says so in its database.
@@ -774,7 +789,13 @@ impl Loop {
         let adapters: Vec<ElectrumHeaders<'_, Checked<net::Conn>>> =
             ready.iter().map(|s| ElectrumHeaders { id: &s.id, client: &self.clients[&s.id].inner }).collect();
         let dyns: Vec<&dyn HeaderSource> = adapters.iter().map(|a| a as &dyn HeaderSource).collect();
-        let change = self.authority.refresh(&dyns, now_secs() as u32);
+        // Each answer of a long download shows in status as it is taken.
+        let (progress, notify) = (self.ctx.progress.clone(), self.ctx.notify.clone());
+        let mut on_chunk = |a: &ChainAuthority| {
+            progress.lock().authority = a.summary(now_secs());
+            notify(Note::State);
+        };
+        let change = self.authority.refresh_with(&dyns, now_secs() as u32, &mut on_chunk);
         drop(dyns);
         drop(adapters);
         for (id, e) in &change.failures {
@@ -1306,10 +1327,15 @@ impl Loop {
             return Err(format!("the Bitcoin Core node is not synced ({} of {} blocks)", st.blocks, st.headers));
         }
         let mut change = Change::default();
+        let behind = self.authority.chain().tip_height() < st.blocks;
+        self.authority.set_target(behind.then_some(st.blocks));
         while self.authority.chain().tip_height() < st.blocks || self.authority.tip_height().is_none() {
             let c = self.node.as_ref().expect("set").headers(&mut self.authority, st.blocks, now_secs() as u32)?;
             let progressed = c.tip_moved;
             change = merge(change, c);
+            if behind {
+                self.publish();
+            }
             if !progressed || self.stopped() || self.remote_source.is_some() {
                 break;
             }

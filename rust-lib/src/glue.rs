@@ -27,9 +27,11 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     fn job_result(&self, job_id: String, receipt: String) -> String;
     fn ack_job(&self, job_id: String, receipt: String) -> bool;
     fn cancel_job(&self, job_id: String, receipt: String) -> bool;
-    /// `{ ok, state, network, group, family, authority: { kind, height, tipAgeSecs, peers, asked }, synced,
-    /// busy, needsBirthday, gapLimit, openHandle?, approvalHandle?, ... }`; `asked` is false until the
-    /// open's first round of asking the chain's sources ends. Never waits on the wallet.
+    /// `{ ok, state, network, group, family, authority: { kind, height, tipAgeSecs, peers, asked, headers },
+    /// synced, busy, needsBirthday, gapLimit, openHandle?, approvalHandle?, ... }`; `asked` is false until
+    /// the open's first round of asking the chain's sources ends or a server's first headers are taken;
+    /// `headers` is `{ have, target }` while the chain's headers come in (`target` null for Kyoto), else
+    /// null. Never waits on the wallet.
     fn status(&self) -> String;
     /// `{ ok, confirmed, waiting, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count,
     /// sat, confirmedSat } }`, satoshis as decimal strings; empty strings while busy, never zero.

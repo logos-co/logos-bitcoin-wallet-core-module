@@ -403,7 +403,7 @@ impl Engine {
     /// Emits `walletStateChanged` when what status says has changed.
     fn emit_state(&self) {
         let s = self.status_inner(false);
-        let digest = json!([s["state"], s["synced"], s["authority"]["kind"], s["authority"]["height"], s["openHandle"], s["approvalHandle"], s["lastError"], s["historyServer"], s["needsBirthday"],
+        let digest = json!([s["state"], s["synced"], s["authority"]["kind"], s["authority"]["height"], s["authority"]["headers"], s["openHandle"], s["approvalHandle"], s["lastError"], s["historyServer"], s["needsBirthday"],
             s["birthday"], s["rescanFrom"], s["lastReorg"]["at"], s["gapLimit"]]).to_string();
         let mut last = self.last_emitted.lock();
         if *last != digest {
