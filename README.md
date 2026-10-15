@@ -13,7 +13,10 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
   so the wallet app can raise `keystore.accounts.open` with `{ handle }`. On approval it fetches the
   grant, builds the BDK wallet from `external`/`internal` exactly as given, opens the encrypted
   database with `databaseKey`, and acknowledges. `close_wallet` calls `close_account` and forgets the
-  key. The key and the descriptors live in memory only.
+  key. The key and the descriptors live in memory only. `group` is any account id the manager
+  lists for a Bitcoin family: a keystore group (`g_…`) or a device account (`shell-…`,
+  `keycard-…`). It names the wallet's directory, so only ASCII letters, digits, `_` and `-` are
+  taken, at most 80, and never a name Windows reserves.
 - **Encrypted storage.** BDK's own rusqlite store, with SQLCipher underneath: `rusqlite` 0.31 (BDK's
   pin) with `bundled-sqlcipher` (CommonCrypto on Apple, vendored OpenSSL elsewhere), keyed with the
   grant's 32-byte key. No custom persister was needed.
@@ -631,6 +634,10 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
 
 - `logosctl.sh`: the gate refusing the host, an open decided by the custodian, a receive, a send
   approved by the approver, a close and an unload;
+- `device.sh`: a device account, the manager's `mock_device_signer` fixture, opened by its id
+  (`mock-segwit`) under a data password the custodian sets at the first open; a receive, a send the
+  approver confirms with no password and the device confirms, and a reopen that refuses a wrong
+  data password and finds the same database;
 - `unload-spike.sh`: spike 3, `RUNS` unloads (20) each while Kyoto syncs headers, downloads
   filters, and idles, its peers slowed through `p2p_proxy` mode files; every cycle reopens the
   database (no reset, the first payment there);

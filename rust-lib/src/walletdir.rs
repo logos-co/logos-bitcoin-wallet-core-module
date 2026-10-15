@@ -39,9 +39,13 @@ pub struct WalletDir {
     pub path: PathBuf,
 }
 
-/// The keystore's group ids become directory names, so only plain ones are taken.
+/// Account ids (a keystore group `g_…`, a device's `shell-…`, `keycard-…`) become directory names,
+/// so only plain ones are taken: never `.`, `..`, a separator or a name Windows reserves.
 pub fn valid_group(g: &str) -> bool {
-    g.starts_with("g_") && g.len() <= 80 && g.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    let b = g.as_bytes();
+    let windows = ["con", "prn", "aux", "nul"].iter().any(|r| g.eq_ignore_ascii_case(r))
+        || (b.len() == 4 && (b[..3].eq_ignore_ascii_case(b"com") || b[..3].eq_ignore_ascii_case(b"lpt")) && b[3].is_ascii_digit());
+    !b.is_empty() && b.len() <= 80 && b[0] != b'.' && !windows && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-')
 }
 
 pub fn now_secs() -> u64 {
@@ -175,9 +179,28 @@ mod tests {
 
     #[test]
     fn group_names() {
-        assert!(valid_group("g_0123abcd"));
-        assert!(!valid_group("../g_x"));
-        assert!(!valid_group("x_123"));
-        assert!(!valid_group("g_a/b"));
+        for ok in ["g_0123abcd", "shell-f0150787-84-0-0", "keycard-73c5da0a-86-1-0", "ledger-73c5da0a-84-1-0", "mock-segwit", "x_123", "COM", "console"] {
+            assert!(valid_group(ok), "{ok}");
+        }
+        let long = "a".repeat(81);
+        for bad in ["", ".", "..", ".hidden", "../g_x", "..\\g_x", "g_a/b", "g_a\\b", "/abs", "C:", "g_ x", "g_é", "abé", "g_a\0", "nul", "CON", "Aux", "com1", "LPT9", &long] {
+            assert!(!valid_group(bad), "{bad:?}");
+        }
+        assert!(valid_group(&long[1..]), "80 characters");
+    }
+
+    #[test]
+    fn a_device_account_lives_under_its_id_and_traversal_stays_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let wallets = root.path().join("wallets");
+        let id = "shell-f0150787-84-0-0";
+        assert!(valid_group(id));
+        let w = WalletDir::new(&wallets, BNetwork::Regtest, id);
+        drop(w.open(&wallets, &WalletDir::new_meta(id, Family::Bitcoin, BNetwork::Regtest), &[3; 32]).unwrap());
+        assert_eq!(w.path, wallets.join("regtest").join(id));
+        assert_eq!(list(&wallets, BNetwork::Regtest).iter().map(|m| m.group.as_str()).collect::<Vec<_>>(), [id]);
+        for escape in ["..", "../regtest", "../../outside", "regtest/../x"] {
+            assert!(!valid_group(escape), "{escape}");
+        }
     }
 }
