@@ -223,7 +223,7 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
             let network = v["network"].as_str().and_then(BNetwork::parse).ok_or("network must be mainnet, testnet4, signet or regtest")?;
             let group = match v["group"].as_str() {
                 Some(g) if walletdir::valid_group(g) => Some(g.to_string()),
-                Some(_) => return Err("not a keystore group".into()),
+                Some(_) => return Err("group must be an account id: ASCII letters, digits, _ or -, at most 80".into()),
                 None => None,
             };
             let family = match v["family"].as_str() {
@@ -475,7 +475,7 @@ impl Engine {
         let grant = grant.ok_or("the approved open has no result")?;
         let checked = (|| {
             if !walletdir::valid_group(&grant.group) {
-                return Err("the keystore named an unusable group".to_string());
+                return Err("the signer manager named an account id the wallet can't store".to_string());
             }
             if group.as_ref().is_some_and(|g| *g != grant.group) {
                 return Err("the keystore opened another wallet than the one asked".to_string());
@@ -510,6 +510,10 @@ impl Engine {
             let m = dir.meta().map_err(|e| e.to_string())?;
             if m.family != grant.family || m.network != network {
                 return Err("the stored wallet is of another family or network".into());
+            }
+            // Ids differing only in case share a directory on macOS and Windows: never set it aside.
+            if m.group != grant.group {
+                return Err("the stored wallet belongs to another account".into());
             }
             m
         } else {
@@ -1607,6 +1611,102 @@ mod tests {
         let dir = root.path().join("wallets/regtest/g_reset");
         let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().contains("unreadable")).collect();
         assert!(!aside.is_empty(), "the old database is kept aside");
+        e.shutdown();
+    }
+
+    /// Grants an open of `group` as signer manager 3ef020c does for a device account: origin
+    /// `restored`, no birthday, nothing unlocked. Keeps what the core asked for.
+    struct DeviceAccount {
+        group: &'static str,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl manager::SignerManager for DeviceAccount {
+        fn request_open(&self, p: &str) -> Result<String, String> {
+            self.asked.lock().unwrap().push(format!("open {p}"));
+            Ok(json!({"ok": true, "handle": "sma_1", "receipt": "r1", "state": "offered"}).to_string())
+        }
+        fn request_approval(&self, _i: &str) -> Result<String, String> {
+            Ok(json!({"ok": false, "error": "not authorized"}).to_string())
+        }
+        fn approval_status(&self, _h: &str, _r: &str) -> Result<String, String> {
+            Ok(json!({"ok": true, "state": "settled", "reason": "approved"}).to_string())
+        }
+        fn fetch_result(&self, _h: &str, _r: &str) -> Result<String, String> {
+            let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+            Ok(json!({"ok": true, "result": {"group": self.group, "family": "bitcoin", "chain": "test", "network": "regtest",
+                "external": format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), "internal": format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"),
+                "fingerprint": "73c5da0a", "databaseKey": "5a".repeat(32), "origin": "restored", "birthday": null, "unlocked": null}}).to_string())
+        }
+        fn ack_result(&self, _h: &str, _r: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn cancel_approval(&self, _h: &str, _r: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn close_account(&self, p: &str) -> Result<String, String> {
+            self.asked.lock().unwrap().push(format!("close {p}"));
+            Ok(json!({"ok": true, "closed": true}).to_string())
+        }
+    }
+
+    #[test]
+    fn a_device_account_opens_under_its_own_id() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let id = "shell-f0150787-84-0-0";
+        let mgr = Arc::new(DeviceAccount { group: id, asked: Default::default() });
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), mgr.clone(), None);
+        let opened = finish(&e, "open_wallet", json!({"network": "regtest", "group": id}));
+        assert_eq!((opened["group"].clone(), opened["created"].clone(), opened["needsBirthday"].clone()), (json!(id), json!(true), json!(true)), "{opened}");
+        assert_eq!(e.status()["group"], id);
+        assert!(root.path().join("wallets/regtest").join(id).join("wallet.db").exists());
+        assert_eq!(e.list_wallets("regtest")["wallets"][0]["group"], id);
+        finish(&e, "close_wallet", json!({}));
+        let again = finish(&e, "open_wallet", json!({"network": "regtest", "group": id}));
+        assert_eq!((again["created"].clone(), again["reset"].clone()), (json!(false), json!(false)), "{again}");
+        finish(&e, "close_wallet", json!({}));
+        let asked = mgr.asked.lock().unwrap().clone();
+        assert!(asked[0].starts_with("open ") && asked[0].contains(&format!(r#""group":"{id}""#)), "{asked:?}");
+        assert!(asked.iter().any(|a| *a == format!(r#"close {{"group":"{id}"}}"#)), "{asked:?}");
+        // A path out of the wallets directory is refused before the manager is asked.
+        for escape in ["..", "../x", "a/b", ".hidden", "nul"] {
+            let r = e.start_job("open_wallet", &json!({"network": "regtest", "group": escape}).to_string());
+            assert_eq!((r["ok"].clone(), r["code"].clone()), (json!(false), json!("invalid")), "{escape}: {r}");
+        }
+        assert_eq!(mgr.asked.lock().unwrap().len(), asked.len());
+        e.shutdown();
+
+        // A manager naming such an id for a picked wallet is refused too, and nothing is written.
+        let root = tempfile::tempdir().unwrap();
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(DeviceAccount { group: "../escape", asked: Default::default() }), None);
+        let j = e.start_job("open_wallet", r#"{"network":"regtest","family":"bitcoin"}"#);
+        let (jid, r) = (j["jobId"].as_str().unwrap().to_string(), j["receipt"].as_str().unwrap().to_string());
+        let t0 = Instant::now();
+        while e.jobs().status(&jid, &r)["state"] != "failed" {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{}", e.jobs().status(&jid, &r));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(e.jobs().status(&jid, &r)["error"].as_str().unwrap().contains("can't store"));
+        assert!(!root.path().join("escape").exists() && !root.path().join("wallets").exists());
+        e.shutdown();
+
+        // Another account's wallet in the directory (ids differing in case, on macOS or Windows)
+        // is left alone, not set aside under this account's key.
+        let root = tempfile::tempdir().unwrap();
+        let wallets = root.path().join("wallets");
+        let other = WalletDir::new(&wallets, BNetwork::Regtest, id);
+        drop(other.open(&wallets, &WalletDir::new_meta(&id.to_uppercase(), Family::Bitcoin, BNetwork::Regtest), &[9; 32]).unwrap());
+        let e = Engine::new(wallets.clone(), Arc::new(|_| {}), Arc::new(DeviceAccount { group: id, asked: Default::default() }), None);
+        let j = e.start_job("open_wallet", &json!({"network": "regtest", "group": id}).to_string());
+        let (jid, r) = (j["jobId"].as_str().unwrap().to_string(), j["receipt"].as_str().unwrap().to_string());
+        let t0 = Instant::now();
+        while e.jobs().status(&jid, &r)["state"] != "failed" {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{}", e.jobs().status(&jid, &r));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(e.jobs().status(&jid, &r)["error"].as_str().unwrap().contains("another account"));
+        assert!(other.exists(), "its database stays where it was");
         e.shutdown();
     }
 

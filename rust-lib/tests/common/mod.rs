@@ -143,14 +143,19 @@ impl SignerManager for MockManager {
             assert!(["group", "family", "network", "reason", "unlock"].contains(&k.as_str()), "the manager refuses unknown keys: {k}");
         }
         let family = match (v["group"].as_str(), v["family"].as_str()) {
-            (Some(g), _) => if g.starts_with("g_tap") { "bitcoin_taproot" } else { "bitcoin" },
+            (Some(g), _) => if g.starts_with("g_tap") || g.contains("-86-") { "bitcoin_taproot" } else { "bitcoin" },
             (None, Some(f)) => f,
             _ => return Ok(json!({"ok": false, "error": "invalid parameters: open: name a Bitcoin group, or a Bitcoin family and a network"}).to_string()),
         };
-        let group = if family == "bitcoin" { "g_seg00000000000000000000000000000000" } else { "g_tap00000000000000000000000000000000" };
+        // Any id but a keystore group is a device account's (`shell-…`), over the same mock keys.
+        let group = match v["group"].as_str() {
+            Some(g) if !g.starts_with("g_") => g,
+            _ if family == "bitcoin" => "g_seg00000000000000000000000000000000",
+            _ => "g_tap00000000000000000000000000000000",
+        };
         let key = self.keys.lock().unwrap().entry(group.into()).or_insert_with(|| hex::encode(rand::random::<[u8; 32]>())).clone();
         let (external, internal) = self.descriptors(family);
-        self.log.lock().unwrap().push(format!("open {family}"));
+        self.log.lock().unwrap().push(format!("open {family} {group}"));
         Ok(self.issue("sma", json!({"group": group, "family": family, "chain": "test", "network": v["network"], "external": external,
             "internal": internal, "fingerprint": "73c5da0a", "databaseKey": key, "origin": "restored", "birthday": null, "unlocked": null}), "approved"))
     }

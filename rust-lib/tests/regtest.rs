@@ -265,10 +265,30 @@ fn bitcoin_wallet_on_regtest() {
     let exposure = t.engine.exposure();
     assert_eq!(exposure["servers"].as_array().unwrap().len(), 2, "{exposure}");
 
+    // A device account: the manager lists it by its own id (a Keycard Shell's), not a keystore group.
+    // It opens under that id, finds the same keys' coins, and sends through the manager.
+    let segwit = t.sats("confirmed");
+    t.job("close_wallet", json!({}));
+    assert!(t.manager.log.lock().unwrap().iter().any(|l| l.starts_with("close ") && l.contains("g_seg")));
+    let device = "shell-73c5da0a-84-1-0";
+    let opened = t.job("open_wallet", json!({"network": "regtest", "group": device}));
+    assert_eq!((opened["group"].clone(), opened["family"].clone(), opened["created"].clone()), (json!(device), json!("bitcoin"), json!(true)), "{opened}");
+    assert!(root.path().join("wallets/regtest").join(device).join("wallet.db").exists());
+    t.synced();
+    t.wait("the device account's coins", 60, || t.sats("confirmed") == segwit);
+    let (_, dsent) = t.send(&theirs, 1_000_000, None);
+    let dtxid = dsent["txid"].as_str().unwrap().to_string();
+    t.mine(1);
+    t.synced();
+    t.wait("the device account's send confirmed", 60, || t.row(&dtxid)["state"] == "confirmed");
+    let listed = t.engine.list_wallets("regtest");
+    assert!(listed["wallets"].as_array().unwrap().iter().any(|w| w["group"] == device), "{listed}");
+    println!("device account {device}: opened, synced {segwit} sat, sent {dtxid}");
+
     // Taproot: a second wallet, same flow.
     t.job("close_wallet", json!({}));
     assert_eq!(t.engine.status()["state"], "no_wallet");
-    assert!(t.manager.log.lock().unwrap().iter().any(|l| l.starts_with("close ") && l.contains("g_seg")));
+    assert!(t.manager.log.lock().unwrap().iter().any(|l| l.starts_with("close ") && l.contains(device)));
     let tr = t.job("open_wallet", json!({"network": "regtest", "family": "bitcoin_taproot"}));
     assert_eq!(tr["family"], "bitcoin_taproot");
     t.synced();
