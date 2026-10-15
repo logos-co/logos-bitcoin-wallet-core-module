@@ -410,14 +410,23 @@ impl Cell {
     }
 
     /// A new receive address, unless a gap of unused ones already stands: past it a restore
-    /// would not find the coins.
+    /// would not find the coins. Then the first unused one, with `fresh` false.
     pub fn next_address(&mut self) -> Result<Value, String> {
         let unused: Vec<_> = self.wallet.list_unused_addresses(KeychainKind::External).collect();
-        let info = if unused.len() as u32 >= self.gap_limit() {
-            unused.into_iter().next().expect("checked")
+        let (gap, held) = (self.gap_limit(), unused.len() as u32);
+        let (info, fresh) = if held >= gap {
+            (unused.into_iter().next().expect("checked"), false)
         } else {
-            self.wallet.reveal_next_address(KeychainKind::External)
+            (self.wallet.reveal_next_address(KeychainKind::External), true)
         };
+        self.persist()?;
+        Ok(json!({"address": info.address.to_string(), "index": info.index, "fresh": fresh,
+                  "unused": held + u32::from(fresh), "gapLimit": gap}))
+    }
+
+    /// The first unused receive address, revealing one only when none is.
+    pub fn current_address(&mut self) -> Result<Value, String> {
+        let info = self.wallet.next_unused_address(KeychainKind::External);
         self.persist()?;
         Ok(json!({"address": info.address.to_string(), "index": info.index}))
     }
@@ -842,6 +851,33 @@ mod tests {
         assert_eq!((b["confirmed"].as_str(), b["beyondGap"]["count"].as_u64()), (Some(sat(&mut (0..=10).chain(70..=72)).as_str()), Some(0)), "{b}");
         assert_eq!(b["pending"], sat(&mut std::iter::once(73)));
         assert!(cell.history(0, 50, &held).unwrap()["rows"].as_array().unwrap().iter().all(|r| r["beyondGap"] == false));
+    }
+
+    /// Opening shows the first unused address without revealing one; past a gap of unused ones,
+    /// a new address is refused and says so.
+    #[test]
+    fn a_gap_of_unused_addresses_stops_new_ones() {
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[4; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        for _ in 0..3 {
+            assert_eq!(cell.current_address().unwrap()["index"], 0, "opens show #0 and reveal nothing more");
+        }
+        for i in 1..GAP_LIMIT {
+            let a = cell.next_address().unwrap();
+            assert_eq!((a["index"].as_u64(), a["fresh"].as_bool(), a["unused"].as_u64()), (Some(u64::from(i)), Some(true), Some(u64::from(i) + 1)), "{a}");
+        }
+        let a = cell.next_address().unwrap();
+        assert_eq!(a, json!({"address": a["address"], "index": 0, "fresh": false, "unused": GAP_LIMIT, "gapLimit": GAP_LIMIT}));
+        assert_eq!(cell.current_address().unwrap()["index"], 0);
+        // A wider gap limit lets it reveal again.
+        crate::storage::meta_set(&cell.conn, GAP_LIMIT_KEY, "30").unwrap();
+        let a = cell.next_address().unwrap();
+        assert_eq!((a["index"].as_u64(), a["fresh"].as_bool(), a["gapLimit"].as_u64()), (Some(u64::from(GAP_LIMIT)), Some(true), Some(30)), "{a}");
     }
 
     #[test]

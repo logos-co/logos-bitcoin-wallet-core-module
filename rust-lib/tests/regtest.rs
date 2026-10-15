@@ -22,10 +22,16 @@ struct Doctor {
     header_at: Option<u64>,
     /// Rewrite `blockchain.transaction.get` for this txid: bytes that hash to something else.
     tx: Option<String>,
+    /// Hold each tip answer this long, as a far server would.
+    slow_tip: Option<Duration>,
     hits: Vec<String>,
 }
 
 fn doctor_line(doctor: &Mutex<Doctor>, method: &str, params: &Value, mut reply: Value) -> Value {
+    let slow = doctor.lock().unwrap().slow_tip;
+    if let (Some(d), "blockchain.headers.subscribe") = (slow, method) {
+        std::thread::sleep(d);
+    }
     let mut d = doctor.lock().unwrap();
     match method {
         "blockchain.block.header" if params[0].as_u64().is_some() && params[0].as_u64() == d.header_at => {
@@ -95,6 +101,12 @@ fn bitcoin_wallet_on_regtest() {
     t.wait("the payment confirmed", 60, || t.sats("confirmed") == 100_000_000);
     assert_eq!(t.row(&funded.to_string())["intent"], "receive");
 
+    // electrs answers -1 for every target on regtest: the floor is never passed off as an estimate,
+    // and a send must name its rate.
+    assert_eq!(t.engine.fee_rates_json(), json!({"ok": false, "error": "no fee estimate yet"}));
+    let e = t.job_err("build_send", json!({"recipients": [{"address": addr, "amountSat": "100000"}]}));
+    assert!(e.contains("no fee estimate yet"), "{e}");
+
     // A birthday for the restore: refused past the first payment, then set; the full scan runs again.
     let first_height = t.row(&funded.to_string())["height"].as_u64().unwrap();
     let (code, e) = t.job_fail("set_birthday", json!({"height": first_height + 1}));
@@ -114,7 +126,7 @@ fn bitcoin_wallet_on_regtest() {
 
     // Send from native segwit: approval through the manager, BDK finalizes, the node accepts it.
     let theirs = t.wallet_rpc("getnewaddress", json!(["payee"])).as_str().unwrap().to_string();
-    let (preview, sent) = t.send(&theirs, 10_000_000, None);
+    let (preview, sent) = t.send(&theirs, 10_000_000, Some(2.0));
     let txid = sent["txid"].as_str().unwrap().to_string();
     assert!(["seen", "requested"].contains(&sent["broadcast"].as_str().unwrap()), "{sent}");
     assert!(t.in_mempool(&txid));
@@ -132,7 +144,7 @@ fn bitcoin_wallet_on_regtest() {
     let balance_before = t.sats("confirmed");
     for reason in ["rejected", "expired_no_ack"] {
         *t.manager.next_reason.lock().unwrap() = Some(reason);
-        let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "1000000"}]}));
+        let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "1000000"}], "feeRate": 2.0}));
         let id = p["previewId"].as_str().unwrap().to_string();
         let e = t.job_err("sign_and_broadcast", json!({"previewId": id}));
         assert!(e.starts_with(reason), "{e}");
@@ -278,7 +290,7 @@ fn bitcoin_wallet_on_regtest() {
     t.mine(1);
     t.synced();
     t.wait("taproot funds confirmed", 60, || t.sats("confirmed") == 50_000_000);
-    let (tpreview, tsent) = t.send(&theirs, 20_000_000, None);
+    let (tpreview, tsent) = t.send(&theirs, 20_000_000, Some(2.0));
     let ttxid = tsent["txid"].as_str().unwrap().to_string();
     t.mine(1);
     t.synced();
@@ -310,6 +322,38 @@ fn bitcoin_wallet_on_regtest() {
     assert_eq!(again["created"], false);
     t.synced();
     assert_eq!(t.row(&ttxid)["state"], "confirmed");
+
+    // Until the open's first round of asking ends, the stored chain shows with `asked` false: no
+    // source has had a say yet, which is not "none agrees".
+    doctor.lock().unwrap().slow_tip = Some(Duration::from_secs(3));
+    t.job("close_wallet", json!({}));
+    t.job("open_wallet", json!({"network": "regtest", "group": group}));
+    let a = t.engine.status()["authority"].clone();
+    assert!(a["height"].as_u64().is_some() && a["peers"] == 0 && a["asked"] == false, "{a}");
+    t.wait("the first round", 30, || t.engine.status()["authority"]["asked"] == true);
+    assert!(t.engine.status()["authority"]["peers"].as_u64().unwrap() > 0);
+    doctor.lock().unwrap().slow_tip = None;
+
+    // Opens show the first unused receive address and reveal none, however many there are. Past a
+    // gap of unused ones a new address is refused, and says so.
+    let shown = t.engine.current_address();
+    for _ in 0..3 {
+        t.job("close_wallet", json!({}));
+        t.job("open_wallet", json!({"network": "regtest", "group": group}));
+        assert_eq!(t.engine.current_address(), shown, "an open reveals nothing");
+    }
+    let gap = t.engine.status()["gapLimit"].as_u64().unwrap();
+    let mut asked = 0;
+    let refused = loop {
+        let a = t.engine.next_address();
+        asked += 1;
+        assert!(asked <= gap, "a new address past the gap: {a}");
+        if a["fresh"] == false {
+            break a;
+        }
+    };
+    assert_eq!((refused["index"].clone(), refused["unused"].as_u64(), refused["gapLimit"].as_u64()), (shown["index"].clone(), Some(gap), Some(gap)), "{refused}");
+    println!("an open shows #{} and reveals nothing; New address stops after {} at a gap of {gap}", shown["index"], asked - 1);
 
     let t0 = Instant::now();
     t.engine.shutdown();

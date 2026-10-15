@@ -354,11 +354,11 @@ Amounts are decimal strings of satoshis.
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below. Malformed parameters are refused at once with `{ ok: false, error, code: "invalid" }` |
 | `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
-| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, gapLimit, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
+| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base, asked }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, gapLimit, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `asked` is false until the open's first round of asking the chain's sources ends (every server asked, a Kyoto peer connected or a start ended, the node answered or failed), and again when the authority changes hands: until then `peers` is 0 and `height` is the chain stored last time, which is no news, not "none agrees". `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
 | `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count, sat, confirmedSat } }`; `unchecked` is what unchecked rows pay the wallet; `beyondGap` is the coins beyond the gap, in none of the other figures; empty strings while busy |
-| `next_address()`, `addresses()`, `utxos()` | A fresh receive address (an unused one once `gapLimit` stand unused); revealed receive addresses; outputs confirmed on the authority's chain |
+| `next_address()`, `current_address()`, `addresses()`, `utxos()` | A fresh receive address, `{ address, index, fresh, unused, gapLimit }`: once `unused` addresses stand unused and reach `gapLimit`, none is revealed and the first unused one comes back with `fresh` false; the first unused receive address, revealed only when none is (what an app shows when a wallet opens); revealed receive addresses; outputs confirmed on the authority's chain |
 | `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, broadcast, via, confirmedVia, beyondGap }`; `beyondGap` is true when the wallet's part of the transaction is only through addresses beyond the gap; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `waiting` is a block a server reported that the chain doesn't hold yet, or whose proof hasn't come; `unchecked` is a block a server reported below the chain's start, which nothing checked or which failed its check, and its `reportedBy` names that server; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState`, `broadcast` (`seen`, `requested` or `unknown`) and `via` come from the wallet's own send record, null without one |
-| `fee_rates()` | `{ fast, normal, slow, minimum, sources }` sat/vB: the median of the fee sources, never below the highest minimum relay fee |
+| `fee_rates()` | `{ fast, normal, slow, minimum, sources, estimated }` sat/vB: the median of the fee sources, never below the highest minimum relay fee; `sources` are those whose estimates went in. Only an estimate for every level answers: until then `{ ok: false, error: "no fee estimate yet" }`, and `build_send` without `feeRate` is refused. Electrum's -1, Esplora's `{}` and Kyoto's relay floor are no estimate; a round with none keeps the last one |
 | `address_valid(text, network)` | An address or BIP21 URI: `{ valid, address, type, amountSat?, label?, message? }` |
 | `sources_status()`, `exposure()` | `{ chainBy, local, kyoto: { id, route, peers, down }, sources }`: who feeds the chain and per server health and verdicts, with `encrypted` false for plain text outside Tor (the app marks those servers); the servers that learned the addresses |
 | `preview(previewId)` | The preview, its state and `approvalHandle` |
@@ -507,7 +507,11 @@ test phrase's wallet must start empty. `test-hooks` is a feature for fault injec
 `regtest`, with the Electrum header chain as the authority: it opens a native segwit wallet,
 receives, confirms, sends, bumps a send, refuses an anchor whose header a proxy in front of one
 electrs rewrites and a transaction it rewrites, re-anchors a payment across a reorg, then does a
-taproot wallet's receive and send, and reopens by group. A lost broadcast: the store after a
+taproot wallet's receive and send, and reopens by group. electrs estimates no fee on regtest, so
+`fee_rates` answers none and a send without `feeRate` is refused. Reopened behind a proxy that holds
+each tip answer 3 s, the status shows the stored chain with `asked` false until the round ends.
+Opens show the first unused address and reveal none, and `next_address` stops at the gap limit
+with `fresh` false. A lost broadcast: the store after a
 successful broadcast answers busy five times; the job still answers the txid, the `broadcasting`
 record survives a reopen with its coins out of reach, and `rebroadcast` and `bump_fee` both find
 the transaction.
@@ -593,9 +597,10 @@ and the other 101 a minute later; the onions came through (regtest keeps none), 
 `esplora`, with Blockstream's electrs (esplora flavour, `--jsonrpc-import`) for history, pending
 payments, broadcast, fees and checks, and the Electrum header chain for the chain: a payment
 pending then confirmed (its anchor checked by Esplora's merkle proof and the block's `tx_count`),
-a send broadcast through Esplora, Esplora's fee estimates (the floor on regtest). Then the same
-server behind a TLS front with a self-signed version 1 certificate: its `certSha256` opens it, and
-another pin is refused.
+a send broadcast through Esplora, and no fee estimate (regtest's `/fee-estimates` is `{}`). Then the
+same server behind a TLS front with a self-signed version 1 certificate: its `certSha256` opens it,
+and another pin is refused. Last, behind a front that answers `/fee-estimates`: its levels and
+source, and a send without a rate takes normal.
 
 `widen` mines 3,000 empty blocks past the birthday, then the restore's segwit history, and
 restores it twice under Kyoto with its peers behind counting proxies (`examples/p2p_proxy.rs`):

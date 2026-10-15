@@ -27,14 +27,18 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     fn job_result(&self, job_id: String, receipt: String) -> String;
     fn ack_job(&self, job_id: String, receipt: String) -> bool;
     fn cancel_job(&self, job_id: String, receipt: String) -> bool;
-    /// `{ ok, state, network, group, family, authority: { kind, height, tipAgeSecs, peers }, synced,
-    /// busy, needsBirthday, gapLimit, openHandle?, approvalHandle?, ... }`. Never waits on the wallet.
+    /// `{ ok, state, network, group, family, authority: { kind, height, tipAgeSecs, peers, asked }, synced,
+    /// busy, needsBirthday, gapLimit, openHandle?, approvalHandle?, ... }`; `asked` is false until the
+    /// open's first round of asking the chain's sources ends. Never waits on the wallet.
     fn status(&self) -> String;
     /// `{ ok, confirmed, waiting, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count,
     /// sat, confirmedSat } }`, satoshis as decimal strings; empty strings while busy, never zero.
     fn balance(&self) -> String;
-    /// `{ ok, address, index }`: a fresh receive address.
+    /// `{ ok, address, index, fresh, unused, gapLimit }`: a fresh receive address, or with `fresh`
+    /// false the first unused one, when `unused` addresses already stand unused and reach `gapLimit`.
     fn next_address(&self) -> String;
+    /// `{ ok, address, index }`: the first unused receive address, revealed only when none is.
+    fn current_address(&self) -> String;
     /// `{ ok, addresses: [{ index, address, used }] }`, the revealed receive addresses.
     fn addresses(&self) -> String;
     /// `{ ok, utxos: [...] }`, outputs confirmed on the authority's chain.
@@ -42,7 +46,8 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, rows: [{ txid, intent: send|self|combine|fee_bump|receive, amountSat, feeSat,
     /// counterparties, height, confirmations, time, state, reportedBy, beyondGap }] }`, newest first.
     fn history(&self, page: i64) -> String;
-    /// `{ ok, fast, normal, slow, minimum, sources }` in sat/vB.
+    /// `{ ok, fast, normal, slow, minimum, sources, estimated }` in sat/vB, once every level has an
+    /// estimate; until then `{ ok: false, error: "no fee estimate yet" }`.
     fn fee_rates(&self) -> String;
     /// An address or BIP21 URI on a network: `{ ok, valid, address, type, amountSat? }`.
     fn address_valid(&self, text: String, network: String) -> String;
@@ -157,6 +162,10 @@ impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
 
     fn next_address(&self) -> String {
         self.with(|e| e.next_address())
+    }
+
+    fn current_address(&self) -> String {
+        self.with(|e| e.current_address())
     }
 
     fn addresses(&self) -> String {

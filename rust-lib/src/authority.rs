@@ -27,6 +27,9 @@ pub struct Summary {
     pub tip_age_secs: Option<u64>,
     /// Sources whose tip is on the authority's chain.
     pub peers: u32,
+    /// A round of asking the chain's sources has finished since the open or a change of feeder;
+    /// until then `peers` is 0 and `height` is the chain stored last time.
+    pub asked: bool,
     /// The checkpoint the chain starts from: every anchor at or above it is checked against it.
     pub base: u32,
 }
@@ -110,6 +113,7 @@ pub struct ChainAuthority {
     progressed: bool,
     agreeing: BTreeSet<String>,
     peers: u32,
+    asked: bool,
     replaced: std::collections::VecDeque<(u32, BlockHash)>,
 }
 
@@ -119,14 +123,14 @@ impl ChainAuthority {
     }
 
     pub fn on(chain: HeaderChain) -> Self {
-        Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default() }
     }
 
     /// From stored headers and proofs on `cp`; a stored chain counts as progress, and its age shows.
     pub fn restore(net: BNetwork, cp: crate::network::Checkpoint, headers: Vec<(u32, Header)>, old: Vec<(u32, BlockHash)>, now: u32) -> Self {
         let chain = HeaderChain::restore_from(net, cp, headers, now);
         let progressed = chain.tip_height() > chain.base();
-        Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default() }
     }
 
     /// Starts the chain again from `cp`, a lower checkpoint, keeping who feeds it and the hashes
@@ -134,7 +138,7 @@ impl ChainAuthority {
     pub fn rebase(&mut self, cp: crate::network::Checkpoint) {
         self.chain = HeaderChain::from_checkpoint(self.chain.network(), cp.height, cp.header);
         self.old.retain(|h, _| *h < cp.height);
-        (self.progressed, self.replaced) = (false, Default::default());
+        (self.progressed, self.replaced, self.asked) = (false, Default::default(), false);
         self.agreeing.clear();
     }
 
@@ -143,13 +147,18 @@ impl ChainAuthority {
         if self.kind != kind {
             self.kind = kind;
             self.agreeing.clear();
-            self.peers = 0;
+            (self.peers, self.asked) = (0, false);
         }
     }
 
     /// Kyoto's connected peers, or 1 for a reachable node.
     pub fn set_peers(&mut self, n: u32) {
         self.peers = n;
+    }
+
+    /// Kyoto or the node answered, or failed to, for the first time since the feeder took over.
+    pub fn set_asked(&mut self) {
+        self.asked = true;
     }
 
     /// A branch from Kyoto or the node, continuing the chain at `fork`: validated like a server's,
@@ -355,6 +364,7 @@ impl Authority for ChainAuthority {
             .collect();
         change.tip_moved = self.chain.tip_hash() != before;
         change.agreeing = self.agreeing.iter().cloned().collect();
+        self.asked = true;
         change
     }
 
@@ -403,6 +413,7 @@ impl Authority for ChainAuthority {
             hash: self.progressed.then(|| self.chain.tip_hash().to_string()),
             tip_age_secs: self.progressed.then(|| now.saturating_sub(u64::from(self.chain.tip().time))),
             peers: if self.kind == ELECTRUM_HEADERS { self.agreeing.len() as u32 } else { self.peers },
+            asked: self.asked,
             base: self.chain.base(),
         }
     }
@@ -530,6 +541,39 @@ mod tests {
         let a = ChainAuthority::new(BNetwork::Regtest);
         assert_eq!(a.tip_height(), None);
         assert_eq!(a.summary(0).height, None);
+    }
+
+    #[test]
+    fn a_stored_chain_is_not_asked_until_a_round_ends() {
+        let honest = chain_of(10, 11);
+        let stored: Vec<(u32, Header)> = honest.iter().enumerate().skip(1).map(|(h, x)| (h as u32, *x)).collect();
+        let cp = crate::network::Checkpoint { height: 0, header: honest[0] };
+        let mut a = ChainAuthority::restore(BNetwork::Regtest, cp, stored, vec![], NOW);
+        let s = a.summary(u64::from(NOW));
+        assert_eq!((s.height, s.peers, s.asked), (Some(10), 0, false), "last session's chain, nobody asked yet");
+        // A round where every server failed has still asked them.
+        struct Down;
+        impl HeaderSource for Down {
+            fn id(&self) -> &str {
+                "down"
+            }
+            fn tip(&self) -> Result<(u32, Header), String> {
+                Err("connection refused".into())
+            }
+            fn headers(&self, _: u32, _: u32) -> Result<Vec<Header>, String> {
+                Err("connection refused".into())
+            }
+        }
+        let c = a.refresh(&[&Down], NOW);
+        assert_eq!(c.failures.len(), 1);
+        assert_eq!((a.summary(0).peers, a.summary(0).asked), (0, true));
+        // A new feeder starts unasked; Kyoto or the node say when they answered.
+        a.set_kind(KYOTO);
+        assert!(!a.summary(0).asked);
+        a.set_asked();
+        assert!(a.summary(0).asked);
+        a.set_kind(KYOTO);
+        assert!(a.summary(0).asked, "the same feeder keeps it");
     }
 
     #[test]

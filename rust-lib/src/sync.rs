@@ -614,6 +614,7 @@ impl Loop {
                     self.ctx.progress.lock().last_error = Some(format!("Bitcoin Core node: {e}"));
                     self.node_ok = false;
                     self.node = None;
+                    self.authority.set_asked();
                     (Change::default(), vec![])
                 }
             },
@@ -819,6 +820,8 @@ impl Loop {
             }
             self.kyoto_status.restarts += 1;
             self.kyoto_status.last_stop = Some(why.unwrap_or_else(|| "stopped".into()));
+            // A start that ended by itself was an answer of sorts: none of its peers held on.
+            self.authority.set_asked();
             // A start that got somewhere retries soon; one that didn't backs off.
             self.kyoto_backoff = if c.updated { Duration::from_secs(2) } else { (self.kyoto_backoff * 2).clamp(Duration::from_secs(2), KYOTO_RETRY_MAX) };
             self.kyoto_retry_at = Instant::now() + self.kyoto_backoff;
@@ -989,6 +992,7 @@ impl Loop {
         if let Some(d) = &route.down {
             self.stop_kyoto(None);
             self.ctx.progress.lock().last_error = Some(format!("Kyoto: {d}"));
+            self.authority.set_asked();
             return (change, found);
         }
         let now = now_secs();
@@ -1040,6 +1044,7 @@ impl Loop {
                     self.kyoto_backoff = (self.kyoto_backoff * 2).clamp(Duration::from_secs(2), KYOTO_RETRY_MAX);
                     self.kyoto_retry_at = Instant::now() + self.kyoto_backoff;
                     self.ctx.progress.lock().last_error = Some(format!("Kyoto: {e}"));
+                    self.authority.set_asked();
                 }
             }
         }
@@ -1117,6 +1122,9 @@ impl Loop {
             let scanned = c.synced && self.kyoto_rescan.is_none() && !self.kyoto_scanning;
             self.kyoto_status.phase = kyoto::phase(scanned, self.kyoto_status.progress);
             self.authority.set_peers(c.connected() as u32);
+            if c.connected() > 0 {
+                self.authority.set_asked();
+            }
         }
         // The node module leaves the peers it skips out of the table.
         self.kyoto_status.skipped = if self.kyoto_reporting { 0 } else { self.kyoto_book.skipped(now) };
@@ -1231,6 +1239,7 @@ impl Loop {
             return Err(format!("the node's headers fail the checks: {}", change.suspects[0].1));
         }
         self.authority.set_peers(1);
+        self.authority.set_asked();
         if let Some(src) = &self.remote_source { self.ctx.netstate.lock().ledger.ok(&src.id, now_secs()); }
         if self.remote_source.is_some() && self.authority.chain().tip_height() < st.blocks {
             self.ctx.wake.store(true, Ordering::SeqCst);
@@ -1877,7 +1886,14 @@ impl Loop {
         if let Some(m) = kyoto.and_then(|r| kyoto::min_fee_rate(&self.ctx.rt, &r)) {
             estimates.push(SourceEstimate { source: KYOTO.into(), rates: [None; 3], minimum: Some(m) });
         }
-        self.ctx.progress.lock().fees = Some(fees::combine(&estimates));
+        // A round without an estimate keeps the last one: a source failing for a while is no
+        // reason to fall back to the floor.
+        let fresh = fees::combine(&estimates);
+        let mut p = self.ctx.progress.lock();
+        if fresh.estimated || !p.fees.as_ref().is_some_and(|f| f.estimated) {
+            p.fees = Some(fresh);
+        }
+        drop(p);
         self.last_fees = Some(Instant::now());
     }
 

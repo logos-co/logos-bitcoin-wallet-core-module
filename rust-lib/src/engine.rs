@@ -748,11 +748,12 @@ impl Engine {
         f(g.as_mut().ok_or("the wallet closed")?)
     }
 
+    /// The rates for floors and coins too small to spend; a send takes them only once `estimated`.
     fn fee_rates(&self) -> crate::fees::FeeRates {
         self.with_open(|w| Ok(w.progress.lock().fees.clone()))
             .ok()
             .flatten()
-            .unwrap_or(crate::fees::FeeRates { fast: 1.0, normal: 1.0, slow: 1.0, minimum: 1.0, sources: vec![] })
+            .unwrap_or(crate::fees::FeeRates { fast: 1.0, normal: 1.0, slow: 1.0, minimum: 1.0, sources: vec![], estimated: false })
     }
 
     fn wake(&self) {
@@ -830,7 +831,7 @@ impl Engine {
     }
 
     fn build_send(&self, v: &Value) -> Result<Value, String> {
-        let (net, known) = self.with_open(|w| Ok((w.network, w.progress.lock().fees.is_some())))?;
+        let (net, known) = self.with_open(|w| Ok((w.network, w.progress.lock().fees.as_ref().is_some_and(|f| f.estimated))))?;
         let input = send::parse_input(v, net)?;
         if input.fee_rate.is_none() && !known {
             return Err("no fee estimate yet: give feeRate, or wait for the fee sources".into());
@@ -1238,7 +1239,16 @@ impl Engine {
     }
 
     pub fn next_address(&self) -> Value {
-        let r = self.cell_job(Duration::from_secs(5), |c| c.next_address());
+        self.address_with(|c| c.next_address())
+    }
+
+    /// The first unused receive address, revealed only when none is: what Receive shows on open.
+    pub fn current_address(&self) -> Value {
+        self.address_with(|c| c.current_address())
+    }
+
+    fn address_with(&self, f: impl FnOnce(&mut Cell) -> Result<Value, String>) -> Value {
+        let r = self.cell_job(Duration::from_secs(5), f);
         self.wake();
         match r {
             Ok(mut v) => {
@@ -1279,12 +1289,13 @@ impl Engine {
 
     pub fn fee_rates_json(&self) -> Value {
         match self.with_open(|w| Ok(w.progress.lock().fees.clone())) {
-            Ok(Some(f)) => {
+            Ok(Some(f)) if f.estimated => {
                 let mut v = json!(f);
                 v["ok"] = json!(true);
                 v
             }
-            Ok(None) => json!({"ok": false, "error": "no fee estimate yet"}),
+            // Only the floor, or nothing asked yet: never shown as an estimate.
+            Ok(_) => json!({"ok": false, "error": "no fee estimate yet"}),
             Err(e) => json!({"ok": false, "error": e}),
         }
     }
