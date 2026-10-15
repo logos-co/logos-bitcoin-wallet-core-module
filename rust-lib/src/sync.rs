@@ -705,7 +705,7 @@ impl Loop {
             let theirs: Result<BlockHash, String> = match s.kind {
                 Kind::Electrum => self.electrum(&s).and_then(|c| c.inner.inner.block_header(at as usize).map(|h| h.block_hash()).map_err(|e| e.to_string())),
                 Kind::Esplora => match self.esplora(&s).map(|c| c.clone()) {
-                    Ok(c) => self.ctx.rt.block_on(c.get_block_hash(at)).map_err(|e| e.to_string()),
+                    Ok(c) => net::block_on_until(&self.ctx.rt, &self.ctx.stop, c.get_block_hash(at)).and_then(|r| r.map_err(|e| e.to_string())),
                     Err(e) => Err(e),
                 },
                 Kind::Rpc => continue,
