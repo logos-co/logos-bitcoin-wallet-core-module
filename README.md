@@ -13,7 +13,10 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
   so the wallet app can raise `keystore.accounts.open` with `{ handle }`. On approval it fetches the
   grant, builds the BDK wallet from `external`/`internal` exactly as given, opens the encrypted
   database with `databaseKey`, and acknowledges. `close_wallet` calls `close_account` and forgets the
-  key. The key and the descriptors live in memory only. `group` is any account id the manager
+  key. The key and the descriptors live in memory only. Closing stops the sync within moments:
+  it shuts the sync's Electrum sockets, so a call waiting on a server (a header download over a
+  slow link) returns at once, and drops its pending Esplora and RPC requests and connection
+  attempts. The sync writes nothing after that. `group` is any account id the manager
   lists for a Bitcoin family: a keystore group (`g_…`) or a device account (`shell-…`,
   `keycard-…`). It names the wallet's directory, so only ASCII letters, digits, `_` and `-` are
   taken, at most 80, and never a name Windows reserves.
@@ -419,6 +422,12 @@ from a server that holds the certificate's key; `examples/pin_probe.rs` reads on
 connects with it. Two community servers with version 1 certificates, refused before, answer that
 way.
 
+The core connects each Electrum socket itself (`net::electrum`), so a close can shut it. TLS to a
+CA-signed server then goes through electrum-client's own handshake and negotiation; plain-text
+and pinned connections ask for protocol 1.4, the version whose header replies electrum-client reads
+without a negotiation of its own: a pinned server that picked 1.6 would have answered
+`blockchain.block.headers` in a form it can't read.
+
 On regtest, `regtest.json` in the persistence directory turns regtest on. The routes come from
 the node module's `route_table("regtest")` when it routes anything there, servers and Kyoto's
 peers alike, with `regtest.json`'s `pollSecs` and `kyotoRequired`; only when it routes nothing, or
@@ -483,6 +492,8 @@ REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --fe
 # a fresh chain each, then
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test node -- --ignored --nocapture
+REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
+  --test close -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
   cargo test --release --no-default-features --features test-hooks --test esplora -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
@@ -518,6 +529,11 @@ with `fresh` false. A lost broadcast: the store after a
 successful broadcast answers busy five times; the job still answers the txid, the `broadcasting`
 record survives a reopen with its coins out of reach, and `rebroadcast` and `bump_fee` both find
 the transaction.
+
+`close` mines 5,000 blocks, so the header chain takes three calls of 2,016, and has a proxy in
+front of electrs hold the second call's answer for a minute, as a slow link would. Closing then
+stops the sync within 3 s (30 ms on macOS), the answer still held; reopened on a fast server, the
+chain completes. Three more rounds close while the next round's call is held, and reopen.
 
 `kyoto`, with Kyoto as the authority and one electrs only cross-checked (`checkOnly`): Kyoto's peers sit behind
 `examples/p2p_proxy.rs`, which forwards, delays answers, goes down, or forges one block's filter

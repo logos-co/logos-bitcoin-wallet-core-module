@@ -119,6 +119,7 @@ struct OpenWallet {
     _key: Zeroizing<[u8; 32]>,
     descriptors: (Zeroizing<String>, Zeroizing<String>),
     stop: Arc<AtomicBool>,
+    cancel: crate::net::Cancel,
     wake: Arc<AtomicBool>,
     reload: Arc<AtomicBool>,
     /// The height scans start from, and a flag that has them start again from it.
@@ -585,6 +586,7 @@ impl Engine {
         let progress = Arc::new(Mutex::new(Progress { full_scan_done, authority: authority.summary(now), last_error: routes_err.clone(), ..Default::default() }));
         let cell = Arc::new(Mutex::new(Some(cell)));
         let (stop, wake, reload) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(routes_err.is_some())));
+        let cancel = crate::net::Cancel::default();
         let (birthday_at, rescan) = (Arc::new(AtomicU32::new(bday)), Arc::new(AtomicBool::new(false)));
         let (gap_at, gap_raised) = (Arc::new(AtomicU32::new(gap)), Arc::new(AtomicBool::new(false)));
         let ctx = Ctx {
@@ -598,6 +600,7 @@ impl Engine {
             netstate: netstate.clone(),
             progress: progress.clone(),
             stop: stop.clone(),
+            cancel: cancel.clone(),
             wake: wake.clone(),
             reload_routes: reload.clone(),
             notify: self.notify(),
@@ -625,6 +628,7 @@ impl Engine {
             _key: grant.database_key,
             descriptors: (Zeroizing::new(grant.external), Zeroizing::new(grant.internal)),
             stop,
+            cancel,
             wake,
             reload,
             birthday: birthday_at,
@@ -686,13 +690,18 @@ impl Engine {
         let mut w = taken?;
         self.set_light(|l| l.state = State::Closing);
         w.stop.store(true, Ordering::SeqCst);
+        // A call blocked on a server, a header download over a slow link, returns now.
+        w.cancel.cut();
         if let Some(t) = w.thread.take() {
-            let until = Instant::now() + Duration::from_millis(1500);
-            while !t.is_finished() && Instant::now() < until {
+            let started = Instant::now();
+            while !t.is_finished() && started.elapsed() < Duration::from_millis(1500) {
                 std::thread::sleep(Duration::from_millis(20));
             }
             if t.is_finished() {
                 let _ = t.join();
+                tracing::info!(target: "bitcoin", "{}: the sync stopped in {} ms", w.group, started.elapsed().as_millis());
+            } else {
+                tracing::warn!(target: "bitcoin", "{}: the sync is still stopping after {} ms; it writes nothing more", w.group, started.elapsed().as_millis());
             }
         }
         {
@@ -1041,7 +1050,7 @@ impl Engine {
             let iso = netstate.lock().iso(&s.id);
             let sent: Result<Outcome, String> = match s.kind {
                 Kind::Rpc => Err("RPC broadcast uses the active Core connection".into()),
-                Kind::Electrum => crate::net::electrum(&s, proxy.as_ref(), &iso).and_then(|c| match c.transaction_broadcast(tx) {
+                Kind::Electrum => crate::net::electrum(&s, proxy.as_ref(), &iso, &crate::net::Cancel::default()).and_then(|c| match c.transaction_broadcast(tx) {
                     Ok(_) => Ok(if c.transaction_get(&txid).is_ok() { Outcome::Seen } else { Outcome::Requested }),
                     Err(e) => Err(e.to_string()),
                 }),
@@ -1458,6 +1467,8 @@ fn restore_live_sends(cell: &mut Cell) -> Result<(), String> {
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod hooks {
     pub static BUSY_AFTER_BROADCAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Sync threads still running, closed wallets' included.
+    pub static SYNC_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 }
 
 fn release_stale_locks(cell: &mut Cell) -> Result<(), String> {

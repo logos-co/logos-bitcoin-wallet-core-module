@@ -4,7 +4,10 @@
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::future::Future;
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bdk_electrum::electrum_client;
@@ -24,18 +27,115 @@ use crate::routes::{Isolation, Proxy, Route, Source};
 /// otherwise walk the wallet's addresses without end.
 pub const SCRIPT_LIMIT: usize = 20_000;
 
+/// What a call cut short by a close answers.
+pub const STOPPING: &str = "stopping";
+
 pub fn timeout_for(src: &Source) -> Duration {
     if src.route == Route::Direct { Duration::from_secs(15) } else { Duration::from_secs(45) }
 }
 
-/// An Electrum connection: electrum-client's own, checked against the CAs, or ours with a pin.
-pub enum Conn {
-    Std(electrum_client::Client),
-    Pinned(RawClient<ElectrumSslStream>),
+/// The open wallet's sockets. Closing cuts them, so a call blocked on one returns at once; a
+/// socket connected after the cut is shut as it connects.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<Mutex<Held>>);
+
+#[derive(Default)]
+struct Held {
+    cut: bool,
+    sockets: Vec<Weak<TcpStream>>,
 }
 
-/// An Electrum client on the source's route. A Tor route without a proxy is refused.
-pub fn electrum(src: &Source, proxy: Option<&Proxy>, iso: &Isolation) -> Result<Conn, String> {
+/// A connection's copy of its socket, for the cut; it goes with the connection.
+struct Socket(#[allow(dead_code)] Arc<TcpStream>);
+
+impl Cancel {
+    fn hold(&self, tcp: &TcpStream) -> Result<Socket, String> {
+        let copy = Arc::new(tcp.try_clone().map_err(|e| e.to_string())?);
+        let mut h = self.0.lock().unwrap();
+        if h.cut {
+            let _ = tcp.shutdown(Shutdown::Both);
+            return Err(STOPPING.into());
+        }
+        h.sockets.retain(|s| s.strong_count() > 0);
+        h.sockets.push(Arc::downgrade(&copy));
+        Ok(Socket(copy))
+    }
+
+    pub fn cut(&self) {
+        let mut h = self.0.lock().unwrap();
+        h.cut = true;
+        for s in h.sockets.drain(..).filter_map(|s| s.upgrade()) {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub fn is_cut(&self) -> bool {
+        self.0.lock().unwrap().cut
+    }
+}
+
+/// `f` on a thread of its own, waited for until `stop` is set; then it finishes alone. A connect
+/// through Tor can take its whole timeout, and a close doesn't wait for it.
+pub fn off_thread<T: Send + 'static>(stop: &AtomicBool, f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new().name("bitcoin-connect".into()).spawn(move || {
+        let _ = tx.send(f());
+    }).map_err(|e| e.to_string())?;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(r) => return r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if stop.load(Ordering::SeqCst) => return Err(STOPPING.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("the connection attempt ended".into()),
+        }
+    }
+}
+
+/// `f` on the runtime until `stop` is set; then it is dropped, which ends its requests.
+pub fn block_on_until<F: Future>(rt: &tokio::runtime::Handle, stop: &AtomicBool, f: F) -> Result<F::Output, String> {
+    rt.block_on(async {
+        tokio::select! {
+            r = f => Ok(r),
+            _ = async { while !stop.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(50)).await } } => Err(STOPPING.to_string()),
+        }
+    })
+}
+
+/// An Electrum connection: TLS checked against the CAs or a pin, or plain text, holding a copy of
+/// its socket for `Cancel`.
+pub struct Conn {
+    link: Link,
+    _socket: Socket,
+}
+
+enum Link {
+    Tls(RawClient<ElectrumSslStream>),
+    Plain(RawClient<TcpStream>),
+}
+
+/// `ssl://host:port`, `tcp://host:port` or `host:port`: the host, the port and whether it is TLS.
+fn electrum_url(url: &str) -> Result<(String, u16, bool), String> {
+    let (tls, rest) = match url.split_once("://") {
+        Some(("ssl", rest)) => (true, rest),
+        Some(("tcp", rest)) => (false, rest),
+        Some((scheme, _)) => return Err(format!("{scheme}:// is not an Electrum URL")),
+        None => (false, url),
+    };
+    let (host, port) = rest.rsplit_once(':').filter(|(_, p)| !p.contains(']')).ok_or("the server's URL has no port")?;
+    let port = port.parse::<u16>().map_err(|_| "the server's URL has a bad port".to_string())?;
+    Ok((host.trim_matches(['[', ']']).to_string(), port, tls))
+}
+
+/// electrum-client negotiates only on clients it connects itself and reads 1.6's header replies
+/// only then: a client connected here asks for 1.4.
+pub(crate) fn negotiate<S: std::io::Read + std::io::Write>(c: &RawClient<S>, name: &str) -> Result<(), String> {
+    let versions = vec!["1.4".to_string(), "1.4".to_string()];
+    c.raw_call("server.version", vec![Param::String(name.into()), Param::StringVec(versions)]).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// An Electrum client on the source's route. A Tor route without a proxy is refused. Its socket
+/// is held in `cancel`.
+pub fn electrum(src: &Source, proxy: Option<&Proxy>, iso: &Isolation, cancel: &Cancel) -> Result<Conn, String> {
     if let Some(d) = &src.down {
         return Err(format!("{}: {d}", src.id));
     }
@@ -44,21 +144,30 @@ pub fn electrum(src: &Source, proxy: Option<&Proxy>, iso: &Isolation) -> Result<
         true => Some(proxy.ok_or_else(|| format!("{}: routed through Tor, and no proxy is set", src.id))?),
         false => None,
     };
-    if let Some(pin) = src.pin {
-        return crate::pin::connect(&src.url, pin, proxy.map(|p| (p, iso)), timeout_for(src)).map(Conn::Pinned).map_err(|e| format!("{}: {e}", src.id));
+    let fail = |e: String| format!("{}: {e}", src.id);
+    let (host, port, tls) = electrum_url(&src.url).map_err(fail)?;
+    if src.pin.is_some() && !tls {
+        return Err(fail("a pinned certificate is for an ssl:// or https:// server".into()));
     }
-    let mut b = electrum_client::ConfigBuilder::new().timeout(Some(timeout_for(src))).retry(0).validate_domain(true);
-    if let Some(p) = proxy {
-        b = b.socks5(Some(electrum_client::Socks5Config::with_credentials(p.addr(), iso.user.clone(), iso.pass.clone())));
-    }
-    electrum_client::Client::from_config(&src.url, b.build()).map(Conn::Std).map_err(|e| format!("{}: {e}", src.id))
+    let tcp = crate::pin::tcp(&host, port, proxy.map(|p| (p, iso)), timeout_for(src)).map_err(fail)?;
+    let socket = cancel.hold(&tcp).map_err(fail)?;
+    let link = match src.pin {
+        Some(pin) => Link::Tls(crate::pin::over(tcp, &host, pin).map_err(fail)?),
+        None if tls => Link::Tls(RawClient::new_ssl_from_stream((host.as_str(), port), true, tcp, None).map_err(|e| fail(e.to_string()))?),
+        None => {
+            let c = RawClient::from(tcp);
+            negotiate(&c, electrum_client::raw_client::CLIENT_NAME).map_err(fail)?;
+            Link::Plain(c)
+        }
+    };
+    Ok(Conn { link, _socket: socket })
 }
 
 macro_rules! either {
     ($self:ident, $c:ident => $call:expr) => {
-        match $self {
-            Conn::Std($c) => $call,
-            Conn::Pinned($c) => $call,
+        match &$self.link {
+            Link::Tls($c) => $call,
+            Link::Plain($c) => $call,
         }
     };
 }
@@ -466,19 +575,107 @@ mod tests {
     #[test]
     fn tor_routes_never_go_direct() {
         let iso = Isolation::fresh();
-        let e = electrum(&src("ssl://electrum.example:50002", Route::Tor, None), None, &iso).err().unwrap();
+        let e = electrum(&src("ssl://electrum.example:50002", Route::Tor, None), None, &iso, &Cancel::default()).err().unwrap();
         assert!(e.contains("no proxy"), "{e}");
         let e = esplora(&src("https://esplora.example/api", Route::Tor, None), None, &iso, None).err().unwrap();
         assert!(e.contains("no proxy"), "{e}");
-        let e = electrum(&src("tcp://x:1", Route::Direct, Some("down for a reason")), None, &iso).err().unwrap();
+        let e = electrum(&src("tcp://x:1", Route::Direct, Some("down for a reason")), None, &iso, &Cancel::default()).err().unwrap();
         assert!(e.contains("down for a reason"));
+    }
+
+    /// An Electrum server that answers server.version and then nothing; each connection's end
+    /// is reported on `ended`.
+    fn mute_server(ended: std::sync::mpsc::Sender<()>) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let ended = ended.clone();
+                std::thread::spawn(move || {
+                    let mut w = c.try_clone().unwrap();
+                    for line in BufReader::new(c).lines().map_while(Result::ok) {
+                        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if v["method"] == "server.version" {
+                            let _ = w.write_all(format!("{}\n", serde_json::json!({"jsonrpc": "2.0", "id": v["id"], "result": ["mute", "1.4"]})).as_bytes());
+                        }
+                    }
+                    let _ = ended.send(());
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_cut_ends_a_call_blocked_on_a_server_and_refuses_new_ones() {
+        let (ended, gone) = std::sync::mpsc::channel();
+        let s = src(&format!("tcp://127.0.0.1:{}", mute_server(ended)), Route::Direct, None);
+        let cancel = Cancel::default();
+        let c = electrum(&s, None, &Isolation::fresh(), &cancel).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let r = c.block_headers(0, 2016);
+            tx.send((r.is_err(), t.elapsed())).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_recv().is_err(), "the server never answers");
+        cancel.cut();
+        let (failed, took) = rx.recv_timeout(Duration::from_secs(5)).expect("the call returned");
+        assert!(failed && took < Duration::from_secs(2), "{took:?}");
+        gone.recv_timeout(Duration::from_secs(5)).expect("the server saw the connection end");
+        let e = electrum(&s, None, &Isolation::fresh(), &cancel).err().unwrap();
+        assert!(e.contains(STOPPING), "{e}");
+        gone.recv_timeout(Duration::from_secs(5)).expect("a connection after the cut is shut at once");
+    }
+
+    #[test]
+    fn a_dropped_connection_takes_its_copy_of_the_socket_along() {
+        let (ended, gone) = std::sync::mpsc::channel();
+        let s = src(&format!("tcp://127.0.0.1:{}", mute_server(ended)), Route::Direct, None);
+        let cancel = Cancel::default();
+        drop(electrum(&s, None, &Isolation::fresh(), &cancel).unwrap());
+        gone.recv_timeout(Duration::from_secs(5)).expect("the server saw the connection end");
+        assert!(cancel.0.lock().unwrap().sockets.iter().all(|w| w.strong_count() == 0));
+    }
+
+    #[test]
+    fn waits_end_when_the_wallet_closes() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            s2.store(true, Ordering::SeqCst);
+        });
+        let t = std::time::Instant::now();
+        let r: Result<(), String> = off_thread(&stop, || {
+            std::thread::sleep(Duration::from_secs(10));
+            Ok(())
+        });
+        assert_eq!(r, Err(STOPPING.to_string()));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(block_on_until(rt.handle(), &stop, async { tokio::time::sleep(Duration::from_secs(10)).await }), Err(STOPPING.to_string()));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert_eq!(block_on_until(rt.handle(), &AtomicBool::new(false), async { 7 }), Ok(7));
+    }
+
+    #[test]
+    fn electrum_urls() {
+        assert_eq!(electrum_url("ssl://h.example:50002"), Ok(("h.example".into(), 50002, true)));
+        assert_eq!(electrum_url("tcp://127.0.0.1:60601"), Ok(("127.0.0.1".into(), 60601, false)));
+        assert_eq!(electrum_url("[::1]:50001"), Ok(("::1".into(), 50001, false)));
+        assert!(electrum_url("ssl://h.example").is_err());
+        assert!(electrum_url("https://h.example:443").is_err());
     }
 
     #[test]
     fn a_dead_proxy_fails_without_a_direct_fallback() {
         // Port 9 on loopback refuses: the connection must fail rather than skip the proxy.
         let p = Proxy::parse("socks5h://127.0.0.1:9").unwrap();
-        let r = electrum(&src("ssl://electrum.example:50002", Route::Tor, None), Some(&p), &Isolation::fresh());
+        let r = electrum(&src("ssl://electrum.example:50002", Route::Tor, None), Some(&p), &Isolation::fresh(), &Cancel::default());
         assert!(r.is_err());
     }
 }
