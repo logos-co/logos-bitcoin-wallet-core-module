@@ -115,6 +115,9 @@ pub struct ChainAuthority {
     peers: u32,
     asked: bool,
     replaced: std::collections::VecDeque<(u32, BlockHash)>,
+    /// The first height the shared header store gave that this wallet hadn't checked itself and
+    /// no source has vouched for yet.
+    seed: Option<u32>,
 }
 
 impl ChainAuthority {
@@ -123,14 +126,14 @@ impl ChainAuthority {
     }
 
     pub fn on(chain: HeaderChain) -> Self {
-        Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default(), seed: None }
     }
 
     /// From stored headers and proofs on `cp`; a stored chain counts as progress, and its age shows.
     pub fn restore(net: BNetwork, cp: crate::network::Checkpoint, headers: Vec<(u32, Header)>, old: Vec<(u32, BlockHash)>, now: u32) -> Self {
         let chain = HeaderChain::restore_from(net, cp, headers, now);
         let progressed = chain.tip_height() > chain.base();
-        Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default(), seed: None }
     }
 
     /// Starts the chain again from `cp`, a lower checkpoint, keeping who feeds it and the hashes
@@ -138,8 +141,58 @@ impl ChainAuthority {
     pub fn rebase(&mut self, cp: crate::network::Checkpoint) {
         self.chain = HeaderChain::from_checkpoint(self.chain.network(), cp.height, cp.header);
         self.old.retain(|h, _| *h < cp.height);
-        (self.progressed, self.replaced, self.asked) = (false, Default::default(), false);
+        (self.progressed, self.replaced, self.asked, self.seed) = (false, Default::default(), false, None);
         self.agreeing.clear();
+    }
+
+    /// Takes the network's shared headers above the wallet's checkpoint when they hold more work
+    /// than its own chain, as a source's branch would be taken. What the wallet's own chain or its
+    /// last tip (`anchor`) covers it checked before; the rest waits for a source to vouch for it.
+    pub fn seed(&mut self, shared: &HeaderChain, anchor: Option<(u32, BlockHash)>, now: u32) -> bool {
+        let base = self.chain.base();
+        if shared.network() != self.chain.network() || shared.hash_at(base) != self.chain.hash_at(base) {
+            return false;
+        }
+        let own = self.chain.tip_height();
+        let checked = if own == base {
+            // Nothing of its own: the store's chain from here, checked as it was loaded.
+            match shared.suffix(base).filter(|c| c.tip_height() > base) {
+                Some(c) => self.chain = c,
+                None => return false,
+            }
+            base
+        } else {
+            let branch: Vec<Header> = shared.headers_from(base + 1).map(|(_, h)| *h).collect();
+            let r = self.chain.try_extend(base, &branch, now);
+            if !r.adopted {
+                return false;
+            }
+            r.changed_from.map_or(own, |h| h - 1)
+        };
+        let anchored = anchor.filter(|(h, hash)| self.chain.hash_at(*h) == Some(*hash)).map_or(base, |(h, _)| h);
+        self.progressed = true;
+        self.seed = Some(checked.max(anchored) + 1).filter(|h| *h <= self.chain.tip_height());
+        true
+    }
+
+    /// The first seeded height no source has vouched for yet.
+    pub fn seed_from(&self) -> Option<u32> {
+        self.seed
+    }
+
+    /// A source holds the same block there: the seeded chain below links to the wallet's own.
+    pub fn vouch(&mut self) {
+        self.seed = None;
+    }
+
+    /// Sources hold another block there: the seeded headers go, from `seed_from` up, and are read
+    /// from the sources instead. Returns the height they went from and the hash dropped there.
+    pub fn disown(&mut self) -> Option<(u32, BlockHash)> {
+        let from = self.seed.take()?;
+        let hash = self.chain.hash_at(from)?;
+        self.chain.truncate(from - 1);
+        self.progressed = self.chain.tip_height() > self.chain.base();
+        Some((from, hash))
     }
 
     /// Who feeds the chain now; the chain itself carries over.
@@ -596,6 +649,50 @@ mod tests {
         assert_eq!(a.hash_at(32), Some(fork[32].block_hash()));
         assert_eq!(c.agreeing, vec!["fork".to_string()]);
         assert!(a.replaced(25, honest[25].block_hash()) && !a.replaced(25, fork[25].block_hash()));
+    }
+
+    #[test]
+    fn shared_headers_seed_the_chain_and_wait_for_a_source_past_what_the_wallet_checked() {
+        let honest = chain_of(40, 31);
+        let shared = HeaderChain::restore(BNetwork::Regtest, honest.iter().enumerate().skip(1).map(|(h, x)| (h as u32, *x)), NOW);
+        // A new wallet: everything above the checkpoint waits for a source.
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
+        assert!(a.seed(&shared, None, NOW));
+        assert_eq!((a.tip_height(), a.seed_from()), (Some(40), Some(1)));
+        a.vouch();
+        assert_eq!(a.seed_from(), None);
+        // A wallet whose last tip was 25 checked up to there itself.
+        let mut b = ChainAuthority::new(BNetwork::Regtest);
+        b.seed(&shared, Some((25, honest[25].block_hash())), NOW);
+        assert_eq!(b.seed_from(), Some(26));
+        let mut c = ChainAuthority::new(BNetwork::Regtest);
+        c.seed(&shared, Some((40, honest[40].block_hash())), NOW);
+        assert_eq!(c.seed_from(), None, "its whole chain");
+        // A tip the store doesn't hold: none of it was checked here.
+        let mut d = ChainAuthority::new(BNetwork::Regtest);
+        d.seed(&shared, Some((25, honest[3].block_hash())), NOW);
+        assert_eq!(d.seed_from(), Some(1));
+        // Its own stored chain, 0 to 30: only more work is taken, past what it held.
+        let own: Vec<(u32, Header)> = (1..=30).map(|h| (h as u32, honest[h])).collect();
+        let mut e = ChainAuthority::restore(BNetwork::Regtest, BNetwork::Regtest.checkpoint(), own.clone(), vec![], NOW);
+        assert!(e.seed(&shared, None, NOW));
+        assert_eq!((e.tip_height(), e.seed_from()), (Some(40), Some(31)));
+        let lighter = HeaderChain::restore(BNetwork::Regtest, own[..20].to_vec(), NOW);
+        let mut f = ChainAuthority::restore(BNetwork::Regtest, BNetwork::Regtest.checkpoint(), own, vec![], NOW);
+        assert!(!f.seed(&lighter, None, NOW));
+        assert_eq!((f.tip_height(), f.seed_from()), (Some(30), None));
+        // Disowned by the sources: back to what the wallet had, and the hash dropped named.
+        let mut g = ChainAuthority::new(BNetwork::Regtest);
+        g.seed(&shared, Some((25, honest[25].block_hash())), NOW);
+        assert_eq!(g.disown(), Some((26, honest[26].block_hash())));
+        assert_eq!((g.tip_height(), g.seed_from()), (Some(25), None));
+        let mut n = ChainAuthority::new(BNetwork::Regtest);
+        n.seed(&shared, None, NOW);
+        n.disown();
+        assert_eq!(n.tip_height(), None, "no progress until a source feeds it");
+        // Another checkpoint's store, or another network's, seeds nothing.
+        let mut h = ChainAuthority::on(HeaderChain::from_checkpoint(BNetwork::Regtest, 10, chain_of(40, 32)[10]));
+        assert!(!h.seed(&shared, None, NOW));
     }
 
     #[test]

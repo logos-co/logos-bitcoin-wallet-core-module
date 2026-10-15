@@ -142,7 +142,7 @@ fn plaintext_control(dir: &Path) {
     let (ext, int) = descriptors();
     let mut conn = rusqlite::Connection::open(dir.join("wallet.db")).unwrap();
     let (wallet, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
-    let mut cell = Cell { wallet, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+    let mut cell = Cell { wallet, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
     let mut needles = Needles::default();
     needles.wallet(&ext, &int);
     write_updates(&mut cell, 4, false, &mut needles);
@@ -181,7 +181,7 @@ fn spike4_encrypted_storage() {
     let mut conn = dir.open(&root, &meta, &key).unwrap();
     let (wallet, created) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
     assert!(created);
-    let mut cell = Cell { wallet, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+    let mut cell = Cell { wallet, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
     let pragma = |p: &str| cell.conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get::<_, String>(0)).unwrap();
     // CommonCrypto's provider has no version string: rusqlite panics on its NULL text.
     let provider = if cfg!(target_vendor = "apple") { pragma("cipher_provider") } else { pragma("cipher_provider_version") };

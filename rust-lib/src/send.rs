@@ -438,7 +438,7 @@ mod tests {
         u.anchors.insert((ConfirmationBlockTime { block_id: b1, confirmation_time: 1 }, tx.compute_txid()));
         let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
-        (dir, Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin })
+        (dir, Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None })
     }
 
     #[test]
