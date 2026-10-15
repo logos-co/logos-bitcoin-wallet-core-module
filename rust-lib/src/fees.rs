@@ -25,7 +25,10 @@ pub struct FeeRates {
     pub normal: f64,
     pub slow: f64,
     pub minimum: f64,
+    /// The sources whose estimates these are; a source that stated only its minimum is not one.
     pub sources: Vec<String>,
+    /// Every level has an estimate from some source. Otherwise the levels are only the floor.
+    pub estimated: bool,
 }
 
 pub fn median(mut v: Vec<f64>) -> Option<f64> {
@@ -41,12 +44,21 @@ pub fn median(mut v: Vec<f64>) -> Option<f64> {
 /// The median of each target across sources, never below the highest minimum any source states.
 pub fn combine(estimates: &[SourceEstimate]) -> FeeRates {
     let minimum = estimates.iter().filter_map(|e| e.minimum).filter(|m| m.is_finite() && *m > 0.0).fold(DEFAULT_MINIMUM, f64::max);
-    let at = |i: usize| median(estimates.iter().filter_map(|e| e.rates[i]).collect()).unwrap_or(minimum).max(minimum);
+    let medians: Vec<Option<f64>> = (0..3).map(|i| median(estimates.iter().filter_map(|e| e.rates[i]).collect())).collect();
+    let at = |i: usize| medians[i].unwrap_or(minimum).max(minimum);
     let (fast, normal, slow) = (at(0), at(1), at(2));
     // A slower target never costs more than a faster one.
     let normal = normal.min(fast);
     let slow = slow.min(normal);
-    FeeRates { fast: round(fast), normal: round(normal), slow: round(slow), minimum: round(minimum), sources: estimates.iter().map(|e| e.source.clone()).collect() }
+    let gave = |e: &SourceEstimate| e.rates.iter().flatten().any(|r| r.is_finite() && *r > 0.0);
+    FeeRates {
+        fast: round(fast),
+        normal: round(normal),
+        slow: round(slow),
+        minimum: round(minimum),
+        sources: estimates.iter().filter(|e| gave(e)).map(|e| e.source.clone()).collect(),
+        estimated: medians.iter().all(Option::is_some),
+    }
 }
 
 fn round(x: f64) -> f64 {
@@ -93,10 +105,18 @@ mod tests {
             est("c", [Some(25.0), None, None], None),
         ]);
         assert_eq!((r.fast, r.normal, r.slow, r.minimum), (25.0, 11.0, 1.5, 1.5));
-        assert_eq!(r.sources, vec!["a", "b", "c"]);
-        // No estimates anywhere, as on regtest: the minimum everywhere.
-        let r = combine(&[est("regtest", [None, None, None], None)]);
-        assert_eq!((r.fast, r.normal, r.slow), (1.0, 1.0, 1.0));
+        assert_eq!((r.sources.clone(), r.estimated), (vec!["a".to_string(), "b".into(), "c".into()], true));
+        // No estimates anywhere, as on regtest (Electrum's -1) or from Kyoto's floor: the minimum
+        // everywhere, and no estimate.
+        let r = combine(&[est("regtest", [None, None, None], None), est("kyoto", [None; 3], Some(1.0))]);
+        assert_eq!((r.fast, r.normal, r.slow, r.estimated), (1.0, 1.0, 1.0, false));
+        assert!(r.sources.is_empty(), "{r:?}");
+        assert!(!combine(&[]).estimated);
+        // A level no source estimates is no estimate either.
+        assert!(!combine(&[est("a", [Some(5.0), Some(3.0), None], None)]).estimated);
+        // A quiet network: every level the same, from a real estimate.
+        let r = combine(&[est("a", [Some(1.0), Some(1.0), Some(1.0)], Some(1.0)), est("kyoto", [None; 3], Some(1.0))]);
+        assert_eq!((r.fast, r.normal, r.slow, r.estimated, r.sources.clone()), (1.0, 1.0, 1.0, true, vec!["a".to_string()]));
         // A slower target is never dearer than a faster one.
         let r = combine(&[est("a", [Some(5.0), Some(9.0), Some(12.0)], None)]);
         assert_eq!((r.fast, r.normal, r.slow), (5.0, 5.0, 5.0));

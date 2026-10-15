@@ -143,10 +143,9 @@ fn esplora_history_broadcast_and_fees() {
     t.synced();
     t.wait("the send confirmed", 60, || t.row(&txid)["state"] == "confirmed");
 
-    // Fee rates: Esplora answered (regtest's node has no estimates, so they are the floor).
-    t.wait("Esplora's fee estimates", 30, || t.engine.fee_rates_json()["sources"].as_array().is_some_and(|s| s.contains(&json!("esplora-0"))));
+    // Fee rates: regtest's node has no estimates, so Esplora answers `{}`; the floor is not one.
     let fees = t.engine.fee_rates_json();
-    assert!(fees["normal"].as_f64().unwrap() >= fees["minimum"].as_f64().unwrap(), "{fees}");
+    assert_eq!(fees, json!({"ok": false, "error": "no fee estimate yet"}));
     let src = t.engine.sources_status();
     let row = src["sources"].as_array().unwrap().iter().find(|s| s["id"] == "esplora-0").cloned().unwrap();
     assert_eq!((row["encrypted"].clone(), row["suspect"].clone()), (json!(false), json!(false)), "{row}");
@@ -168,4 +167,23 @@ fn esplora_history_broadcast_and_fees() {
     assert_eq!(wrong.engine.history(0)["total"], 0);
     println!("ESPLORA pinned: {} rows over https://127.0.0.1:{front}; another pin: {}", total, wrong.engine.status()["lastError"]);
     wrong.engine.shutdown();
+
+    // A server that does estimate, through a front that answers `/fee-estimates`: the levels, the
+    // source named, and a send without a rate takes normal.
+    let estimating = common::http_front(esplora_port, Arc::new(|path: &str, body: Option<&[u8]>| {
+        (path == "/fee-estimates" && body.is_none()).then(|| (200, br#"{"1":30.5,"2":12.4,"3":11,"6":6,"12":3,"24":2.1,"144":1.2}"#.to_vec()))
+    }));
+    let (e, _dir3) = open(&t, routes(&electrum, &format!("http://127.0.0.1:{estimating}"), None));
+    e.synced();
+    e.wait("Esplora's estimate", 60, || e.engine.fee_rates_json()["ok"] == true);
+    let fees = e.engine.fee_rates_json();
+    assert_eq!((fees["fast"].as_f64(), fees["normal"].as_f64(), fees["slow"].as_f64()), (Some(12.4), Some(6.0), Some(2.1)), "{fees}");
+    assert_eq!((fees["sources"].clone(), fees["estimated"].clone()), (json!(["esplora-0"]), json!(true)), "{fees}");
+    e.wait("the history through the front", 60, || e.engine.history(0)["total"] == total);
+    let theirs = t.wallet_rpc("getnewaddress", json!(["payee"])).as_str().unwrap().to_string();
+    let p = e.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "100000"}]}));
+    assert_eq!(p["feeRate"].as_f64(), Some(6.0), "{p}");
+    e.job("cancel_send", json!({"previewId": p["previewId"]}));
+    println!("ESPLORA fees through a front that estimates: {fees}");
+    e.engine.shutdown();
 }
