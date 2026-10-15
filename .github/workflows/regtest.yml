@@ -64,6 +64,13 @@ jobs:
           REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
             cargo test --release --no-default-features --features test-hooks --locked --test regtest -- --ignored --nocapture
 
+      - name: Close the wallet during a slow header download, on the same chain
+        run: |
+          cd rust-lib
+          REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE="$CHAIN_DIR/bitcoind/regtest/.cookie" \
+          REGTEST_ELECTRUM=127.0.0.1:60601 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
+            cargo test --release --no-default-features --features test-hooks --locked --test close -- --ignored --nocapture
+
       - name: Run the engine on regtest, Kyoto the authority
         run: |
           tools/regtest/chain.sh stop
@@ -92,6 +99,13 @@ jobs:
           REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE="$CHAIN_DIR/bitcoind/regtest/.cookie" \
           REGTEST_ELECTRUM=127.0.0.1:60601 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
             cargo test --release --no-default-features --features test-hooks --locked --test node -- --ignored --nocapture
+
+      - name: Wallets share the network's headers, and a damaged store is rebuilt, on the same chain
+        run: |
+          cd rust-lib
+          REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE="$CHAIN_DIR/bitcoind/regtest/.cookie" \
+          REGTEST_ELECTRUM=127.0.0.1:60601 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
+            cargo test --release --no-default-features --features test-hooks --locked --test shared_headers -- --ignored --nocapture
 
       - name: Run the engine on regtest, Esplora for history, broadcast and fees
         run: |

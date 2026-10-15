@@ -19,7 +19,7 @@ fn main() {
     let mut clients = vec![];
     for (i, url) in args[2..].iter().enumerate() {
         let s = Source { id: format!("s{i}:{url}"), url: url.clone(), operator: String::new(), route, kind: Kind::Electrum, pin: None, encrypted: true, down: None, credentials: false };
-        match net::electrum(&s, proxy.as_ref(), &Isolation::fresh()) {
+        match net::electrum(&s, proxy.as_ref(), &Isolation::fresh(), &net::Cancel::default()) {
             Ok(c) => clients.push((s.id, c)),
             Err(e) => println!("{e}"),
         }

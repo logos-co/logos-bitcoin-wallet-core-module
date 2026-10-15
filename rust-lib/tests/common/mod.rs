@@ -43,7 +43,8 @@ pub struct MockManager {
     next: AtomicU64,
     records: Mutex<HashMap<String, Record>>,
     delay: Duration,
-    keys: Mutex<HashMap<String, String>>,
+    /// Each account's database key; removing one gives the account a new key at its next open.
+    pub keys: Mutex<HashMap<String, String>>,
     pub log: Mutex<Vec<String>>,
     /// The next approval settles this way instead of approved.
     pub next_reason: Mutex<Option<&'static str>>,

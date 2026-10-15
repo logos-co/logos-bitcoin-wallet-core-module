@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use crate::checks::GAP_LIMIT;
 use crate::fees;
 use crate::headers::HeaderChain;
+use crate::headerstore::{SharedHeaders, Written};
 use crate::intent::{self, Intent};
 use crate::network::{BNetwork, Family};
 
@@ -24,7 +25,12 @@ pub struct Cell {
     pub conn: Connection,
     pub network: BNetwork,
     pub family: Family,
+    /// The network's shared header store; without it the wallet keeps its headers itself.
+    pub shared: Option<SharedHeaders>,
 }
+
+/// The wallet's last stored tip, `height:hash`: the chain it checked itself, in its own database.
+pub const CHAIN_TIP_KEY: &str = "chain_tip";
 
 /// Where the wallet's gap limit is kept in `core_meta`; 20 when unset.
 pub const GAP_LIMIT_KEY: &str = "gap_limit";
@@ -119,20 +125,58 @@ impl Cell {
     /// Drops every stored header: the chain starts again from another checkpoint.
     pub fn clear_headers(&mut self) -> Result<(), String> {
         sql(self.conn.execute("DELETE FROM core_headers", []))?;
+        sql(self.conn.execute("DELETE FROM core_meta WHERE key = ?1", [CHAIN_TIP_KEY]))?;
         Ok(())
     }
 
-    /// Rewrites stored headers from `from` up to the chain's tip.
+    /// Stores the chain: in the shared store when it takes it, which then holds the wallet's
+    /// headers (any it kept itself go), else rewritten here from `from` up. Either way the tip is
+    /// kept here, as what the wallet checked itself.
     pub fn store_headers(&mut self, chain: &HeaderChain, from: u32) -> Result<(), String> {
+        let shared = match self.shared.as_mut().map(|s| s.write(chain)) {
+            Some(Ok(w)) => w != Written::Detached,
+            Some(Err(e)) => {
+                tracing::warn!(target: "bitcoin", "{e}; the wallet keeps its headers itself");
+                false
+            }
+            None => false,
+        };
+        // Kept here again after the store held it: the whole chain, not only what changed.
+        let held_below = from <= chain.base() + 1 || self.conn.query_row("SELECT 1 FROM core_headers WHERE height = ?1", [from - 1], |_| Ok(())).is_ok();
+        let from = if shared || held_below { from } else { chain.base() + 1 };
         let tx = sql(self.conn.transaction())?;
-        sql(tx.execute("DELETE FROM core_headers WHERE height >= ?1", [from]))?;
-        {
+        if shared {
+            sql(tx.execute("DELETE FROM core_headers", []))?;
+        } else {
+            sql(tx.execute("DELETE FROM core_headers WHERE height >= ?1", [from]))?;
             let mut st = sql(tx.prepare("INSERT INTO core_headers (height, header) VALUES (?1, ?2)"))?;
             for (h, header) in chain.headers_from(from.max(chain.base() + 1)) {
                 sql(st.execute(params![h, serialize(header)]))?;
             }
         }
+        let tip = format!("{}:{}", chain.tip_height(), chain.tip_hash());
+        sql(tx.execute("INSERT INTO core_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", params![CHAIN_TIP_KEY, tip]))?;
         sql(tx.commit())
+    }
+
+    /// Keeps the chain's tip as what the wallet checked itself, as a store does.
+    pub fn note_tip(&self, chain: &HeaderChain) -> Result<(), String> {
+        crate::storage::meta_set(&self.conn, CHAIN_TIP_KEY, &format!("{}:{}", chain.tip_height(), chain.tip_hash())).map_err(|e| e.to_string())
+    }
+
+    /// The tip the wallet last stored, when it has one.
+    pub fn anchor(&self) -> Option<(u32, BlockHash)> {
+        let v = crate::storage::meta_get(&self.conn, CHAIN_TIP_KEY).ok().flatten()?;
+        let (h, hash) = v.split_once(':')?;
+        Some((h.parse().ok()?, BlockHash::from_str(hash).ok()?))
+    }
+
+    /// The chain as stored from `cp`: the wallet's own headers, or the shared store's when it
+    /// holds more work from there.
+    pub fn stored_chain(&mut self, cp: crate::network::Checkpoint, now: u32) -> Result<HeaderChain, String> {
+        let own = HeaderChain::restore_from(self.network, cp, self.load_headers()?, now);
+        let shared = self.shared.as_mut().and_then(|s| s.load(now)).filter(|c| c.hash_at(cp.height) == Some(cp.header.block_hash())).and_then(|c| c.suffix(cp.height));
+        Ok(shared.filter(|s| s.total_work() > own.total_work()).unwrap_or(own))
     }
 
     pub fn load_old(&self) -> Result<Vec<(u32, BlockHash)>, String> {
@@ -648,6 +692,39 @@ mod tests {
     use super::*;
     use crate::headers::tests::regtest_branch;
 
+    /// A wallet that kept its headers itself moves them to the shared store at its next write and
+    /// keeps its tip; one whose chain the store can't take keeps its own.
+    #[test]
+    fn headers_move_to_the_shared_store_and_the_tip_stays() {
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[4; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
+        let g = BNetwork::Regtest.checkpoint().header;
+        let mut chain = HeaderChain::new(BNetwork::Regtest);
+        chain.try_extend(0, &regtest_branch(&g, 50, g.time, 1), 2_000_000_000);
+        cell.store_headers(&chain, 1).unwrap();
+        assert_eq!(cell.load_headers().unwrap().len(), 50, "without a store, its own");
+        assert_eq!(cell.anchor(), Some((50, chain.tip_hash())));
+        cell.shared = Some(SharedHeaders::open(&dir.path().join("headers"), BNetwork::Regtest).unwrap());
+        cell.store_headers(&chain, 50).unwrap();
+        assert!(cell.load_headers().unwrap().is_empty(), "the store holds them now");
+        assert_eq!(cell.stored_chain(BNetwork::Regtest.checkpoint(), 2_000_000_000).unwrap().tip_hash(), chain.tip_hash());
+        // A chain from another checkpoint the store doesn't share: kept here, whole, from wherever
+        // it changed, and the tip with it.
+        let mut other = HeaderChain::from_checkpoint(BNetwork::Regtest, 7, regtest_branch(&g, 7, g.time, 2)[6]);
+        let more = regtest_branch(other.tip(), 10, other.tip().time, 2);
+        other.try_extend(7, &more, 2_000_000_000);
+        cell.store_headers(&other, 15).unwrap();
+        assert_eq!(cell.load_headers().unwrap().iter().map(|(h, _)| *h).collect::<Vec<_>>(), (8..=17).collect::<Vec<_>>());
+        assert_eq!(cell.anchor(), Some((17, other.tip_hash())));
+        cell.clear_headers().unwrap();
+        assert_eq!(cell.anchor(), None);
+    }
+
     /// The original of a fee bump confirms first: it reads confirmed, with no replacement, and the
     /// conflicted bump has no row.
     #[test]
@@ -686,7 +763,7 @@ mod tests {
         u.anchors.insert((ConfirmationBlockTime { block_id: b2, confirmation_time: 2 }, original.compute_txid()));
         let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1, b2]).unwrap();
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
-        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
         let record = |tx: &Transaction, state: &str, replaces: Option<Txid>| SendRecord {
             txid: tx.compute_txid(), tx: tx.clone(), inputs: vec![coin], state: state.into(), created: 0, replaces, via: None, broadcast: None,
         };
@@ -739,7 +816,7 @@ mod tests {
         let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b6]).unwrap();
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
         crate::storage::meta_set(&conn, crate::sync::CHAIN_BASE, "5").unwrap();
-        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
         let held = [Held { txid: funding.compute_txid(), anchor: ConfirmationBlockTime { block_id: b2, confirmation_time: 2 }, source: "esplora-0".into() }];
         let row = |held: &[Held]| {
             let h = cell.history(0, 50, held).unwrap();
@@ -790,7 +867,7 @@ mod tests {
         u.seen_ats.insert((spend.compute_txid(), 2));
         let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
-        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
         let record = SendRecord { txid: spend.compute_txid(), tx: spend.clone(), inputs: vec![coin], state: "sent".into(), created: 2, replaces: None, via: Some("kyoto".into()), broadcast: Some("unknown".into()) };
         cell.store_send(&record).unwrap();
         let h = cell.history(0, 50, &[]).unwrap();
@@ -835,7 +912,7 @@ mod tests {
         u.txs.push(std::sync::Arc::new(held.clone()));
         let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
-        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
         let held = [Held { txid: held.compute_txid(), anchor: ConfirmationBlockTime { block_id: BlockId { height: 9, hash: BlockHash::from_byte_array([9; 32]) }, confirmation_time: 9 }, source: "electrum-0".into() }];
         let sat = |is: &mut dyn Iterator<Item = u32>| is.map(|i| 1_000 * u64::from(i + 1)).sum::<u64>().to_string();
         let b = cell.balance(&held, 1.0);
@@ -863,7 +940,7 @@ mod tests {
         let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
         let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
         let (w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
-        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin };
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
         for _ in 0..3 {
             assert_eq!(cell.current_address().unwrap()["index"], 0, "opens show #0 and reveal nothing more");
         }

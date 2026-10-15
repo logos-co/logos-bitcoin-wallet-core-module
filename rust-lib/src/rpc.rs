@@ -4,7 +4,8 @@ use crate::{
     routes::{Isolation, Proxy, Route, Source},
 };
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub struct RemoteRpc {
     client: reqwest::Client,
@@ -12,6 +13,7 @@ pub struct RemoteRpc {
     rt: tokio::runtime::Handle,
     next: AtomicU64,
     creds: Option<zeroize::Zeroizing<(String, String)>>,
+    stop: Option<Arc<AtomicBool>>,
 }
 impl RemoteRpc {
     pub fn new(
@@ -48,10 +50,16 @@ impl RemoteRpc {
             rt,
             next: AtomicU64::new(1),
             creds: creds.map(zeroize::Zeroizing::new),
+            stop: None,
         })
     }
+    /// Requests end, with an error, once `stop` is set: a closing wallet doesn't wait for them.
+    pub fn until(mut self, stop: Arc<AtomicBool>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
     fn request(&self, body: Value) -> Result<Value, String> {
-        self.rt.block_on(async {
+        let call = async {
             let mut req = self
                 .client
                 .post(&self.url)
@@ -84,7 +92,11 @@ impl RemoteRpc {
                 bytes.extend_from_slice(&chunk);
             }
             serde_json::from_slice(&bytes).map_err(|_| "RPC response is not JSON".into())
-        })
+        };
+        match &self.stop {
+            Some(stop) => crate::net::block_on_until(&self.rt, stop, call)?,
+            None => self.rt.block_on(call),
+        }
     }
 }
 impl NodeRpc for RemoteRpc {

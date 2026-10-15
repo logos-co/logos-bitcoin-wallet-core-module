@@ -8,6 +8,7 @@ pub mod engine;
 pub mod fees;
 pub mod gate;
 pub mod headers;
+pub mod headerstore;
 pub mod intent;
 pub mod jobs;
 pub mod kyoto;
