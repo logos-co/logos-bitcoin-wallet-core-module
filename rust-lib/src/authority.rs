@@ -32,6 +32,16 @@ pub struct Summary {
     pub asked: bool,
     /// The checkpoint the chain starts from: every anchor at or above it is checked against it.
     pub base: u32,
+    /// While headers are being taken in: the chain's tip and the tip its source announced.
+    pub headers: Option<HeaderProgress>,
+}
+
+/// A header download: `have` the height reached, `target` the tip the source announced, unknown
+/// for Kyoto, whose peers' tips aren't known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HeaderProgress {
+    pub have: u32,
+    pub target: Option<u32>,
 }
 
 /// What one refresh changed.
@@ -115,6 +125,10 @@ pub struct ChainAuthority {
     peers: u32,
     asked: bool,
     replaced: std::collections::VecDeque<(u32, BlockHash)>,
+    /// The highest tip a source on the chain announced above it: what a download is heading to.
+    target: Option<u32>,
+    /// This round's sources and the last of their headers taken, so one ahead still agrees.
+    delivered: BTreeMap<String, (u32, BlockHash)>,
 }
 
 impl ChainAuthority {
@@ -123,14 +137,14 @@ impl ChainAuthority {
     }
 
     pub fn on(chain: HeaderChain) -> Self {
-        Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: BTreeMap::new(), progressed: false, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default(), target: None, delivered: BTreeMap::new() }
     }
 
     /// From stored headers and proofs on `cp`; a stored chain counts as progress, and its age shows.
     pub fn restore(net: BNetwork, cp: crate::network::Checkpoint, headers: Vec<(u32, Header)>, old: Vec<(u32, BlockHash)>, now: u32) -> Self {
         let chain = HeaderChain::restore_from(net, cp, headers, now);
         let progressed = chain.tip_height() > chain.base();
-        Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default() }
+        Self { kind: ELECTRUM_HEADERS, chain, old: old.into_iter().collect(), progressed, agreeing: BTreeSet::new(), peers: 0, asked: false, replaced: Default::default(), target: None, delivered: BTreeMap::new() }
     }
 
     /// Starts the chain again from `cp`, a lower checkpoint, keeping who feeds it and the hashes
@@ -138,7 +152,7 @@ impl ChainAuthority {
     pub fn rebase(&mut self, cp: crate::network::Checkpoint) {
         self.chain = HeaderChain::from_checkpoint(self.chain.network(), cp.height, cp.header);
         self.old.retain(|h, _| *h < cp.height);
-        (self.progressed, self.replaced, self.asked) = (false, Default::default(), false);
+        (self.progressed, self.replaced, self.asked, self.target) = (false, Default::default(), false, None);
         self.agreeing.clear();
     }
 
@@ -147,8 +161,13 @@ impl ChainAuthority {
         if self.kind != kind {
             self.kind = kind;
             self.agreeing.clear();
-            (self.peers, self.asked) = (0, false);
+            (self.peers, self.asked, self.target) = (0, false, None);
         }
+    }
+
+    /// The node's tip while its headers are taken in; none once the chain reaches it.
+    pub fn set_target(&mut self, target: Option<u32>) {
+        self.target = target;
     }
 
     /// Kyoto's connected peers, or 1 for a reachable node.
@@ -268,8 +287,9 @@ impl ChainAuthority {
         }
     }
 
-    /// Fetches and tries `src`'s chain; returns its tip for the agreement count.
-    fn refresh_one(&mut self, src: &dyn HeaderSource, now: u32, change: &mut Change) -> Result<(u32, BlockHash), String> {
+    /// Fetches and tries `src`'s chain; returns its tip for the agreement count. Each answer is
+    /// checked and taken as it comes, and `on_chunk` hears of it, so a long download shows.
+    fn refresh_one(&mut self, src: &dyn HeaderSource, now: u32, change: &mut Change, on_chunk: &mut dyn FnMut(&ChainAuthority)) -> Result<(u32, BlockHash), String> {
         let (their_tip, their_header) = src.tip()?;
         let tip = (their_tip, their_header.block_hash());
         if their_tip < self.chain.base() {
@@ -278,7 +298,7 @@ impl ChainAuthority {
         if self.chain.hash_at(their_tip) == Some(tip.1) {
             return Ok(tip);
         }
-        let Some(fork) = self.fork_point(src, their_tip)? else {
+        let Some(mut fork) = self.fork_point(src, their_tip)? else {
             change.suspects.push((src.id().into(), "its chain does not contain the checkpoint".into()));
             return Ok(tip);
         };
@@ -293,23 +313,72 @@ impl ChainAuthority {
             start += got.len() as u32;
             branch.extend(got);
             calls += 1;
-        }
-        let r = self.chain.try_extend(fork, &branch, now);
-        if let Some(e) = &r.error {
-            // A header that fails the checks is a lie, not a lag; one from the future may be a clock.
-            if !matches!(e, HeaderError::TimeTooNew(_)) {
-                change.suspects.push((src.id().into(), e.to_string()));
+            // A branch lighter than ours so far (a deep reorg) waits for more of it.
+            let r = self.chain.try_extend(fork, &branch, now);
+            if let Some(e) = &r.error {
+                // A header that fails the checks is a lie, not a lag; one from the future may be a clock.
+                if !matches!(e, HeaderError::TimeTooNew(_)) {
+                    change.suspects.push((src.id().into(), e.to_string()));
+                }
+            }
+            if r.adopted {
+                self.remember(r.replaced);
+                change.reorg_depth = change.reorg_depth.max(r.reorg_depth);
+                change.changed_from = match (change.changed_from, r.changed_from) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            if r.error.is_some() {
+                break;
+            }
+            if branch.last().is_some_and(|h| self.chain.tip_hash() == h.block_hash()) {
+                // Taken whole: the source is on the chain, ahead of it, and has answered.
+                (fork, self.asked, self.progressed) = (self.chain.tip_height(), true, true);
+                branch.clear();
+                self.delivered.insert(src.id().to_string(), (fork, self.chain.tip_hash()));
+                self.agreeing.insert(src.id().to_string());
+                if their_tip > fork {
+                    self.target = Some(self.target.map_or(their_tip, |t| t.max(their_tip)));
+                }
+                on_chunk(self);
             }
         }
-        if r.adopted {
-            self.remember(r.replaced);
-            change.reorg_depth = change.reorg_depth.max(r.reorg_depth);
-            change.changed_from = match (change.changed_from, r.changed_from) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-        }
         Ok(tip)
+    }
+
+    /// `refresh`, with `on_chunk` called as each answer is taken during a long download.
+    pub fn refresh_with(&mut self, sources: &[&dyn HeaderSource], now: u32, on_chunk: &mut dyn FnMut(&ChainAuthority)) -> Change {
+        let mut change = Change::default();
+        let before = self.chain.tip_hash();
+        self.delivered.clear();
+        let mut tips = vec![];
+        for src in sources {
+            match self.refresh_one(*src, now, &mut change, on_chunk) {
+                Ok(tip) => {
+                    self.progressed = true;
+                    tips.push((src.id().to_string(), tip));
+                }
+                Err(e) => change.failures.push((src.id().into(), e)),
+            }
+        }
+        // Agreement against the chain kept after every source had its say: a source whose tip is
+        // on it, or one ahead whose headers it took this round.
+        let on_chain = |id: &str, (h, hash): (u32, BlockHash)| {
+            self.chain.hash_at(h) == Some(hash) || self.delivered.get(id).is_some_and(|(dh, dhash)| self.chain.hash_at(*dh) == Some(*dhash))
+        };
+        let agreeing: Vec<(String, u32)> = tips
+            .into_iter()
+            .filter(|(id, tip)| on_chain(id, *tip) && !change.suspects.iter().any(|(s, _)| s == id))
+            .map(|(id, (h, _))| (id, h))
+            .collect();
+        let tip = self.chain.tip_height();
+        self.target = agreeing.iter().map(|(_, h)| *h).filter(|h| *h > tip).max();
+        self.agreeing = agreeing.into_iter().map(|(id, _)| id).collect();
+        change.tip_moved = self.chain.tip_hash() != before;
+        change.agreeing = self.agreeing.iter().cloned().collect();
+        self.asked = true;
+        change
     }
 }
 
@@ -344,28 +413,7 @@ impl Authority for ChainAuthority {
     }
 
     fn refresh(&mut self, sources: &[&dyn HeaderSource], now: u32) -> Change {
-        let mut change = Change::default();
-        let before = self.chain.tip_hash();
-        let mut tips = vec![];
-        for src in sources {
-            match self.refresh_one(*src, now, &mut change) {
-                Ok(tip) => {
-                    self.progressed = true;
-                    tips.push((src.id().to_string(), tip));
-                }
-                Err(e) => change.failures.push((src.id().into(), e)),
-            }
-        }
-        // Agreement against the chain kept after every source had its say.
-        self.agreeing = tips
-            .into_iter()
-            .filter(|(id, (h, hash))| self.chain.hash_at(*h) == Some(*hash) && !change.suspects.iter().any(|(s, _)| s == id))
-            .map(|(id, _)| id)
-            .collect();
-        change.tip_moved = self.chain.tip_hash() != before;
-        change.agreeing = self.agreeing.iter().cloned().collect();
-        self.asked = true;
-        change
+        self.refresh_with(sources, now, &mut |_| {})
     }
 
     fn prove_below(&mut self, heights: &[u32], src: &dyn HeaderSource) -> Result<Walked, String> {
@@ -407,6 +455,7 @@ impl Authority for ChainAuthority {
     }
 
     fn summary(&self, now: u64) -> Summary {
+        let tip = self.chain.tip_height();
         Summary {
             kind: self.kind(),
             height: self.tip_height(),
@@ -415,6 +464,7 @@ impl Authority for ChainAuthority {
             peers: if self.kind == ELECTRUM_HEADERS { self.agreeing.len() as u32 } else { self.peers },
             asked: self.asked,
             base: self.chain.base(),
+            headers: self.target.filter(|t| *t > tip).map(|t| HeaderProgress { have: tip, target: Some(t) }),
         }
     }
 
@@ -596,6 +646,84 @@ mod tests {
         assert_eq!(a.hash_at(32), Some(fork[32].block_hash()));
         assert_eq!(c.agreeing, vec!["fork".to_string()]);
         assert!(a.replaced(25, honest[25].block_hash()) && !a.replaced(25, fork[25].block_hash()));
+    }
+
+    /// A source serving a fixed chain, whose header calls fail from the `fail_from`th on.
+    struct Failing {
+        chain: Vec<Header>,
+        calls: std::cell::Cell<u32>,
+        fail_from: u32,
+    }
+
+    impl HeaderSource for Failing {
+        fn id(&self) -> &str {
+            "failing"
+        }
+        fn tip(&self) -> Result<(u32, Header), String> {
+            Ok((self.chain.len() as u32 - 1, *self.chain.last().unwrap()))
+        }
+        fn headers(&self, start: u32, count: u32) -> Result<Vec<Header>, String> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() >= self.fail_from {
+                return Err("connection reset".into());
+            }
+            Ok(self.chain.iter().skip(start as usize).take(count as usize).copied().collect())
+        }
+    }
+
+    #[test]
+    fn a_long_download_is_taken_and_shown_chunk_by_chunk() {
+        let honest = chain_of(5_000, 21);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
+        let mut seen = vec![];
+        let c = a.refresh_with(&[&fake("far", honest.clone())], NOW, &mut |a| {
+            let s = a.summary(u64::from(NOW));
+            seen.push((s.height, s.headers, s.peers, s.asked));
+        });
+        let at = |have: u32| Some(HeaderProgress { have, target: Some(5_000) });
+        assert_eq!(seen, vec![(Some(2_016), at(2_016), 1, true), (Some(4_032), at(4_032), 1, true), (Some(5_000), None, 1, true)]);
+        assert_eq!((c.changed_from, c.agreeing.clone()), (Some(1), vec!["far".to_string()]));
+        assert_eq!(a.summary(0).headers, None, "at the source's tip nothing is left to read");
+    }
+
+    #[test]
+    fn a_download_longer_than_a_round_shows_its_target_between_rounds() {
+        let honest = chain_of(60_000, 22);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
+        let far = fake("far", honest);
+        a.refresh(&[&far], NOW);
+        let s = a.summary(u64::from(NOW));
+        let have = HEADERS_PER_CALL * MAX_CALLS_PER_REFRESH;
+        assert_eq!((s.height, s.headers, s.peers, s.asked), (Some(have), Some(HeaderProgress { have, target: Some(60_000) }), 1, true),
+                   "a source still sending its chain agrees with it, and has answered");
+        a.refresh(&[&far], NOW);
+        let s = a.summary(u64::from(NOW));
+        assert_eq!((s.height, s.headers, s.peers), (Some(60_000), None, 1));
+    }
+
+    #[test]
+    fn what_was_taken_before_a_source_failed_stays() {
+        let honest = chain_of(5_000, 23);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
+        // The fork search is the first call, two chunks the next: the fourth call fails.
+        let c = a.refresh(&[&Failing { chain: honest.clone(), calls: Default::default(), fail_from: 4 }], NOW);
+        assert_eq!((a.tip_height(), c.changed_from, c.failures.len()), (Some(4_032), Some(1), 1));
+        assert_eq!(a.hash_at(4_032), Some(honest[4_032].block_hash()));
+        let s = a.summary(u64::from(NOW));
+        assert_eq!((s.peers, s.headers), (0, None), "a source that failed agrees with nothing this round");
+    }
+
+    #[test]
+    fn a_reorg_longer_than_one_answer_waits_for_enough_work() {
+        let ours = chain_of(3_000, 24);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
+        a.refresh(&[&fake("ours", ours.clone())], NOW);
+        // A heavier fork from 100: its first 2,016 headers weigh less than our 2,900 above it.
+        let mut theirs = ours[..101].to_vec();
+        theirs.extend(regtest_branch(&ours[100], 3_100, ours[100].time + 1, 25));
+        let c = a.refresh(&[&fake("theirs", theirs.clone())], NOW);
+        assert_eq!((c.reorg_depth, c.changed_from, a.tip_height()), (2_900, Some(101), Some(3_200)));
+        assert_eq!(a.hash_at(3_200), Some(theirs[3_200].block_hash()));
     }
 
     #[test]

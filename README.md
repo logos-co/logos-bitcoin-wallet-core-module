@@ -90,6 +90,15 @@ header }`) for the tests. Every header passes the same checks wherever it comes 
 The authority changes as the route table and the node's state change; the header chain carries
 over, and `status.authority.kind` says which feeds it: `local_node`, `kyoto` or `electrum_headers`.
 
+A long download shows as it goes. Electrum servers send at most 2,016 headers a call and 25 calls
+a refresh; each answer is checked and taken as it comes, so the chain, `status.authority.height`
+and `status.authority.headers: { have, target }` move with every answer, and an answer that
+failed or was cut short keeps what came before it. A server sending its chain has answered and
+agrees with it, so `asked` turns true and `peers` counts it from its first answer; `target` is the
+highest tip announced by a server on the chain, kept between refreshes until the chain reaches
+it. The node's headers show the same way, its tip the target; Kyoto's, while it syncs headers
+before its scan, as its own best header with `target` null: its peers' tips aren't known.
+
 ### The local node
 
 `bitcoind_module` runs Bitcoin Core in-process. The core calls its `rpc(method, paramsJson)` over
@@ -357,7 +366,7 @@ Amounts are decimal strings of satoshis.
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below. Malformed parameters are refused at once with `{ ok: false, error, code: "invalid" }` |
 | `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
-| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base, asked }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, gapLimit, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `asked` is false until the open's first round of asking the chain's sources ends (every server asked, a Kyoto peer connected or a start ended, the node answered or failed), and again when the authority changes hands: until then `peers` is 0 and `height` is the chain stored last time, which is no news, not "none agrees". `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
+| `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base, asked, headers }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, gapLimit, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `asked` is false until the open's first round of asking the chain's sources ends (every server asked, a Kyoto peer connected or a start ended, the node answered or failed) or a server's first headers are taken, and again when the authority changes hands: until then `peers` is 0 and `height` is the chain stored last time, which is no news, not "none agrees". `headers: { have, target }` is a header download in progress ("The chain authority"), null otherwise; `target` is null for Kyoto. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
 | `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count, sat, confirmedSat } }`; `unchecked` is what unchecked rows pay the wallet; `beyondGap` is the coins beyond the gap, in none of the other figures; empty strings while busy |
 | `next_address()`, `current_address()`, `addresses()`, `utxos()` | A fresh receive address, `{ address, index, fresh, unused, gapLimit }`: once `unused` addresses stand unused and reach `gapLimit`, none is revealed and the first unused one comes back with `fresh` false; the first unused receive address, revealed only when none is (what an app shows when a wallet opens); revealed receive addresses; outputs confirmed on the authority's chain |
 | `history(page)` | Rows `{ txid, intent: send\|self\|combine\|fee_bump\|receive, amountSat, feeSat, coins, counterparties, height, blockHash, confirmations, time, state: confirmed\|waiting\|unchecked\|pending\|sent\|replaced, replaces, replacedBy, reportedBy, sendState, broadcast, via, confirmedVia, beyondGap }`; `beyondGap` is true when the wallet's part of the transaction is only through addresses beyond the gap; `blockHash` is the confirming block's, on confirmed, waiting and unchecked rows; `waiting` is a block a server reported that the chain doesn't hold yet, or whose proof hasn't come; `unchecked` is a block a server reported below the chain's start, which nothing checked or which failed its check, and its `reportedBy` names that server; `confirmedVia` names the descendant whose confirmation confirms the row when its own block isn't known, and `height` is then its own reported one or null, never the descendant's; `sendState`, `broadcast` (`seen`, `requested` or `unknown`) and `via` come from the wallet's own send record, null without one |
@@ -485,6 +494,8 @@ REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --fe
   --test node -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
   cargo test --release --no-default-features --features test-hooks --test esplora -- --ignored --nocapture
+REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
+  --test progress -- --ignored --nocapture
 ESPLORA=$(nix build .#esplora-electrs --no-link --print-out-paths)/bin/electrs REGTEST_ELECTRUM=127.0.0.1:60601 \
   cargo test --release --no-default-features --features test-hooks --test restore -- --ignored --nocapture
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
@@ -547,6 +558,13 @@ gap. With Kyoto instead, Kyoto holds the chain over the gap and hands it back. W
 back, the three matched blocks come from them (`getblockfrompeer`), and only 6 blocks are read
 for 406 filters. Then a reorg under a payment followed through the node, and a new birthday that
 reads the filters again.
+
+`progress` mines 8,000 blocks and has a proxy in front of electrs take 1.5 s over each answer of
+more than one header, as 320 kB do over a slow link. A new wallet's first sync shows
+`authority.headers` at 2,016, 4,032, 6,048 and 8,064 of the tip, in status and in
+`walletStateChanged`, with the height moving along, `asked` true and the server counted from its
+first answer; at the tip `headers` is null. A reopen with the chain stored, and three new blocks,
+show no download.
 
 `restore` builds a history first, as a live network has one, then restores it: a Core wallet
 that imported the test phrase's BIP84 keys (range 0 to 200) pays receive indices 0 to 150, ten
