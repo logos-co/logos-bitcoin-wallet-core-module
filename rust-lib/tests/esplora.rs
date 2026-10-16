@@ -178,7 +178,7 @@ fn esplora_history_broadcast_and_fees() {
     e.wait("Esplora's estimate", 60, || e.engine.fee_rates_json()["ok"] == true);
     let fees = e.engine.fee_rates_json();
     assert_eq!((fees["fast"].as_f64(), fees["normal"].as_f64(), fees["slow"].as_f64()), (Some(12.4), Some(6.0), Some(2.1)), "{fees}");
-    assert_eq!((fees["sources"].clone(), fees["estimated"].clone()), (json!(["esplora-0"]), json!(true)), "{fees}");
+    assert_eq!((fees["sources"].clone(), fees["estimated"].clone(), fees["basis"].clone()), (json!(["esplora-0"]), json!(true), json!("estimate")), "{fees}");
     e.wait("the history through the front", 60, || e.engine.history(0)["total"] == total);
     let theirs = t.wallet_rpc("getnewaddress", json!(["payee"])).as_str().unwrap().to_string();
     let p = e.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "100000"}]}));

@@ -48,8 +48,9 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, rows: [{ txid, intent: send|self|combine|fee_bump|receive, amountSat, feeSat,
     /// counterparties, height, confirmations, time, state, reportedBy, beyondGap }] }`, newest first.
     fn history(&self, page: i64) -> String;
-    /// `{ ok, fast, normal, slow, minimum, sources, estimated }` in sat/vB, once every level has an
-    /// estimate; until then `{ ok: false, error: "no fee estimate yet" }`.
+    /// `{ ok, fast, normal, slow, minimum, sources, estimated, basis }` in sat/vB, once every level
+    /// has an estimate; until then `{ ok: false, error: "no fee estimate yet" }`. `basis` is
+    /// `mempool` when the sources read the levels off their mempools, else `estimate`.
     fn fee_rates(&self) -> String;
     /// An address or BIP21 URI on a network: `{ ok, valid, address, type, amountSat? }`.
     fn address_valid(&self, text: String, network: String) -> String;

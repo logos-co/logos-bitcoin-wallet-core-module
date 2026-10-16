@@ -1962,13 +1962,16 @@ impl Loop {
                     let e = c.inner.inner.batch_estimate_fee(fees::TARGETS.iter().map(|t| *t as usize)).map_err(|e| e.to_string())?;
                     let min = c.inner.inner.relay_fee().ok().or_else(|| c.inner.inner.mempool_get_info().ok().map(|m| m.minrelaytxfee)).and_then(fees::from_btc_per_kb);
                     let at = |i: usize| e.get(i).copied().and_then(fees::from_btc_per_kb);
-                    Ok(SourceEstimate { source: s.id.clone(), rates: [at(0), at(1), at(2)], minimum: min })
+                    let rates = [at(0), at(1), at(2)];
+                    // Where estimatefee says -1, the server's mempool can still say what a block takes.
+                    let histogram = if rates.contains(&None) { c.inner.inner.raw_call("mempool.get_fee_histogram", vec![]).ok() } else { None };
+                    Ok(fees::from_electrum(&s.id, rates, histogram.as_ref(), min))
                 })(),
                 Kind::Esplora => (|| {
                     let c = self.esplora(&s)?.clone();
                     let m = net::block_on_until(&self.ctx.rt, &self.ctx.stop, c.get_fee_estimates())?.map_err(|e| e.to_string())?;
                     let at = |t: u16| m.get(&t).copied();
-                    Ok(SourceEstimate { source: s.id.clone(), rates: [at(fees::TARGETS[0]), at(fees::TARGETS[1]), at(fees::TARGETS[2])], minimum: None })
+                    Ok(SourceEstimate { source: s.id.clone(), rates: [at(fees::TARGETS[0]), at(fees::TARGETS[1]), at(fees::TARGETS[2])], minimum: None, basis: fees::Basis::Estimate })
                 })(),
             };
             match r {
@@ -1989,7 +1992,7 @@ impl Loop {
             }
         }
         if let Some(m) = kyoto.and_then(|r| kyoto::min_fee_rate(&self.ctx.rt, &r)) {
-            estimates.push(SourceEstimate { source: KYOTO.into(), rates: [None; 3], minimum: Some(m) });
+            estimates.push(SourceEstimate { source: KYOTO.into(), rates: [None; 3], minimum: Some(m), basis: fees::Basis::Estimate });
         }
         // A round without an estimate keeps the last one: a source failing for a while is no
         // reason to fall back to the floor.

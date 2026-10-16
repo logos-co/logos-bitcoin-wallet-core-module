@@ -785,7 +785,7 @@ impl Engine {
         self.with_open(|w| Ok(w.progress.lock().fees.clone()))
             .ok()
             .flatten()
-            .unwrap_or(crate::fees::FeeRates { fast: 1.0, normal: 1.0, slow: 1.0, minimum: 1.0, sources: vec![], estimated: false })
+            .unwrap_or(crate::fees::FeeRates { fast: 1.0, normal: 1.0, slow: 1.0, minimum: 1.0, sources: vec![], estimated: false, basis: crate::fees::Basis::Estimate })
     }
 
     fn wake(&self) {
