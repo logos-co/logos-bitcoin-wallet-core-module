@@ -17,6 +17,8 @@ use crate::network::BNetwork;
 pub const HEADERS_PER_CALL: u32 = 2016;
 /// Calls per source per refresh; a first sync continues on the next refresh.
 const MAX_CALLS_PER_REFRESH: u32 = 25;
+/// Headers a fork search asks for first, below the lower tip: most forks are a block or two deep.
+const FORK_WINDOW: u32 = 16;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -320,12 +322,13 @@ impl ChainAuthority {
         }
     }
 
-    /// The highest height where `src` and the chain agree, searching down from `from`.
+    /// The highest height where `src` and the chain agree, searching down from `from`: a few
+    /// headers first, then whole answers.
     fn fork_point(&self, src: &dyn HeaderSource, from: u32) -> Result<Option<u32>, String> {
         let base = self.chain.base();
-        let mut top = from.min(self.chain.tip_height());
+        let (mut top, mut span) = (from.min(self.chain.tip_height()), FORK_WINDOW);
         loop {
-            let start = top.saturating_sub(HEADERS_PER_CALL - 1).max(base);
+            let start = top.saturating_sub(span - 1).max(base);
             let theirs = src.headers(start, top - start + 1)?;
             for (i, h) in theirs.iter().enumerate().rev() {
                 let height = start + i as u32;
@@ -336,8 +339,22 @@ impl ChainAuthority {
             if start == base {
                 return Ok(None);
             }
-            top = start - 1;
+            (top, span) = (start - 1, HEADERS_PER_CALL);
         }
+    }
+
+    /// The fork and the branch's first headers, where no search is needed: the tip's parent is on
+    /// the chain (a new block, or one beside ours), or the answer from above our tip names it.
+    fn quick_fork(&self, src: &dyn HeaderSource, their_tip: u32, their_header: &Header) -> Result<Option<(u32, Vec<Header>)>, String> {
+        if their_tip.checked_sub(1).and_then(|h| self.chain.hash_at(h)) == Some(their_header.prev_blockhash) {
+            return Ok(Some((their_tip - 1, vec![*their_header])));
+        }
+        let ours = self.chain.tip_height();
+        if their_tip <= ours + 1 {
+            return Ok(None);
+        }
+        let got = src.headers(ours + 1, (their_tip - ours).min(HEADERS_PER_CALL))?;
+        Ok(got.first().is_some_and(|h| h.prev_blockhash == self.chain.tip_hash()).then_some((ours, got)))
     }
 
     /// Fetches and tries `src`'s chain; returns its tip for the agreement count. Each answer is
@@ -351,7 +368,11 @@ impl ChainAuthority {
         if self.chain.hash_at(their_tip) == Some(tip.1) {
             return Ok(tip);
         }
-        let Some(mut fork) = self.fork_point(src, their_tip)? else {
+        let (found, mut first) = match self.quick_fork(src, their_tip, &their_header)? {
+            Some((at, got)) => (Some(at), Some(got)),
+            None => (self.fork_point(src, their_tip)?, None),
+        };
+        let Some(mut fork) = found else {
             change.suspects.push((src.id().into(), "its chain does not contain the checkpoint".into()));
             return Ok(tip);
         };
@@ -359,7 +380,10 @@ impl ChainAuthority {
         let mut branch: Vec<Header> = vec![];
         let mut calls = 0;
         while start <= their_tip && calls < MAX_CALLS_PER_REFRESH {
-            let got = src.headers(start, (their_tip - start + 1).min(HEADERS_PER_CALL))?;
+            let got = match first.take() {
+                Some(got) => got,
+                None => src.headers(start, (their_tip - start + 1).min(HEADERS_PER_CALL))?,
+            };
             if got.is_empty() {
                 break;
             }
@@ -558,10 +582,11 @@ mod tests {
 
     const NOW: u32 = 2_000_000_000;
 
-    /// A source serving a fixed chain from genesis.
+    /// A source serving a fixed chain from genesis, counting the headers it sends.
     struct Fake {
         id: String,
         chain: Vec<Header>,
+        served: std::cell::Cell<u32>,
     }
 
     impl HeaderSource for Fake {
@@ -572,12 +597,14 @@ mod tests {
             Ok((self.chain.len() as u32 - 1, *self.chain.last().unwrap()))
         }
         fn headers(&self, start: u32, count: u32) -> Result<Vec<Header>, String> {
-            Ok(self.chain.iter().skip(start as usize).take(count as usize).copied().collect())
+            let got: Vec<Header> = self.chain.iter().skip(start as usize).take(count as usize).copied().collect();
+            self.served.set(self.served.get() + got.len() as u32);
+            Ok(got)
         }
     }
 
     fn fake(id: &str, chain: Vec<Header>) -> Fake {
-        Fake { id: id.into(), chain }
+        Fake { id: id.into(), chain, served: Default::default() }
     }
 
     fn genesis() -> Header {
@@ -758,8 +785,8 @@ mod tests {
     fn what_was_taken_before_a_source_failed_stays() {
         let honest = chain_of(5_000, 23);
         let mut a = ChainAuthority::new(BNetwork::Regtest);
-        // The fork search is the first call, two chunks the next: the fourth call fails.
-        let c = a.refresh(&[&Failing { chain: honest.clone(), calls: Default::default(), fail_from: 4 }], NOW);
+        // Two chunks, then the third call fails.
+        let c = a.refresh(&[&Failing { chain: honest.clone(), calls: Default::default(), fail_from: 3 }], NOW);
         assert_eq!((a.tip_height(), c.changed_from, c.failures.len()), (Some(4_032), Some(1), 1));
         assert_eq!(a.hash_at(4_032), Some(honest[4_032].block_hash()));
         let s = a.summary(u64::from(NOW));
@@ -777,6 +804,45 @@ mod tests {
         let c = a.refresh(&[&fake("theirs", theirs.clone())], NOW);
         assert_eq!((c.reorg_depth, c.changed_from, a.tip_height()), (2_900, Some(101), Some(3_200)));
         assert_eq!(a.hash_at(3_200), Some(theirs[3_200].block_hash()));
+    }
+
+    #[test]
+    fn new_blocks_cost_their_own_headers_and_a_shallow_fork_a_few() {
+        let mut honest = chain_of(3_000, 26);
+        let mut a = ChainAuthority::new(BNetwork::Regtest);
+        let first = fake("s", honest.clone());
+        a.refresh(&[&first], NOW);
+        assert_eq!(first.served.get(), 3_000, "a first sync reads each header once");
+        // One new block comes with the tip, its parent ours; three are read from just above ours.
+        for (n, cost) in [(1, 0), (1, 0), (3, 3)] {
+            let last = *honest.last().unwrap();
+            honest.extend(regtest_branch(&last, n, last.time, 26));
+            let s = fake("s", honest.clone());
+            let c = a.refresh(&[&s], NOW);
+            assert_eq!((c.changed_from, c.reorg_depth, c.agreeing.len(), s.served.get()), (Some(honest.len() as u32 - n as u32), 0, 1, cost));
+        }
+        // The tip replaced by two blocks: their parent isn't ours, and a window finds the fork.
+        let at = honest.len() - 1;
+        let mut fork = honest[..at].to_vec();
+        fork.extend(regtest_branch(&honest[at - 1], 2, honest[at - 1].time + 1, 27));
+        let s = fake("s", fork.clone());
+        let c = a.refresh(&[&s], NOW);
+        assert_eq!((c.reorg_depth, c.changed_from, a.hash_at(at as u32 + 1)), (1, Some(at as u32), Some(fork[at + 1].block_hash())));
+        assert_eq!(s.served.get(), FORK_WINDOW + 2);
+        // A server left on the replaced block: its tip's parent is ours, so nothing is read, and
+        // it isn't blamed.
+        let behind = fake("behind", honest.clone());
+        let c = a.refresh(&[&behind], NOW);
+        assert!(c.suspects.is_empty() && !c.tip_moved && c.agreeing.is_empty(), "{c:?}");
+        assert_eq!(behind.served.get(), 0);
+        // One deeper than the window: the search reads on, whole answers below it.
+        let deep = honest.len() - 20;
+        let mut longer = honest[..deep].to_vec();
+        longer.extend(regtest_branch(&honest[deep - 1], 30, honest[deep - 1].time + 1, 28));
+        let s = fake("s", longer.clone());
+        let c = a.refresh(&[&s], NOW);
+        assert_eq!((c.reorg_depth, c.changed_from), (fork.len() as u32 - deep as u32, Some(deep as u32)));
+        assert_eq!(a.hash_at(longer.len() as u32 - 1), Some(longer.last().unwrap().block_hash()));
     }
 
     #[test]

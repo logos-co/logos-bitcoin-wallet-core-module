@@ -104,8 +104,8 @@ fn wallets_share_the_networks_headers() {
         c.execute("UPDATE headers SET header = ?1 WHERE height = 5000", [bitcoin::consensus::encode::serialize(&h)]).unwrap();
     }
     let (_, again, _) = sync(json!({"network": "regtest", "group": "shell-73c5da0a-84-1-0"}), "a wallet on a damaged store");
-    // From 5,000 up, and the server's last 2,016 to find where its chain meets the wallet's.
-    assert!(again > u64::from(tip - 5_000) && again < u64::from(tip), "{again}");
+    // From 5,000 up: the first of them names the wallet's tip, 4,999, so nothing more is read.
+    assert_eq!(again, u64::from(tip - 4_999));
     assert_eq!(stored(), Some((tip, real())), "rebuilt");
 
     // A store that isn't a database: started again, and filled again.
