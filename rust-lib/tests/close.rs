@@ -84,12 +84,12 @@ fn closing_stops_a_slow_header_download_within_seconds() {
     t.synced();
     assert_eq!(t.engine.status()["authority"]["height"].as_u64(), Some(tip));
 
-    // Again on the open wallet: new blocks have the next round search for the fork with a long
-    // call, which the server holds. Each close ends the sync; each reopen runs one.
+    // Again on the open wallet: three new blocks have the next round read them from above the
+    // wallet's tip, a call the server holds. Each close ends the sync; each reopen runs one.
     for round in 0..3 {
         *slow.hold.lock().unwrap() = Some((0, Duration::from_secs(60)));
         let before = slow.held.load(Ordering::SeqCst);
-        t.rpc("generatetoaddress", json!([2, ELSEWHERE]));
+        t.rpc("generatetoaddress", json!([3, ELSEWHERE]));
         t.wait("a call held", 60, || slow.held.load(Ordering::SeqCst) > before);
         let t0 = Instant::now();
         t.job("close_wallet", json!({}));

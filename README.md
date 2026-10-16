@@ -103,6 +103,13 @@ highest tip announced by a server on the chain, kept between refreshes until the
 it. The node's headers show the same way, its tip the target; Kyoto's, while it syncs headers
 before its scan, as its own best header with `target` null: its peers' tips aren't known.
 
+A refresh asks each server for its tip, whose header comes with the answer. A tip whose parent is
+on the chain (one new block, or a server left on a replaced one) is tried as it is, and nothing
+more is read; a tip further ahead is read from just above the chain's tip, and an answer whose
+first header names the chain's tip as its parent starts the branch. Only a server whose headers
+don't link searches for where its chain parts from the wallet's: the 16 headers below the lower
+tip first, then 2,016 a call down to the checkpoint.
+
 ### The local node
 
 `bitcoind_module` runs Bitcoin Core in-process. The core calls its `rpc(method, paramsJson)` over
@@ -625,7 +632,9 @@ more than one header, as 320 kB do over a slow link. A new wallet's first sync s
 `authority.headers` at 2,016, 4,032, 6,048 and 8,064 of the tip, in status and in
 `walletStateChanged`, with the height moving along, `asked` true and the server counted from its
 first answer; at the tip `headers` is null. A reopen with the chain stored, and three new blocks,
-show no download.
+show no download. Counted at the proxy, a new block costs no `blockchain.block.headers` call (its
+header comes with the tip), three at once read 3, and a reorg of the tip 18: 16 to find the fork
+and the 2 blocks that replace it.
 
 `restore` builds a history first, as a live network has one, then restores it: a Core wallet
 that imported the test phrase's BIP84 keys (range 0 to 200) pays receive indices 0 to 150, ten
@@ -662,8 +671,8 @@ before, the made-up one confirms at once.
 `shared_headers` mines 8,000 blocks and counts the headers electrs sends through a proxy. The
 first wallet on the network reads all 8,102; a second wallet, and the first reopened under a new
 database key (`reset`), read none, the server vouching for the store's with one header. With a
-stored header at 5,000 that no longer links, the next wallet reads from 5,000 up (5,118, the
-server's last 2,016 included to find where the chains meet) and the store is whole again; a store
+stored header at 5,000 that no longer links, the next wallet reads from 5,000 up and no more, the
+first naming the wallet's tip, 4,999, as its parent, and the store is whole again; a store
 file of random bytes starts again; and a store holding another chain 500 blocks longer, valid on
 regtest's work, is disowned by the server at height 1 and replaced by the server's chain, with no
 blame on the server.
