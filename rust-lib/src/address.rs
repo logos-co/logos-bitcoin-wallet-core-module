@@ -88,12 +88,17 @@ fn kind(a: &Address) -> &'static str {
     }
 }
 
-/// `{ ok, valid, address, type, amountSat?, label?, message? }` or `{ ok, valid: false, reason }`.
+/// The least an output to this address may hold: Bitcoin Core's dust limit, at its default 3 sat/vB.
+pub fn dust_limit(a: &Address) -> Amount {
+    a.script_pubkey().minimal_non_dust()
+}
+
+/// `{ ok, valid, address, type, dustSat, amountSat?, label?, message? }` or `{ ok, valid: false, reason }`.
 pub fn validate(text: &str, net: BNetwork) -> Value {
     match parse(text, net) {
         Ok(p) => json!({
             "ok": true, "valid": true, "address": p.address.to_string(), "type": kind(&p.address),
-            "network": net.name(),
+            "network": net.name(), "dustSat": dust_limit(&p.address).to_sat().to_string(),
             "amountSat": p.amount.map(|a| a.to_sat().to_string()),
             "label": p.label, "message": p.message,
         }),
@@ -123,6 +128,22 @@ mod tests {
         assert_eq!(validate("hello", BNetwork::Mainnet)["reason"], "not a Bitcoin address");
         let tr = "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297";
         assert_eq!(validate(tr, BNetwork::Mainnet)["type"], "p2tr");
+    }
+
+    #[test]
+    fn dust_limits_by_address_type() {
+        for (a, ty, sat) in [
+            (MAIN, "p2wpkh", "294"),
+            ("bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297", "p2tr", "330"),
+            ("bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3", "p2wsh", "330"),
+            ("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", "p2sh", "540"),
+            ("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", "p2pkh", "546"),
+        ] {
+            let v = validate(a, BNetwork::Mainnet);
+            assert_eq!((v["type"].as_str(), v["dustSat"].as_str()), (Some(ty), Some(sat)), "{v}");
+        }
+        assert_eq!(validate(TB, BNetwork::Testnet4)["dustSat"], "294", "the same on every network");
+        assert!(validate("hello", BNetwork::Mainnet)["dustSat"].is_null());
     }
 
     #[test]

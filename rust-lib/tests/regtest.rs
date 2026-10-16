@@ -140,6 +140,17 @@ fn bitcoin_wallet_on_regtest() {
     assert_eq!(t.job("rebroadcast", json!({"txid": txid}))["broadcast"], "seen");
     println!("segwit send {txid}: fee {fee} sat, vsize {}", preview["vsize"]);
 
+    // Below an address's dust limit a send is refused in words, with code dust, before BDK builds it.
+    let legacy = t.wallet_rpc("getnewaddress", json!(["payee", "legacy"])).as_str().unwrap().to_string();
+    for (to, ty, limit) in [(&theirs, "p2wpkh", 294u64), (&legacy, "p2pkh", 546)] {
+        let v = Engine::address_valid(to, "regtest");
+        assert_eq!((v["type"].as_str(), v["dustSat"].as_str()), (Some(ty), Some(limit.to_string().as_str())), "{v}");
+        let (code, e) = t.job_fail("build_send", json!({"recipients": [{"address": to, "amountSat": (limit - 1).to_string()}], "feeRate": 2.0}));
+        assert_eq!((code.as_str(), e), ("dust", format!("The smallest amount this address can receive is {limit} sats.")));
+        let p = t.job("build_send", json!({"recipients": [{"address": to, "amountSat": limit.to_string()}], "feeRate": 2.0}));
+        t.job("cancel_send", json!({"previewId": p["previewId"]}));
+    }
+
     // A declined approval fails the job with the reason; the preview and its locks stay until cancelled.
     let balance_before = t.sats("confirmed");
     for reason in ["rejected", "expired_no_ack"] {
@@ -334,6 +345,16 @@ fn bitcoin_wallet_on_regtest() {
     t.synced();
     t.wait("the send without change confirmed", 60, || t.row(&no_change)["state"] == "confirmed");
     assert_eq!(t.sats("confirmed"), 0);
+
+    // Send max of a coin the fee leaves below the recipient's dust limit: 350 sat less about 99.
+    let dusty = t.engine.next_address()["address"].as_str().unwrap().to_string();
+    t.fund(&dusty, 0.0000035);
+    t.mine(1);
+    t.synced();
+    t.wait("the small coin confirmed", 60, || t.sats("confirmed") == 350);
+    let (code, e) = t.job_fail("build_send", json!({"recipients": [{"address": theirs}], "sendMax": true, "feeRate": 1.0}));
+    assert!(code == "dust" && e.starts_with("After the fee, ") && e.ends_with("The smallest amount this address can receive is 294 sats."), "{code}: {e}");
+    println!("send max of 350 sat at 1 sat/vB: {code}: {e}");
 
     // Reopen by group: the key and descriptors come from the manager again, the history from disk.
     let group = t.engine.status()["group"].as_str().unwrap().to_string();

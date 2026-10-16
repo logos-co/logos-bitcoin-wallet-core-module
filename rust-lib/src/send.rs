@@ -4,6 +4,7 @@
 use std::str::FromStr;
 
 use bdk_wallet::bitcoin::psbt::Psbt;
+use bdk_wallet::error::CreateTxError;
 use bdk_wallet::{KeychainKind, SignOptions};
 use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
@@ -90,7 +91,42 @@ pub fn parse_input(v: &Value, net: BNetwork) -> Result<SendInput, String> {
     if fee_rate.is_some() && target.is_some() {
         return Err("give feeRate or target, not both".into());
     }
+    // Refused here, before BDK, which would name only the output's index.
+    if !send_max {
+        for r in &recipients {
+            let limit = crate::address::dust_limit(&r.address);
+            if r.amount.is_some_and(|a| a < limit) {
+                return Err(dust_refusal((recipients.len() > 1).then_some(&r.address), limit));
+            }
+        }
+    }
     Ok(SendInput { recipients, fee_rate, target, send_max, small_change_to_fee })
+}
+
+/// An amount below an address's dust limit, said plainly; `address` names it among several.
+fn dust_refusal(address: Option<&Address>, limit: Amount) -> String {
+    let who = address.map_or("this address".to_string(), |a| a.to_string());
+    format!("The smallest amount {who} can receive is {} sats.", limit.to_sat())
+}
+
+/// BDK's refusals in words a person can act on; the rest as BDK says them.
+fn build_error(e: CreateTxError, input: &SendInput) -> String {
+    match &e {
+        CreateTxError::OutputBelowDustLimit(i) => {
+            if let Some(r) = input.recipients.get(*i) {
+                return dust_refusal(Some(&r.address), crate::address::dust_limit(&r.address));
+            }
+        }
+        // Send max: what the fee leaves is below the recipient's dust limit.
+        CreateTxError::CoinSelection(f) if input.send_max => {
+            let limit = crate::address::dust_limit(&input.recipients[0].address);
+            if f.needed == limit && f.available > Amount::ZERO {
+                return format!("After the fee, {} sats would be left. {}", f.available.to_sat(), dust_refusal(None, limit));
+            }
+        }
+        _ => {}
+    }
+    format!("cannot build the send: {e}")
 }
 
 /// sat/vB for a send: the rate asked, or the target's, never below the minimum relay fee.
@@ -209,7 +245,7 @@ pub fn build(cell: &mut Cell, input: &SendInput, rate: f64) -> Result<(Psbt, u64
             b.add_recipient(r.address.script_pubkey(), r.amount.expect("checked"));
         }
     }
-    let mut psbt = b.finish().map_err(|e| format!("cannot build the send: {e}"))?;
+    let mut psbt = b.finish().map_err(|e| build_error(e, input))?;
     let to_fee = if input.small_change_to_fee { change_to_fee(cell, &mut psbt, rate) } else { 0 };
     Ok((psbt, to_fee))
 }
@@ -392,13 +428,32 @@ mod tests {
         assert!(parse_input(&max, BNetwork::Signet).unwrap().send_max);
         let two = json!({"recipients": [{"address": a}, {"address": a}], "sendMax": true});
         assert!(parse_input(&two, BNetwork::Signet).is_err());
-        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1}], "password": "x"}), BNetwork::Signet).is_err());
-        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1}], "feeRate": 2, "target": "fast"}), BNetwork::Signet).is_err());
-        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1}]}), BNetwork::Mainnet).is_err(), "another network's address");
-        let small = json!({"recipients": [{"address": a, "amountSat": 1}], "smallChangeToFee": true});
+        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1000}], "password": "x"}), BNetwork::Signet).is_err());
+        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1000}], "feeRate": 2, "target": "fast"}), BNetwork::Signet).is_err());
+        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1000}]}), BNetwork::Mainnet).is_err(), "another network's address");
+        let small = json!({"recipients": [{"address": a, "amountSat": 1000}], "smallChangeToFee": true});
         assert!(parse_input(&small, BNetwork::Signet).unwrap().small_change_to_fee);
         assert!(!parse_input(&v, BNetwork::Signet).unwrap().small_change_to_fee, "off unless asked");
-        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1}], "smallChangeToFee": "yes"}), BNetwork::Signet).is_err());
+        assert!(parse_input(&json!({"recipients": [{"address": a, "amountSat": 1000}], "smallChangeToFee": "yes"}), BNetwork::Signet).is_err());
+    }
+
+    #[test]
+    fn amounts_below_the_dust_limit_are_refused_up_front() {
+        let a = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        let one = |sat: u64| parse_input(&json!({"recipients": [{"address": a, "amountSat": sat.to_string()}], "feeRate": 2}), BNetwork::Testnet4);
+        let e = one(5).unwrap_err();
+        assert_eq!(e, "The smallest amount this address can receive is 294 sats.");
+        assert_eq!(crate::jobs::code_of(&e), "dust");
+        assert!(one(293).is_err());
+        assert!(one(294).is_ok(), "the limit itself is enough");
+        let uri = json!({"recipients": [{"address": format!("bitcoin:{a}?amount=0.00000100")}], "feeRate": 2});
+        assert_eq!(parse_input(&uri, BNetwork::Testnet4).unwrap_err(), e, "a payment request's amount too");
+        // Among several recipients the refusal names the address.
+        let tr = "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c";
+        let two = json!({"recipients": [{"address": a, "amountSat": "1000"}, {"address": tr, "amountSat": "300"}], "feeRate": 2});
+        assert_eq!(parse_input(&two, BNetwork::Testnet4).unwrap_err(), format!("The smallest amount {tr} can receive is 330 sats."));
+        let max = json!({"recipients": [{"address": a, "amountSat": "5"}], "sendMax": true});
+        assert!(parse_input(&max, BNetwork::Testnet4).is_ok(), "send max has no amount of its own");
     }
 
     #[test]
@@ -500,6 +555,39 @@ mod tests {
         let big = SendInput { recipients: vec![Recipient { address: to, amount: Some(Amount::from_sat(50_000)) }], small_change_to_fee: true, ..send };
         let (k, m) = build(&mut cell, &big, rate).unwrap();
         assert_eq!((m, k.unsigned_tx.output.len()), (0, 2));
+    }
+
+    #[test]
+    fn bdk_dust_refusals_read_plainly() {
+        let (_dir, mut cell) = funded(400);
+        let to = crate::address::parse("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", BNetwork::Regtest).unwrap().address;
+        // Past parse_input's check, BDK's own: it names only the output's index.
+        let tiny = SendInput { recipients: vec![Recipient { address: to.clone(), amount: Some(Amount::from_sat(100)) }], fee_rate: Some(1.0), target: None, send_max: false, small_change_to_fee: false };
+        let e = build(&mut cell, &tiny, 1.0).unwrap_err();
+        assert_eq!(e, format!("The smallest amount {to} can receive is 294 sats."));
+        assert_eq!(crate::jobs::code_of(&e), "dust");
+        // Send max where the fee leaves less than the limit: BDK calls it insufficient funds.
+        let max = SendInput { recipients: vec![Recipient { address: to.clone(), amount: None }], send_max: true, ..tiny };
+        let e = build(&mut cell, &max, 1.0).unwrap_err();
+        assert!(e.starts_with("After the fee, ") && e.ends_with(" sats would be left. The smallest amount this address can receive is 294 sats."), "{e}");
+        assert_eq!(crate::jobs::code_of(&e), "dust");
+        assert!(build(&mut cell, &max, 0.1).is_ok(), "at a lower rate more is left");
+        // Nothing left after the fee is not enough money, not dust.
+        let e = build(&mut cell, &max, 4.0).unwrap_err();
+        assert_eq!(crate::jobs::code_of(&e), "insufficient_funds", "{e}");
+    }
+
+    #[test]
+    fn change_below_the_dust_limit_goes_to_the_fee() {
+        let (_dir, mut cell) = funded(100_000);
+        let to = crate::address::parse("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", BNetwork::Regtest).unwrap().address;
+        // About 200 sat of change at 1 sat/vB: BDK leaves it out rather than refuse the send.
+        let send = SendInput { recipients: vec![Recipient { address: to, amount: Some(Amount::from_sat(100_000 - 141 - 200)) }], fee_rate: Some(1.0), target: None, send_max: false, small_change_to_fee: false };
+        let (psbt, moved) = build(&mut cell, &send, 1.0).unwrap();
+        assert_eq!((psbt.unsigned_tx.output.len(), moved), (1, 0));
+        assert_eq!(psbt.fee().unwrap().to_sat(), 341);
+        let p = preview_json(&cell, "p1", "send", &psbt, 1.0, None, 0).unwrap();
+        assert_eq!(p["warnings"], json!([]), "{p}");
     }
 
     #[test]
