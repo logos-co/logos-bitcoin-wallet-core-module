@@ -99,7 +99,13 @@ pub fn random_height(birthday: u32, tip: u32, avoid: &dyn Fn(u32) -> bool) -> Op
         return None;
     }
     let mut rng = rand::thread_rng();
-    (0..16).map(|_| rng.gen_range(birthday..=tip)).find(|h| !avoid(*h))
+    if let Some(h) = (0..16).map(|_| rng.gen_range(birthday..=tip)).find(|h| !avoid(*h)) {
+        return Some(h);
+    }
+    // Nearly all the wallet's own: walk on from a random height, so one that isn't is still found.
+    let span = u64::from(tip - birthday) + 1;
+    let start = rng.gen_range(0..span);
+    (0..span).map(|i| birthday + ((start + i) % span) as u32).find(|h| !avoid(*h))
 }
 
 /// The next scheduled check: the interval, plus or minus a fifth.
@@ -206,6 +212,11 @@ mod tests {
             assert!(h % 2 == 1 && (10..=20).contains(&h));
         }
         assert_eq!(random_height(20, 20, &|_| false), None);
+        // One height left that isn't the wallet's: always found, never a lost draw.
+        for _ in 0..50 {
+            assert_eq!(random_height(10, 20, &|h| h != 17), Some(17));
+        }
+        assert_eq!(random_height(10, 20, &|_| true), None);
         let d = next_delay_secs();
         assert!((480..=720).contains(&d));
     }
