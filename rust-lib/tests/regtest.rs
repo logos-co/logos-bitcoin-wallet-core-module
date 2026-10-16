@@ -24,6 +24,8 @@ struct Doctor {
     tx: Option<String>,
     /// Hold each tip answer this long, as a far server would.
     slow_tip: Option<Duration>,
+    /// Refuse `mempool.get_fee_histogram`, as a server without one would.
+    no_histogram: bool,
     hits: Vec<String>,
 }
 
@@ -50,9 +52,21 @@ fn doctor_line(doctor: &Mutex<Doctor>, method: &str, params: &Value, mut reply: 
                 d.hits.push(format!("tx {}", params[0]));
             }
         }
+        "mempool.get_fee_histogram" if d.no_histogram => {
+            reply = json!({"jsonrpc": "2.0", "id": reply["id"], "error": {"code": -32601, "message": "unknown method"}});
+        }
         _ => {}
     }
     reply
+}
+
+/// What electrs itself answers for `mempool.get_fee_histogram`.
+fn histogram(server: SocketAddr) -> Value {
+    let mut s = std::net::TcpStream::connect(server).unwrap();
+    std::io::Write::write_all(&mut s, b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"mempool.get_fee_histogram\",\"params\":[]}\n").unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).unwrap();
+    serde_json::from_str::<Value>(&line).unwrap()["result"].clone()
 }
 
 #[test]
@@ -64,11 +78,15 @@ fn bitcoin_wallet_on_regtest() {
         return;
     };
     let servers: Vec<SocketAddr> = std::env::var("REGTEST_ELECTRUM").expect("REGTEST_ELECTRUM").split(',').map(|s| s.trim().trim_start_matches("tcp://").parse().unwrap()).collect();
-    let doctor: Arc<Mutex<Doctor>> = Arc::default();
+    let doctor = Arc::new(Mutex::new(Doctor { no_histogram: true, ..Default::default() }));
     let d = doctor.clone();
     let via_proxy = electrum_proxy(servers[0], Arc::new(move |m, p, v| Some(doctor_line(&d, m, p, v))));
+    // The honest electrs only withholds its fee histogram too, until the fee rates' turn.
+    let honest = Arc::new(Mutex::new(Doctor { no_histogram: true, ..Default::default() }));
+    let h = honest.clone();
+    let via_honest = electrum_proxy(servers[1], Arc::new(move |m, p, v| Some(doctor_line(&h, m, p, v))));
     // The proxy is first: it holds the history until it lies, then the honest electrs takes over.
-    configure_regtest(RegtestConfig { electrum: vec![format!("tcp://{via_proxy}"), format!("tcp://{}", servers[1])], poll_secs: Some(1), ..Default::default() });
+    configure_regtest(RegtestConfig { electrum: vec![format!("tcp://{via_proxy}"), format!("tcp://{via_honest}")], poll_secs: Some(1), ..Default::default() });
     let (sink, events) = collecting();
     let manager = Arc::new(MockManager::new(Duration::from_millis(1500)));
     let root = tempfile::tempdir().unwrap();
@@ -101,8 +119,8 @@ fn bitcoin_wallet_on_regtest() {
     t.wait("the payment confirmed", 60, || t.sats("confirmed") == 100_000_000);
     assert_eq!(t.row(&funded.to_string())["intent"], "receive");
 
-    // electrs answers -1 for every target on regtest: the floor is never passed off as an estimate,
-    // and a send must name its rate.
+    // electrs answers -1 for every target on regtest, and neither server gives a fee histogram: the
+    // floor is never passed off as an estimate, and a send must name its rate.
     assert_eq!(t.engine.fee_rates_json(), json!({"ok": false, "error": "no fee estimate yet"}));
     let e = t.job_err("build_send", json!({"recipients": [{"address": addr, "amountSat": "100000"}]}));
     assert!(e.contains("no fee estimate yet"), "{e}");
@@ -395,6 +413,55 @@ fn bitcoin_wallet_on_regtest() {
     };
     assert_eq!((refused["index"].clone(), refused["unused"].as_u64(), refused["gapLimit"].as_u64()), (shown["index"].clone(), Some(gap), Some(gap)), "{refused}");
     println!("an open shows #{} and reveals nothing; New address stops after {} at a gap of {gap}", shown["index"], asked - 1);
+
+    // Fee rates from the servers' mempools, as from a testnet4 server whose node has no estimate:
+    // each level is read off the histogram, never below the relay fee. A few payments at 1 to
+    // 12 sat/vB fit in the next block, so every level is the floor, an estimate all the same.
+    t.fund(shown["address"].as_str().unwrap(), 0.01);
+    t.mine(1);
+    t.synced();
+    t.wait("a coin to send from", 60, || t.sats("confirmed") >= 1_000_000);
+    for d in [&doctor, &honest] {
+        d.lock().unwrap().no_histogram = false;
+    }
+    for rate in [1.0, 3.0, 12.0] {
+        t.wallet_rpc("send", json!([{theirs.clone(): 0.001}, null, "unset", rate]));
+    }
+    let reopen_for_fees = || {
+        let vsize = t.rpc("getmempoolinfo", json!([]))["bytes"].as_u64().unwrap();
+        let held = |s: SocketAddr| histogram(s).as_array().unwrap().iter().map(|b| b[1].as_u64().unwrap()).sum::<u64>();
+        t.wait("electrs's view of the mempool", 60, || servers.iter().all(|s| held(*s) == vsize));
+        t.job("close_wallet", json!({}));
+        t.job("open_wallet", json!({"network": "regtest", "group": group}));
+        t.wait("the fee estimate", 60, || t.engine.fee_rates_json()["ok"] == true);
+        (vsize, histogram(servers[0]), t.engine.fee_rates_json())
+    };
+    let (vsize, hist, fees) = reopen_for_fees();
+    let sources = json!(["electrum-0", "electrum-1"]);
+    assert_eq!(fees, json!({"ok": true, "fast": 1.0, "normal": 1.0, "slow": 1.0, "minimum": 1.0, "sources": sources, "estimated": true, "basis": "mempool"}));
+    println!("fees from {vsize} vB in the mempool, histogram {hist}: {fees}");
+    let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "100000"}]}));
+    assert_eq!(p["feeRate"].as_f64(), Some(1.0), "{p}");
+    t.job("cancel_send", json!({"previewId": p["previewId"]}));
+    // More than a block's worth at 20 sat/vB, as eleven transactions of 95 kvB on coins of their own
+    // (a cluster stops at 101 kvB): fast must outbid them, at 31, the top of electrs's band [16, 32);
+    // normal and slow still fit.
+    let data = "ab".repeat(95_000);
+    for _ in 0..11 {
+        t.wallet_rpc("send", json!([[{"data": data}], null, "unset", 20, {"minconf": 1}]));
+    }
+    let (vsize, hist, fees) = reopen_for_fees();
+    assert!(vsize > 1_000_000, "{vsize}");
+    assert_eq!((fees["fast"].as_f64(), fees["normal"].as_f64(), fees["slow"].as_f64()), (Some(31.0), Some(1.0), Some(1.0)), "{fees}");
+    assert_eq!((fees["sources"].clone(), fees["basis"].clone()), (sources, json!("mempool")), "{fees}");
+    // The preview's rate is the built fee's over the signed vsize, a little above the rate asked.
+    let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "100000"}], "target": "fast"}));
+    assert!(p["feeRate"].as_f64().is_some_and(|r| (31.0..31.5).contains(&r)), "{p}");
+    t.job("cancel_send", json!({"previewId": p["previewId"]}));
+    println!("fees from {vsize} vB in the mempool, histogram {hist}: {fees}");
+    t.mine(2);
+    t.synced();
+    assert_eq!(t.rpc("getmempoolinfo", json!([]))["size"], 0);
 
     let t0 = Instant::now();
     t.engine.shutdown();

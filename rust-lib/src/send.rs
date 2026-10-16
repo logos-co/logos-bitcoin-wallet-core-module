@@ -410,7 +410,7 @@ mod tests {
     use super::*;
 
     fn rates() -> FeeRates {
-        FeeRates { fast: 20.0, normal: 10.0, slow: 2.0, minimum: 1.5, sources: vec![], estimated: true }
+        FeeRates { fast: 20.0, normal: 10.0, slow: 2.0, minimum: 1.5, sources: vec![], estimated: true, basis: fees::Basis::Estimate }
     }
 
     #[test]

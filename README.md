@@ -413,6 +413,13 @@ moves a payment, a birthday is set and its rescan starts and ends), `jobFinished
 detail, at }`); `authority_suspect` is Kyoto naming a chain the checks refuse, with `source: "kyoto"`;
 `unchecked_anchor` names transactions reported below the chain's start that nothing could check.
 
+In `fee_rates`, a level an Electrum server's `estimatefee` leaves at -1, as one whose node has no
+estimate does, comes from its `mempool.get_fee_histogram`, read as Electrum reads it: walking down
+from the highest rate, the rate where the waiting vsize passes 1, 3 or 12 MvB for fast, normal and
+slow (half their 2, 6 and 24 blocks), or the server's `relayfee` when all of it fits. `fee_rates`
+then carries `basis: "mempool"` when every source in `sources` read its levels that way, else
+`"estimate"`. A server with neither gives no estimate.
+
 The core never takes a password, phrase or key; a unit test reads the contract and fails on a
 parameter named like one. Callers other than `bitcoin_wallet_backend` are refused on the
 backend-only paths; for tests, a `callers.json` in the instance's persistence directory can admit
@@ -589,8 +596,9 @@ test phrase's wallet must start empty. `test-hooks` is a feature for fault injec
 `regtest`, with the Electrum header chain as the authority: it opens a native segwit wallet,
 receives, confirms, sends, bumps a send, refuses an anchor whose header a proxy in front of one
 electrs rewrites and a transaction it rewrites, re-anchors a payment across a reorg, then does a
-taproot wallet's receive and send, and reopens by group. electrs estimates no fee on regtest, so
-`fee_rates` answers none and a send without `feeRate` is refused. Reopened behind a proxy that holds
+taproot wallet's receive and send, and reopens by group. electrs estimates no fee on regtest, and
+proxies in front of both withhold its fee histogram, so `fee_rates` answers none and a send without
+`feeRate` is refused. Reopened behind a proxy that holds
 each tip answer 3 s, the status shows the stored chain with `asked` false until the round ends.
 Opens show the first unused address and reveal none, and `next_address` stops at the gap limit
 with `fresh` false. A send 1 sat below the dust limit of a native segwit and of a legacy address
@@ -598,7 +606,10 @@ fails with code `dust`, one at the limit builds, and a send max of a 350-sat tap
 1 sat/vB fails with `dust` too. A lost broadcast: the store after a
 successful broadcast answers busy five times; the job still answers the txid, the `broadcasting`
 record survives a reopen with its coins out of reach, and `rebroadcast` and `bump_fee` both find
-the transaction.
+the transaction. Last, the histograms back, as from a testnet4 server whose node has no estimate:
+three payments at 1 to 12 sat/vB fit in a block, so every level is the floor, with `basis:
+"mempool"`, and a send without a rate takes it; eleven 95 kvB transactions at 20 sat/vB make fast
+31, the top of electrs's band [16, 32), and leave normal and slow at the floor.
 
 `close` mines 5,000 blocks, so the header chain takes three calls of 2,016, and has a proxy in
 front of electrs hold the second call's answer for a minute, as a slow link would. Closing then

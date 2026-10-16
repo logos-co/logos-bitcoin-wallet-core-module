@@ -566,7 +566,7 @@ pub fn fees(c: &NodeClient, id: &str) -> Result<SourceEstimate, String> {
         rates[i] = r["feerate"].as_f64().and_then(fees::from_btc_per_kb);
     }
     let minimum = c.raw("getnetworkinfo", &[]).ok().and_then(|n| n["relayfee"].as_f64()).and_then(fees::from_btc_per_kb);
-    Ok(SourceEstimate { source: id.to_string(), rates, minimum })
+    Ok(SourceEstimate { source: id.to_string(), rates, minimum, basis: fees::Basis::Estimate })
 }
 
 #[cfg(test)]
