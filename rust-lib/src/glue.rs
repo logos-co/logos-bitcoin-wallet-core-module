@@ -51,7 +51,8 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, fast, normal, slow, minimum, sources, estimated }` in sat/vB, once every level has an
     /// estimate; until then `{ ok: false, error: "no fee estimate yet" }`.
     fn fee_rates(&self) -> String;
-    /// An address or BIP21 URI on a network: `{ ok, valid, address, type, amountSat? }`.
+    /// An address or BIP21 URI on a network: `{ ok, valid, address, type, dustSat, amountSat? }`; `dustSat`
+    /// is the least it can receive, below which build_send fails with code `dust`.
     fn address_valid(&self, text: String, network: String) -> String;
     /// `{ ok, proxy, crossCheck, sources: [{ id, roles, state, suspect, lastSync, error, ... }] }`.
     fn sources_status(&self) -> String;

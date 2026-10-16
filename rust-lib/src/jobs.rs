@@ -183,6 +183,8 @@ pub fn code_of(e: &str) -> &'static str {
         "expired"
     } else if l.starts_with("cancelled") {
         "cancelled"
+    } else if l.contains("the smallest amount") && l.contains("can receive") {
+        "dust"
     } else if l.contains("insufficient funds") {
         "insufficient_funds"
     } else if l.contains("no source is enabled for broadcast") || l.contains("no broadcast source") || l.contains("no history server") || l.contains("no tip") {
@@ -246,6 +248,7 @@ mod tests {
         assert_eq!(code_of("expired_no_ack: nobody showed the request in time; ask again"), "expired");
         assert_eq!(code_of("cancelled"), "cancelled");
         assert_eq!(code_of("cannot build the send: Insufficient funds: 1000 sat available of 5000 sat needed"), "insufficient_funds");
+        assert_eq!(code_of("The smallest amount this address can receive is 294 sats."), "dust");
         assert_eq!(code_of("no source is enabled for broadcast"), "no_route");
         assert_eq!(code_of("the wallet is busy; try again"), "busy");
         assert_eq!(code_of("electrum-0 refused the transaction: min relay fee not met"), "refused");
