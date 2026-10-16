@@ -83,27 +83,52 @@ impl SharedHeaders {
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
         let path = dir.join(format!("{}.db", net.name()));
-        Self::open_at(&path, net).or_else(|e| {
+        Self::open_at(&path, net).or_else(|(bad, e)| {
+            // Only a file that is no store of this network's starts again: a busy one is another writer's.
+            if !bad {
+                return Err(e);
+            }
             tracing::warn!(target: "bitcoin", "{e}: {} starts again", path.display());
             remove(&path);
-            Self::open_at(&path, net)
+            Self::open_at(&path, net).map_err(|(_, e)| e)
         })
     }
 
-    fn open_at(path: &Path, net: BNetwork) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(sql)?;
-        conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map_err(sql)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL;").map_err(sql)?;
-        conn.execute_batch(SCHEMA).map_err(sql)?;
-        match (meta(&conn, "network")?, meta(&conn, "format")?) {
+    /// The error says whether the file is no store of this network's (true) or merely unavailable.
+    fn open_at(path: &Path, net: BNetwork) -> Result<Self, (bool, String)> {
+        let bad = |e: rusqlite::Error| {
+            let corrupt = matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt));
+            (corrupt, sql(e))
+        };
+        let mut conn = Connection::open(path).map_err(bad)?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(bad)?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map_err(bad)?;
+        // A journal mode switch can be refused at once while another opener holds the file, without
+        // waiting on the busy timeout: so it is asked again for as long.
+        let t0 = std::time::Instant::now();
+        loop {
+            match conn.execute_batch("PRAGMA journal_mode = WAL;") {
+                Ok(()) => break,
+                Err(e) if t0.elapsed() < Duration::from_secs(5)
+                    && matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => return Err(bad(e)),
+            }
+        }
+        // One transaction, so a second opener never sees the store half made.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(bad)?;
+        tx.execute_batch(SCHEMA).map_err(bad)?;
+        match (meta(&tx, "network").map_err(|e| (false, e))?, meta(&tx, "format").map_err(|e| (false, e))?) {
             (None, None) => {
-                set_meta(&conn, "network", net.name())?;
-                set_meta(&conn, "format", FORMAT)?;
+                set_meta(&tx, "network", net.name()).map_err(|e| (false, e))?;
+                set_meta(&tx, "format", FORMAT).map_err(|e| (false, e))?;
             }
             (Some(n), Some(f)) if n == net.name() && f == FORMAT => {}
-            _ => return Err("shared headers: another network's or another format".into()),
+            _ => return Err((true, "shared headers: another network's or another format".into())),
         }
+        tx.commit().map_err(bad)?;
         crate::storage::restrict(path);
         Ok(Self { conn, net, path: path.to_path_buf() })
     }
