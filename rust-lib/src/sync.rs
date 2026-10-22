@@ -918,8 +918,10 @@ impl Loop {
             self.kyoto_status.last_stop = Some(why.unwrap_or_else(|| "stopped".into()));
             // A start that ended by itself was an answer of sorts: none of its peers held on.
             self.authority.set_asked();
-            // A start that got somewhere retries soon; one that didn't backs off.
-            self.kyoto_backoff = if c.updated { Duration::from_secs(2) } else { (self.kyoto_backoff * 2).clamp(Duration::from_secs(2), KYOTO_RETRY_MAX) };
+            self.authority.set_peers(0);
+            // A start that got somewhere retries soon; one that didn't, or whose updates soon ended, backs off.
+            let soon_ended = c.ended && c.started.elapsed() < KYOTO_RETRY_MAX;
+            self.kyoto_backoff = if c.updated && !soon_ended { Duration::from_secs(2) } else { (self.kyoto_backoff * 2).clamp(Duration::from_secs(2), KYOTO_RETRY_MAX) };
             self.kyoto_retry_at = Instant::now() + self.kyoto_backoff;
             tracing::info!(target: "bitcoin", "kyoto stopped ({}); {} of {} peers never connected; again in {:?}",
                 self.kyoto_status.last_stop.as_deref().unwrap_or(""), c.unseen().len(), c.peers.len(), self.kyoto_backoff);
@@ -1146,7 +1148,7 @@ impl Loop {
         }
         let feeds = self.kyoto.as_mut().map(|c| c.poll()).unwrap_or_default();
         // Updates sent before the node stopped are taken before the stop.
-        let (mut stopped, mut conflict) = (None, false);
+        let (mut stopped, mut conflict, mut ended) = (None, false, None);
         for f in feeds {
             match f {
                 Feed::Progress { fraction, height } => {
@@ -1156,6 +1158,7 @@ impl Loop {
                 Feed::Warning(w) => self.kyoto_status.last_warning = Some(w),
                 Feed::Conflict => conflict = true,
                 Feed::Stopped(why) => stopped = Some(why),
+                Feed::Ended(why) => ended = Some(why),
                 Feed::Dial { peer, outcome } if !self.kyoto_own.contains(&peer) => self.peer_reports.dial(&peer, outcome),
                 Feed::Dial { .. } => {}
                 Feed::Gossip { from, addrs } => self.peer_reports.gossip(self.ctx.net, &from, &addrs, now),
@@ -1195,6 +1198,10 @@ impl Loop {
         }
         if let Some(why) = stopped {
             self.stop_kyoto(Some(why));
+        } else if let Some(why) = ended.filter(|_| self.kyoto.is_some()) {
+            // Its node ran on, but nothing more would reach the wallet: a new client takes over.
+            self.stop_kyoto(Some(Some(format!("updates ended: {why}"))));
+            tracing::warn!(target: "bitcoin", "kyoto: the updates ended while the node ran ({why}); a new client in {:?}", self.kyoto_backoff);
         }
         // Addresses revealed past what the client watches: it watches them from now on, in place.
         let rebuild = match (&self.kyoto, self.ctx.cell.lock().as_ref()) {

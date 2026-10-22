@@ -192,6 +192,12 @@ bdk_kyoto 0.18.1 with four patches on bip157 0.7.0 (published from 0169dc3) with
   10 reached the tip.
 - When Kyoto runs out of peers (`NoReachablePeers`) it restarts on a fresh subset: after 2 s when the
   run got somewhere, else backing off up to 2 minutes.
+- When the client's update stream ends while its node runs on, nothing more would reach the wallet:
+  the core stops that client and starts another from the wallet's chain, after 2 s when the
+  client ran 2 minutes or more, else backing off as after a start that got nowhere, with a restart
+  counted, `lastStop` `updates ended: …` and a warning in the log. A node that stops, or a close,
+  ends the stream too; only the stop is reported. Until bdk_kyoto patch 4, a matched block
+  reorganized out of the best chain before its fetch ended it.
 - bdk_kyoto copies the wallet's address index when the client is built, so it watches the revealed
   addresses plus 25, or more after a rescan. When the wallet reveals past those, the running client
   watches them from its next filter on (bdk_kyoto patch 3; `status.kyoto.rebuilds` counts these).
@@ -569,8 +575,8 @@ REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 \
 # a fresh chain (stop, remove CHAIN_DIR, prepare), then
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test kyoto -- --ignored --exact kyoto_is_the_authority_on_regtest --nocapture
-# then, on the same chain, kyoto_with_a_history_server and kyoto_skips_a_matched_block_reorganized_away
-# the same way, one at a time
+# then, on the same chain, kyoto_with_a_history_server, kyoto_skips_a_matched_block_reorganized_away
+# and kyoto_restarts_a_client_whose_updates_ended the same way, one at a time
 # a fresh chain each, then
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test node -- --ignored --nocapture
@@ -645,8 +651,15 @@ every block 15 s: a payment's block is matched, its fetch held, and `chain.sh re
 so the node drops the request; the payment confirms in the block that replaced it, from the same
 client. Then a block matched while another's fetch is held is replaced before its own: the node
 fetches it from the old branch, and its payment too ends in the new block. Without patch 4 the
-first step fails: the update stream ends, and the wallet stays `synced` at the block before the
-payment's, its client running with both peers and no stop reported. `kyoto_first_sync_on_a_long_chain`
+first step fails: a new client brings the payment (`lastStop` `updates ended: the node halted
+execution.`); without the restart below either, the wallet stays `synced` at the block before the
+payment's, its client running with both peers and no stop reported.
+`kyoto_restarts_a_client_whose_updates_ended` ends the update stream after an update (a test
+hook) while the node runs on: the core counts one restart, with `lastStop` `updates ended: ended
+by a test hook` and one warning, and a payment confirms through the new client with no reopen. A
+close then stops the sync within 3 s (48 ms on macOS), and in the 10 s after no client dials and
+nothing reads as an end of the updates. Without the restart the client runs on with its peers,
+silent. `kyoto_first_sync_on_a_long_chain`
 times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_a_live_network` restores the test phrase
 on signet or testnet4 (`LIVE_NETWORK`, signet by default) with a birthday (`LIVE_BIRTHDAY`) through
 Tor (`LIVE_PROXY`, a `socks5h://` port with IsolateDestAddr) from `LIVE_PEERS` (comma-separated

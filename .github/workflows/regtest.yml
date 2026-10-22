@@ -80,7 +80,7 @@ jobs:
           export REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE="$CHAIN_DIR/bitcoind/regtest/.cookie" \
             REGTEST_ELECTRUM=127.0.0.1:60601 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh"
           for t in kyoto_is_the_authority_on_regtest kyoto_with_a_history_server \
-                   kyoto_skips_a_matched_block_reorganized_away; do
+                   kyoto_skips_a_matched_block_reorganized_away kyoto_restarts_a_client_whose_updates_ended; do
             cargo test --release --no-default-features --features test-hooks --locked --test kyoto -- --ignored --exact "$t" --nocapture
           done
 
