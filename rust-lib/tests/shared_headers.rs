@@ -87,11 +87,11 @@ fn wallets_share_the_networks_headers() {
     // vouches for them with one header.
     let (_, second, _) = sync(json!({"network": "regtest", "family": "bitcoin_taproot"}), "a second wallet");
     assert_eq!(second, 0);
-    let walletdb = |g: &str| root.path().join("wallets/regtest").join(g).join("wallet.db");
-    assert!(walletdb("g_tap00000000000000000000000000000000").exists());
+    let wallets = std::fs::read_dir(root.path().join("wallets/regtest")).unwrap().flatten().filter(|e| e.path().join("wallet.db").exists()).count();
+    assert_eq!(wallets, 2);
 
     // The first wallet under a new database key: its database is set aside, the headers aren't.
-    t.manager.keys.lock().unwrap().remove("g_seg00000000000000000000000000000000");
+    t.manager.forget_key("g_seg00000000000000000000000000000000");
     let (opened, reset, _) = sync(json!({"network": "regtest", "group": "g_seg00000000000000000000000000000000"}), "the first wallet, its key changed");
     assert_eq!((opened["reset"].clone(), reset), (json!(true), 0), "{opened}");
 

@@ -307,14 +307,14 @@ fn bitcoin_wallet_on_regtest() {
     assert_eq!(exposure["servers"].as_array().unwrap().len(), 2, "{exposure}");
 
     // A device account: the manager lists it by its own id (a Keycard Shell's), not a keystore group.
-    // It opens under that id, finds the same keys' coins, and sends through the manager.
+    // The same keys are the same account: it opens the same wallet, with its coins, and sends
+    // through the manager.
     let segwit = t.sats("confirmed");
     t.job("close_wallet", json!({}));
     assert!(t.manager.log.lock().unwrap().iter().any(|l| l.starts_with("close ") && l.contains("g_seg")));
     let device = "shell-73c5da0a-84-1-0";
     let opened = t.job("open_wallet", json!({"network": "regtest", "group": device}));
-    assert_eq!((opened["group"].clone(), opened["family"].clone(), opened["created"].clone()), (json!(device), json!("bitcoin"), json!(true)), "{opened}");
-    assert!(root.path().join("wallets/regtest").join(device).join("wallet.db").exists());
+    assert_eq!((opened["group"].clone(), opened["family"].clone(), opened["created"].clone()), (json!(device), json!("bitcoin"), json!(false)), "{opened}");
     t.synced();
     t.wait("the device account's coins", 60, || t.sats("confirmed") == segwit);
     let (_, dsent) = t.send(&theirs, 1_000_000, Some(2.0));

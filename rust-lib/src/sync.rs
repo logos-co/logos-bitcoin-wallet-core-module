@@ -1472,9 +1472,9 @@ impl Loop {
         let mut guard = self.ctx.cell.lock();
         let cell = guard.as_mut().ok_or("closed")?;
         let screened = checks::screen(&mut update, &self.authority, &HashMap::new(), &|t| cell.known(t), true);
-        for (txid, a) in &screened.dropped {
+        for (_, a) in &screened.dropped {
             // The authority's own block, gone from its chain since: a reorg raced the update.
-            tracing::info!(target: "bitcoin", "{}: {txid} at {} is off the chain now; it comes again", f.source, a.block_id.height);
+            tracing::info!(target: "bitcoin", "{}: a transaction at {} is off the chain now; it comes again", f.source, a.block_id.height);
         }
         for (txid, a) in screened.held.iter().chain(&screened.needs_linkage) {
             let _ = cell.hold(&Held { txid: *txid, anchor: *a, source: f.source.to_string() });
@@ -1823,7 +1823,7 @@ impl Loop {
             match self.inclusion(&src, txid, a, header, &proofs)? {
                 Inclusion::Proved => settled.push((txid, a)),
                 Inclusion::Unknown(why) => {
-                    tracing::info!(target: "bitcoin", "{}: {txid} at {height} not checked yet: {why}", src.id);
+                    tracing::info!(target: "bitcoin", "{}: a transaction at {height} not checked yet: {why}", src.id);
                     update.anchors.remove(&(a, txid));
                     if below { unchecked.push((txid, a)) } else { waiting.push((txid, a)) }
                 }

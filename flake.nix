@@ -5,7 +5,7 @@
     logos-module-builder.url = "github:logos-co/logos-module-builder";
     # Only its contract is consumed: the core asks it to open wallets and approve sends.
     signer_manager_module = {
-      url = "github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818";
+      url = "github:logos-co/logos-signer-manager-module/cfe858ea55a763ffa6e8e0e12a94a08c91199639";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
   };

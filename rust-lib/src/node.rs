@@ -349,7 +349,7 @@ impl Follower {
                 Ok(_) => {}
                 Err(Failure::Rpc { message, .. }) if message.contains("already") => {}
                 Err(e) => {
-                    tracing::info!(target: "bitcoin", "node: getblockfrompeer {hash} from peer {id}: {e}");
+                    tracing::info!(target: "bitcoin", "node: getblockfrompeer from peer {id}: {e}");
                     continue;
                 }
             }
