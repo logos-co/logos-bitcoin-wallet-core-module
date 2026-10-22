@@ -14,7 +14,8 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
   grant (the person's consent, the descriptors and the wallet's `seed`), builds the BDK wallet from
   `external`/`internal` exactly as given, asks the signer manager for its own keys to that seed's
   data (`data_key`, [logos.wallets/1](https://github.com/logos-co/logos-signer-interface/blob/main/docs/wallets.md)),
-  opens the encrypted database, and acknowledges. A seed still locked in the Signer app answers
+  opens the encrypted database, and acknowledges. The open result and `status` name the `seed`. A
+  seed still locked in the Signer app answers
   `locked`, and the open fails saying so. `close_wallet` calls `close_account` and forgets the
   key. The key and the descriptors live in memory only. Closing stops the sync within moments:
   it shuts the sync's Electrum sockets, so a call waiting on a server (a header download over a

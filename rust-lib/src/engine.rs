@@ -85,6 +85,8 @@ struct Light {
     state: State,
     network: Option<BNetwork>,
     group: Option<String>,
+    /// The signer manager's wallet the open one belongs to.
+    seed: Option<String>,
     family: Option<Family>,
     open_handle: Option<String>,
     approval_handle: Option<String>,
@@ -101,6 +103,7 @@ impl Default for Light {
             state: State::NoWallet,
             network: None,
             group: None,
+            seed: None,
             family: None,
             open_handle: None,
             approval_handle: None,
@@ -500,6 +503,7 @@ impl Engine {
             self.set_light(|l| {
                 l.state = State::Opening;
                 l.group = Some(grant.group.clone());
+                l.seed = Some(grant.seed.clone());
                 l.family = Some(grant.family);
             });
             self.open_with(network, grant, birthday, gap_limit)
@@ -657,7 +661,7 @@ impl Engine {
         let xpub = Zeroizing::new(manager::descriptor_xpub(&grant.external).ok_or("open result: no account xpub in the descriptor")?);
         let thread = sync::spawn(ctx, authority).map_err(|e| e.to_string())?;
         let result = json!({
-            "group": grant.group, "family": grant.family, "network": network.name(), "created": created || !existed,
+            "group": grant.group, "seed": grant.seed, "family": grant.family, "network": network.name(), "created": created || !existed,
             "reset": reset.is_some(),
             "fingerprint": grant.fingerprint, "birthday": {"height": bday, "source": source}, "needsBirthday": needs_birthday,
             "gapLimit": gap,
@@ -1199,7 +1203,7 @@ impl Engine {
     fn status_inner(&self, wait_wallet: bool) -> Value {
         let l = self.light.lock().clone();
         let mut v = json!({
-            "ok": true, "state": l.state.as_str(), "network": l.network.map(|n| n.name()), "group": l.group,
+            "ok": true, "state": l.state.as_str(), "network": l.network.map(|n| n.name()), "group": l.group, "seed": l.seed,
             "family": l.family, "openHandle": l.open_handle, "approvalHandle": l.approval_handle,
             "needsBirthday": l.needs_birthday, "birthday": l.birthday, "birthdaySource": l.birthday_source,
             "gapLimit": l.gap_limit, "lastError": l.last_error, "synced": false, "busy": false,
@@ -1787,7 +1791,7 @@ mod tests {
         let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), mgr.clone(), None);
         finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
         e.wallets_changed();
-        assert_eq!(e.status()["group"], "g_reset", "still unlocked: still open");
+        assert_eq!((e.status()["group"].clone(), e.status()["seed"].clone()), (json!("g_reset"), json!("s_test")), "still unlocked: still open");
         assert_eq!(e.list_wallets("regtest")["wallets"].as_array().unwrap().len(), 1);
         mgr.locked.store(true, Ordering::SeqCst);
         e.wallets_changed();
