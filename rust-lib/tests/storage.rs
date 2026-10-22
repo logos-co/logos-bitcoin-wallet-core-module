@@ -22,7 +22,6 @@ use bitcoin_wallet_core::walletdir::{DirError, WalletDir};
 
 const TXS: u32 = 10_000;
 const PER_BLOCK: u32 = 10;
-const GROUP: &str = "g_spike4";
 const REOPEN_LIMIT: Duration = Duration::from_secs(2);
 // The test phrase's BIP84 account (abandon ×11 about, 73c5da0a), as the keystore hands it over.
 const XPUB: &str = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
@@ -171,14 +170,13 @@ fn spike4_encrypted_storage() {
 
     let (ext, int) = descriptors();
     let root = base.join("wallets");
-    let dir = WalletDir::new(&root, BNetwork::Regtest, GROUP);
-    let meta = WalletDir::new_meta(GROUP, Family::Bitcoin, BNetwork::Regtest);
+    let dir = WalletDir::create(&root, BNetwork::Regtest);
     let key: [u8; 32] = rand::random();
     let mut needles = Needles::default();
     needles.wallet(&ext, &int);
 
     // Create, then 10,000 updates, each persisted on its own.
-    let mut conn = dir.open(&root, &meta, &key).unwrap();
+    let mut conn = dir.open_db(&root, &key).unwrap();
     let (wallet, created) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
     assert!(created);
     let mut cell = Cell { wallet, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
@@ -195,7 +193,7 @@ fn spike4_encrypted_storage() {
 
     // Closed: reopen with the key, timed from the file to a loaded wallet and its balance.
     let t = Instant::now();
-    let mut conn = dir.open(&root, &meta, &key).unwrap();
+    let mut conn = dir.open_db(&root, &key).unwrap();
     let (wallet, created) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
     let count = wallet.transactions().count();
     let balance = wallet.balance();
@@ -219,13 +217,13 @@ fn spike4_encrypted_storage() {
     let before = snapshot(&dir.path);
     let mut wrong = key;
     wrong[0] ^= 0xff;
-    let refused = dir.open(&root, &meta, &wrong);
+    let refused = dir.open_db(&root, &wrong);
     assert!(matches!(refused, Err(DirError::Storage(StorageError::WrongKey))), "{:?}", refused.err());
     let unkeyed = rusqlite::Connection::open(dir.path.join("wallet.db")).unwrap();
     assert!(unkeyed.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_err(), "no key, no tables");
     drop(unkeyed);
     assert_eq!(snapshot(&dir.path), before, "a refused open leaves the files as they were");
-    let mut conn = dir.open(&root, &meta, &key).expect("the right key still opens it");
+    let mut conn = dir.open_db(&root, &key).expect("the right key still opens it");
     assert_eq!(load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap().0.transactions().count(), TXS as usize);
     drop(conn);
 

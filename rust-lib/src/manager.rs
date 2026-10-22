@@ -1,11 +1,13 @@
-//! The wallet core's side of `signer_manager_module`: open grants and PSBT approvals. The core is
-//! the requester; it keeps every receipt and hands only handles upward.
+//! The wallet core's side of `signer_manager_module`: open grants, PSBT approvals and the core's
+//! keys for each wallet's data. The core is the requester; it keeps every receipt and hands only
+//! handles upward.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
@@ -21,6 +23,8 @@ pub trait SignerManager: Send + Sync {
     fn ack_result(&self, handle: &str, receipt: &str) -> Result<bool, String>;
     fn cancel_approval(&self, handle: &str, receipt: &str) -> Result<bool, String>;
     fn close_account(&self, params_json: &str) -> Result<String, String>;
+    /// `logos.wallets/1`: the core's own key for one scope of a wallet's data.
+    fn data_key(&self, params_json: &str) -> Result<String, String>;
 }
 
 /// A request in flight: the handle goes up to the backend and the app, the receipt never leaves.
@@ -60,7 +64,8 @@ pub fn open_params(network: BNetwork, group: Option<&str>, family: Option<Family
     }
 }
 
-/// What an approved open hands over. The database key lives only here and in the open wallet.
+/// What an approved open hands over: the person's consent, the wallet's descriptors and its seed,
+/// whose keys the core asks for itself.
 pub struct OpenGrant {
     pub group: String,
     pub family: Family,
@@ -68,7 +73,8 @@ pub struct OpenGrant {
     pub external: String,
     pub internal: String,
     pub fingerprint: String,
-    pub database_key: Zeroizing<[u8; 32]>,
+    /// The signer manager's wallet: what `data_key` names.
+    pub seed: String,
     /// `created` or `restored`, from managers that say.
     pub origin: Option<String>,
     /// The UTC day the wallet was made, or the day the person gave on restore.
@@ -88,11 +94,7 @@ pub fn open_grant(reply: &str, net: BNetwork) -> Result<Option<OpenGrant>, Strin
     if s("chain")? != net.chain() {
         return Err(format!("the wallet is on the {} chain, not {}'s", s("chain")?, net.name()));
     }
-    let mut hex_key = Zeroizing::new(s("databaseKey")?);
-    let mut key = Zeroizing::new([0u8; 32]);
-    let decoded = hex::decode_to_slice(hex_key.as_bytes(), &mut key[..]);
-    zeroize::Zeroize::zeroize(&mut *hex_key);
-    decoded.map_err(|_| "open result: the database key is not 32 bytes of hex")?;
+    let seed = s("seed").map_err(|_| "open result: no seed: this wallet doesn't unlock in the Signer app".to_string())?;
     let grant = OpenGrant {
         group: s("group")?,
         family,
@@ -100,7 +102,7 @@ pub fn open_grant(reply: &str, net: BNetwork) -> Result<Option<OpenGrant>, Strin
         external: s("external")?,
         internal: s("internal")?,
         fingerprint: s("fingerprint")?,
-        database_key: key,
+        seed,
         origin: r["origin"].as_str().map(str::to_string),
         birthday: r["birthday"].as_str().map(str::to_string),
     };
@@ -111,9 +113,38 @@ pub fn open_grant(reply: &str, net: BNetwork) -> Result<Option<OpenGrant>, Strin
     Ok(Some(grant))
 }
 
-/// A Bitcoin intent: the group and exactly one psbt leg.
-pub fn approval_intent(group: &str, purpose: &str, network: BNetwork, psbt_base64: &str) -> String {
-    json!({"group": group, "purpose": purpose, "legs": [{"kind": "psbt", "network": network.name(), "psbt": psbt_base64}]}).to_string()
+/// The core's key for one scope of a seed's data; `locked` until the person unlocks it.
+pub fn data_key(m: &dyn SignerManager, seed: &str, scope: &str, generation: Option<u32>) -> Result<DataKey, String> {
+    let req = DataKeyRequest { seed: seed.into(), scope: scope.into(), generation };
+    let reply = m.data_key(&serde_json::to_string(&req).map_err(|e| e.to_string())?).map_err(|e| format!("signer_manager_module: {e}"))?;
+    read_data_key(&reply).map_err(|e| e.message)
+}
+
+/// What keys the wallet files of a seed: their boxes, and which directory holds which account.
+pub const WALLETS_SCOPE: &str = "wallets";
+
+/// An account's database key scope: its roster key, the same whichever signer opened it.
+pub fn database_scope(family: Family, network: BNetwork, descriptor: &str) -> Result<String, String> {
+    use logos_signer_interface::{Chain, Family as F};
+    let xpub = descriptor_xpub(descriptor).ok_or("open result: no account xpub in the descriptor")?;
+    let f = if family == Family::Bitcoin { F::Bitcoin } else { F::BitcoinTaproot };
+    let chain = if network.chain() == "main" { Chain::Main } else { Chain::Test };
+    let key = logos_signer_interface::unlock::roster_key(f, Some(chain), &xpub).map_err(|e| e.message)?;
+    Ok(format!("wallet/{key}"))
+}
+
+/// A Bitcoin intent: the group, its xpub and exactly one psbt leg. A signer that keeps the xpub
+/// sealed lists none, so the open wallet brings it; the manager checks it is the group's.
+pub fn approval_intent(group: &str, xpub: &str, purpose: &str, network: BNetwork, psbt_base64: &str) -> String {
+    json!({"group": group, "xpub": xpub, "purpose": purpose, "legs": [{"kind": "psbt", "network": network.name(), "psbt": psbt_base64}]}).to_string()
+}
+
+/// The account xpub in a descriptor such as `wpkh([73c5da0a/84'/1'/0']tpub…/0/*)#…`.
+pub fn descriptor_xpub(descriptor: &str) -> Option<String> {
+    use std::str::FromStr;
+    let after = &descriptor[descriptor.find(']')? + 1..];
+    let xpub = &after[..after.find('/')?];
+    bitcoin::bip32::Xpub::from_str(xpub).ok().map(|_| xpub.to_string())
 }
 
 pub fn signed_psbts(reply: &str) -> Result<Vec<String>, String> {
@@ -204,7 +235,7 @@ mod tests {
     fn reply(extra: Value) -> String {
         let mut r = json!({"group": "g_1", "family": "bitcoin", "chain": "test", "network": "regtest",
             "external": EXT, "internal": EXT.replace("/0/*", "/1/*"), "fingerprint": "73c5da0a",
-            "databaseKey": "ab".repeat(32), "unlocked": null});
+            "seed": "s_1"});
         for (k, v) in extra.as_object().unwrap() {
             r[k] = v.clone();
         }
@@ -215,14 +246,13 @@ mod tests {
     fn an_open_grant_is_read_whole_and_checked() {
         crate::network::configure_regtest(Default::default());
         let g = open_grant(&reply(json!({})), BNetwork::Regtest).unwrap().unwrap();
-        assert_eq!((g.group.as_str(), g.family), ("g_1", Family::Bitcoin));
-        assert_eq!(*g.database_key, [0xab; 32]);
+        assert_eq!((g.group.as_str(), g.family, g.seed.as_str()), ("g_1", Family::Bitcoin, "s_1"));
         assert_eq!((g.origin, g.birthday), (None, None), "older managers say neither");
         let g = open_grant(&reply(json!({"origin": "created", "birthday": "2026-10-01"})), BNetwork::Regtest).unwrap().unwrap();
         assert_eq!((g.origin.as_deref(), g.birthday.as_deref()), (Some("created"), Some("2026-10-01")));
         // A wallet on the main chain does not open on regtest, and keys must be 32 bytes.
         assert!(open_grant(&reply(json!({"chain": "main"})), BNetwork::Regtest).is_err());
-        assert!(open_grant(&reply(json!({"databaseKey": "abcd"})), BNetwork::Regtest).is_err());
+        assert!(open_grant(&reply(json!({"seed": null})), BNetwork::Regtest).err().unwrap().contains("Signer app"));
         assert!(open_grant(&reply(json!({"family": "bitcoin_taproot"})), BNetwork::Regtest).is_err(), "descriptor kind must match");
         let pending = json!({"ok": false, "error": "invalid parameters: no result for this handle"}).to_string();
         assert!(open_grant(&pending, BNetwork::Regtest).unwrap().is_none());
@@ -231,14 +261,32 @@ mod tests {
     }
 
     #[test]
+    fn an_accounts_database_scope_is_its_roster_key() {
+        let s = database_scope(Family::Bitcoin, BNetwork::Regtest, EXT).unwrap();
+        assert!(s.starts_with("wallet/btc_") && s.len() == "wallet/btc_".len() + 32, "{s}");
+        assert_ne!(database_scope(Family::BitcoinTaproot, BNetwork::Regtest, EXT).unwrap(), s);
+        assert!(database_scope(Family::Bitcoin, BNetwork::Regtest, "wpkh(x)").is_err());
+    }
+
+    #[test]
+    fn the_xpub_a_request_brings_is_the_descriptors() {
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        assert_eq!(descriptor_xpub(&format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)#4ae3dsxx")).as_deref(), Some(x));
+        assert_eq!(descriptor_xpub(&format!("tr([73c5da0a/86'/1'/0']{x}/1/*)")).as_deref(), Some(x));
+        assert_eq!(descriptor_xpub("wpkh([73c5da0a/84'/1'/0']notanxpub/0/*)"), None);
+        assert_eq!(descriptor_xpub("wpkh(x)"), None);
+    }
+
+    #[test]
     fn requests_are_shaped_as_the_manager_takes_them() {
         let p: Value = serde_json::from_str(&open_params(BNetwork::Signet, Some("g_1"), None).unwrap()).unwrap();
         assert_eq!((p["group"].clone(), p["network"].clone()), (json!("g_1"), json!("signet")));
         let p: Value = serde_json::from_str(&open_params(BNetwork::Mainnet, None, Some(Family::BitcoinTaproot)).unwrap()).unwrap();
         assert_eq!((p["family"].clone(), p.get("group")), (json!("bitcoin_taproot"), None));
-        let i: Value = serde_json::from_str(&approval_intent("g_1", "Send", BNetwork::Signet, "cHNidP8=")).unwrap();
+        let i: Value = serde_json::from_str(&approval_intent("g_1", "tpubD6", "Send", BNetwork::Signet, "cHNidP8=")).unwrap();
         assert_eq!(i["legs"].as_array().unwrap().len(), 1);
         assert_eq!(i["legs"][0]["kind"], "psbt");
+        assert_eq!(i["xpub"], "tpubD6");
         assert_eq!(signed_psbts(&json!({"ok": true, "signed": ["cHNidP8="]}).to_string()).unwrap(), vec!["cHNidP8="]);
         assert!(require_approved("approved").is_ok());
         assert!(require_approved("expired_no_ack").unwrap_err().starts_with("expired_no_ack"));

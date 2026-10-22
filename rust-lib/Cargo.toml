@@ -43,6 +43,8 @@ base64 = "0.22"
 rand = "0.8"
 zeroize = "1"
 thiserror = "2"
+# The core's keys for each wallet's data, from the signer manager, and the box they seal.
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "eab22d1a990adfb973aa8669175e366d28cf0803" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
@@ -55,7 +57,7 @@ rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"]
 
 [dev-dependencies]
 tempfile = "3"
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "a80206330ae18be12710fac83c1b2feb73a96dc9", features = ["mock"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "eab22d1a990adfb973aa8669175e366d28cf0803", features = ["mock"] }
 
 [features]
 default = ["logos_module"]

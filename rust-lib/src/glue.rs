@@ -81,6 +81,9 @@ pub trait BitcoinWalletCoreModuleEvents {
     fn jobFinished(&self, job_id: String, state: String);
     /// `{ source, kind: suspect|stale|authority_behind|anchor_mismatch|authority_suspect, detail, at }`.
     fn sourceAlert(&self, payload: String);
+    /// `list_wallets` shows other wallets: one was unlocked or locked in the Signer app. `locked`
+    /// counts the seeds whose wallets it can't list.
+    fn walletsChanged(&self, locked: i64);
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
@@ -239,6 +242,7 @@ impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
                 Event::WalletState(v) => emit_wallet_state_changed(&v.to_string()),
                 Event::JobFinished { id, state } => emit_job_finished(&id, state),
                 Event::SourceAlert(v) => emit_source_alert(&v.to_string()),
+                Event::WalletsChanged { locked } => emit_wallets_changed(locked as i64),
             }
         });
         let engine = Engine::new(dir.join("wallets"), sink, Arc::new(ManagerIpc::default()), Some(Arc::new(NodeIpc::default())));
@@ -251,9 +255,45 @@ impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
 
 static UNLOADING: AtomicBool = AtomicBool::new(false);
 
-/// The manager's handle-only events wake waiters early; the node's route changes reload routes.
-/// Subscribing waits on other modules, so it runs off the dispatch thread, retrying while absent.
+/// The manager's handle-only events wake waiters early; its wallet events have the core ask for
+/// its keys again; the node's route changes reload routes. Subscribing waits on other modules, so
+/// it runs off the dispatch thread, retrying while absent.
 fn listen(engine: &Arc<Engine>) {
+    let weak = Arc::downgrade(engine);
+    std::thread::spawn(move || {
+        match weak.upgrade() {
+            Some(e) => e.wallets_changed(),
+            None => return,
+        }
+        while !UNLOADING.load(Ordering::SeqCst) {
+            let mut c = signer_manager_module::SignerManagerModuleClient::new();
+            let subs: Vec<_> = [c.on_wallets_changed(), c.on_wallets_locked()].into_iter().flatten().collect();
+            if subs.is_empty() {
+                std::thread::sleep(Duration::from_secs(30));
+                continue;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            for sub in subs {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for _ in sub {
+                        if tx.send(()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            // One ask at a time; a burst of events is one ask.
+            while rx.recv().is_ok() {
+                while rx.try_recv().is_ok() {}
+                match weak.upgrade() {
+                    Some(e) => e.wallets_changed(),
+                    None => return,
+                }
+            }
+        }
+    });
     let settled = engine.settled.clone();
     std::thread::spawn(move || {
         while !UNLOADING.load(Ordering::SeqCst) {
@@ -360,6 +400,9 @@ impl SignerManager for ManagerIpc {
     }
     fn close_account(&self, p: &str) -> Result<String, String> {
         ipc!(self, close_account_async_with_timeout, p)
+    }
+    fn data_key(&self, p: &str) -> Result<String, String> {
+        ipc!(self, data_key_async_with_timeout, p)
     }
 }
 

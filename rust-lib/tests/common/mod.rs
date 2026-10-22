@@ -43,8 +43,12 @@ pub struct MockManager {
     next: AtomicU64,
     records: Mutex<HashMap<String, Record>>,
     delay: Duration,
-    /// Each account's database key; removing one gives the account a new key at its next open.
-    pub keys: Mutex<HashMap<String, String>>,
+    /// The keys `data_key` gives, by scope: one per account, whichever signer opens it.
+    keys: Mutex<HashMap<String, String>>,
+    /// Each group's database scope, once asked for.
+    scopes: Mutex<HashMap<String, String>>,
+    /// The group last opened.
+    opened: Mutex<String>,
     pub log: Mutex<Vec<String>>,
     /// The next approval settles this way instead of approved.
     pub next_reason: Mutex<Option<&'static str>>,
@@ -54,7 +58,13 @@ impl MockManager {
     pub fn new(delay: Duration) -> Self {
         let mut signer = MockSigner::new(MockOptions { phrase: PHRASE.into(), ..Default::default() });
         signer.set_request_kinds(vec![RequestKind::BtcPsbt]);
-        Self { signer: Mutex::new(signer), next: AtomicU64::new(0), records: Mutex::default(), delay, keys: Mutex::default(), log: Mutex::default(), next_reason: Mutex::default() }
+        Self { signer: Mutex::new(signer), next: AtomicU64::new(0), records: Mutex::default(), delay, keys: Mutex::default(), scopes: Mutex::default(), opened: Mutex::default(), log: Mutex::default(), next_reason: Mutex::default() }
+    }
+
+    /// The account `group` opened has a new database key at its next open, as a seed added again.
+    pub fn forget_key(&self, group: &str) {
+        let scope = self.scopes.lock().unwrap().get(group).cloned().expect("opened before");
+        self.keys.lock().unwrap().remove(&scope);
     }
 
     fn account(&self, id: &str) -> (String, String, String) {
@@ -118,7 +128,7 @@ impl MockManager {
         let account = if taproot { "mock-taproot" } else { "mock-segwit" };
         let mut s = self.signer.lock().unwrap();
         let job = s
-            .sign(SignRequest { account: account.into(), payload: Payload::BtcPsbt { network: "regtest".into(), psbt: psbt_b64.into() }, secret: None })
+            .sign(SignRequest { account: account.into(), payload: Payload::BtcPsbt { network: "regtest".into(), psbt: psbt_b64.into() }, secret: None, xpub: None })
             .map_err(|e| e.to_string())?;
         let sigs = s.result(&job).map_err(|e| e.to_string())?;
         for sig in sigs {
@@ -154,11 +164,11 @@ impl SignerManager for MockManager {
             _ if family == "bitcoin" => "g_seg00000000000000000000000000000000",
             _ => "g_tap00000000000000000000000000000000",
         };
-        let key = self.keys.lock().unwrap().entry(group.into()).or_insert_with(|| hex::encode(rand::random::<[u8; 32]>())).clone();
+        *self.opened.lock().unwrap() = group.into();
         let (external, internal) = self.descriptors(family);
         self.log.lock().unwrap().push(format!("open {family} {group}"));
         Ok(self.issue("sma", json!({"group": group, "family": family, "chain": "test", "network": v["network"], "external": external,
-            "internal": internal, "fingerprint": "73c5da0a", "databaseKey": key, "origin": "restored", "birthday": null, "unlocked": null}), "approved"))
+            "internal": internal, "fingerprint": "73c5da0a", "seed": "s_mock", "origin": "restored", "birthday": null}), "approved"))
     }
 
     fn request_approval(&self, intent: &str) -> Result<String, String> {
@@ -205,6 +215,18 @@ impl SignerManager for MockManager {
     fn close_account(&self, p: &str) -> Result<String, String> {
         self.log.lock().unwrap().push(format!("close {p}"));
         Ok(json!({"ok": true, "closed": true}).to_string())
+    }
+
+    /// One generation, a key per scope.
+    fn data_key(&self, p: &str) -> Result<String, String> {
+        let v: Value = serde_json::from_str(p).unwrap();
+        assert_eq!(v["seed"], "s_mock");
+        let scope = v["scope"].as_str().unwrap().to_string();
+        if scope.starts_with("wallet/") {
+            self.scopes.lock().unwrap().insert(self.opened.lock().unwrap().clone(), scope.clone());
+        }
+        let key = self.keys.lock().unwrap().entry(scope).or_insert_with(|| hex::encode(rand::random::<[u8; 32]>())).clone();
+        Ok(json!({"ok": true, "key": key, "generation": 0, "seed": "s_mock"}).to_string())
     }
 }
 
@@ -449,6 +471,7 @@ pub fn collecting() -> (Sink, Arc<Mutex<Vec<(String, Value)>>>) {
             Event::WalletState(v) => ("walletStateChanged".to_string(), v),
             Event::JobFinished { id, state } => ("jobFinished".to_string(), json!({"jobId": id, "state": state})),
             Event::SourceAlert(v) => ("sourceAlert".to_string(), v),
+            Event::WalletsChanged { locked } => ("walletsChanged".to_string(), json!({"locked": locked})),
         };
         ev.lock().unwrap().push(entry);
     });
