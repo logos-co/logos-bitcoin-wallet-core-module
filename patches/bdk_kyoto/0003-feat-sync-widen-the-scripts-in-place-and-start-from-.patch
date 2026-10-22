@@ -1,7 +1,7 @@
-From e8c25c6054e4bd37cea6b93152d974b0af41fb51 Mon Sep 17 00:00:00 2001
+From 153ced2be069d82b11014027ddb5b1a2c4a3edd4 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sun, 11 Oct 2026 17:53:02 -0300
-Subject: [PATCH 3/3] feat(sync): widen the scripts in place, and start from a
+Subject: [PATCH 3/4] feat(sync): widen the scripts in place, and start from a
  chain state
 
 UpdateSubscriber::widen_handle() takes the last index to watch per

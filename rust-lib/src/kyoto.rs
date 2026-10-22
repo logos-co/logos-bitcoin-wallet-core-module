@@ -34,6 +34,8 @@ pub const LOOKAHEAD: u32 = 25;
 pub const CHECKPOINT_FILTERS: u32 = 2_016;
 /// Kyoto restarts this far below the last height it scanned, for a reorg since.
 pub const RESTART_DEPTH: u32 = 8;
+/// A node that stops ends the update stream too; within this its stop shows, and is reported as one.
+const STOP_GRACE: Duration = Duration::from_secs(1);
 
 /// A peer as the light client dials it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +277,8 @@ pub enum Feed {
     Conflict,
     /// The node stopped: it ran out of peers, or was told to.
     Stopped(Option<String>),
+    /// The update stream ended while the node ran on: nothing more would reach the wallet.
+    Ended(String),
     /// How a dial to one of this start's peers ended, when the client reports peers.
     Dial { peer: String, outcome: DialOutcome },
     /// Addresses a peer gossiped, when the client reports peers; `from` as it was dialled.
@@ -318,6 +322,8 @@ pub struct Client {
     /// An update came, at a checkpoint or the tip; one came with filters synced to the tip.
     pub updated: bool,
     pub synced: bool,
+    /// The update stream ended while the node ran.
+    pub ended: bool,
 }
 
 const KEYCHAINS: [KeychainKind; 2] = [KeychainKind::External, KeychainKind::Internal];
@@ -392,11 +398,34 @@ impl Client {
         let (updated, woken) = (tx.clone(), wake.clone());
         updates.checkpoint_every(CHECKPOINT_FILTERS);
         let widen = updates.widen_handle();
-        rt.spawn(async move {
-            while let Ok(u) = updates.update().await {
-                if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), synced: updates.synced() }).is_err() {
-                    break;
+        // Why the stream ended, or none once the sync thread is gone.
+        let stream = rt.spawn(async move {
+            loop {
+                match updates.update().await {
+                    Ok(u) => {
+                        if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), synced: updates.synced() }).is_err() {
+                            return None;
+                        }
+                        woken.store(true, std::sync::atomic::Ordering::SeqCst);
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        if crate::engine::hooks::END_KYOTO_UPDATES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            return Some("ended by a test hook".to_string());
+                        }
+                    }
+                    Err(e) => return Some(e.to_string()),
                 }
+            }
+        });
+        let (ended, woken, running) = (tx.clone(), wake.clone(), requester.clone());
+        rt.spawn(async move {
+            let why = match stream.await {
+                Ok(Some(why)) => why,
+                Ok(None) => return,
+                Err(e) => format!("its task failed: {e}"),
+            };
+            // A stopped node is drain_logs's to report.
+            tokio::time::sleep(STOP_GRACE).await;
+            if running.is_running() && ended.send(Feed::Ended(why)).is_ok() {
                 woken.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
@@ -407,15 +436,19 @@ impl Client {
         tracing::info!(target: "bitcoin", "kyoto: started after {} holding headers to {} with {} peers, quorum {required}{}", start.from.0, start.known_to, dial.len(),
             if start.headers_only { ", headers first" } else { "" });
         let lan = dial.iter().filter(|(_, p)| matches!(p, Peer::Lan(..))).map(|(t, _)| t.clone()).collect();
-        Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, now, connected, best_header, revealed, window, widen, start, started: Instant::now(), updated: false, synced: false })
+        Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, now, connected, best_header, revealed, window, widen, start, started: Instant::now(), updated: false, synced: false, ended: false })
     }
 
     pub fn poll(&mut self) -> Vec<Feed> {
         let out: Vec<Feed> = self.feed.try_iter().collect();
         for f in &out {
-            if let Feed::Update { synced, .. } = f {
-                self.updated = true;
-                self.synced |= *synced;
+            match f {
+                Feed::Update { synced, .. } => {
+                    self.updated = true;
+                    self.synced |= *synced;
+                }
+                Feed::Ended(_) => self.ended = true,
+                _ => {}
             }
         }
         out

@@ -1,6 +1,7 @@
 //! Kyoto as the chain authority on tools/regtest/chain.sh's chain: three filter-serving Core
 //! nodes behind proxies the test steers. Receive, send and confirm; a reorg; a restart after
-//! NoReachablePeers; a rebuild past the lookahead; and a peer forging filter headers.
+//! NoReachablePeers; a rebuild past the lookahead; and a peer forging filter headers. Then a
+//! matched block reorganized away before its fetch, and an update stream that ends.
 //! Needs `--features test-hooks`; the run command is in the README.
 
 mod common;
@@ -10,9 +11,11 @@ mod p2p_proxy;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bitcoin_wallet_core::engine::hooks::{END_KYOTO_UPDATES, SYNC_THREADS};
 use bitcoin_wallet_core::engine::Engine;
 use bitcoin_wallet_core::network::{configure_regtest, RegtestConfig};
 use common::{chain, collecting, MockManager, T};
@@ -394,5 +397,176 @@ fn kyoto_with_a_history_server() {
     let exposure = t.engine.exposure();
     assert!(exposure["servers"].as_array().unwrap().iter().any(|s| s["source"] == "electrum-0"), "{exposure}");
     println!("KYOTO with a history server: pending from electrum-0, confirmed at {}", t.tip());
+    t.engine.shutdown();
+}
+
+/// An engine whose Kyoto dials `copies` proxies each in front of the main node and the follower,
+/// quorum 2: a peer dropped for a held answer leaves spares to dial. The fork node is left out,
+/// as it drops its connections while it builds a branch.
+fn kyoto_behind_proxies(copies: usize) -> (T, Vec<Proxy>, tempfile::TempDir) {
+    let Some((rpc, cookie)) = common::chain_env() else { panic!("REGTEST_RPC is not set (see tools/regtest/chain.sh)") };
+    let nodes: Vec<SocketAddr> = chain(&["peers"]).trim().split(',').map(|s| s.parse().unwrap()).collect();
+    let proxies: Vec<Proxy> = [nodes[0], nodes[2]].iter().flat_map(|n| (0..copies).map(|_| Proxy::start("127.0.0.1:0", *n, Mode::Forward))).collect();
+    configure_regtest(RegtestConfig { kyoto: proxies.iter().map(|p| p.addr.to_string()).collect(), poll_secs: Some(1), kyoto_required: Some(2), ..Default::default() });
+    let (sink, events) = collecting();
+    let manager = Arc::new(MockManager::new(Duration::from_millis(100)));
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::new(root.path().join("wallets"), sink, manager.clone(), None);
+    let t = T { engine, rpc, cookie, events, manager };
+    t.job("open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+    t.synced();
+    t.wait("the scan from the birthday done", 120, || t.engine.status()["rescanFrom"].is_null());
+    t.synced();
+    assert_eq!(t.engine.status()["authority"]["kind"], "kyoto");
+    (t, proxies, root)
+}
+
+fn sum(proxies: &[Proxy], command: &str) -> usize {
+    proxies.iter().map(|p| p.count(command)).sum()
+}
+
+/// What the engine logs, kept for the test to read.
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        std::io::Write::write(&mut std::io::stderr(), b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    /// Captures the process's logs, or None when another subscriber took them first.
+    fn capture() -> Option<Logs> {
+        let logs = Logs::default();
+        let w = logs.clone();
+        tracing_subscriber::fmt().with_writer(move || w.clone()).with_max_level(tracing::Level::INFO).try_init().ok().map(|_| logs)
+    }
+
+    fn count(&self, text: &str) -> usize {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).matches(text).count()
+    }
+}
+
+/// A matched block reorganized away while the proxies hold its fetch: the node drops the request,
+/// bdk_kyoto patch 4 skips the block, and the payment comes in its replacement from the same
+/// client. Then one replaced before its fetch, fetched from the old branch as bip157 keeps stale
+/// headers. Run alone.
+#[test]
+#[ignore]
+fn kyoto_skips_a_matched_block_reorganized_away() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+    if common::chain_env().is_none() {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    }
+    let (t, proxies, _root) = kyoto_behind_proxies(4);
+    let hold = || proxies.iter().for_each(|p| p.set(delay("block", 15_000)));
+    let release = || proxies.iter().for_each(|p| p.set(Mode::Forward));
+    let restarts = kyoto(&t)["restarts"].clone();
+
+    // The node drops the queued request as the block leaves the chain: RecvError.
+    let paid = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.11).to_string();
+    hold();
+    let asked = sum(&proxies, "block");
+    t.mine(1);
+    let h = t.tip();
+    let old = t.rpc("getblockhash", json!([h]));
+    t.wait("the matched block's fetch held at a proxy", 60, || sum(&proxies, "block") > asked);
+    chain(&["reorg", "1"]);
+    let new = t.rpc("getblockhash", json!([h]));
+    assert_ne!(old, new);
+    t.wait("Kyoto on the new branch", 30, || kyoto(&t)["headers"].as_u64() > Some(h));
+    release();
+    t.synced();
+    t.wait("the payment in the block that replaced its first", 90, || {
+        let r = t.row(&paid);
+        r["state"] == "confirmed" && r["blockHash"] == new
+    });
+    assert_eq!(kyoto(&t)["restarts"], restarts, "the same client throughout: {}", kyoto(&t));
+    println!("KYOTO skipped {old} at {h}, reorganized away while its fetch was held; the payment came in {new}");
+
+    // Replaced before its fetch: the node still knows the block, and fetches it from the old branch.
+    let first = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.12).to_string();
+    hold();
+    let asked = sum(&proxies, "block");
+    t.mine(1);
+    let h1 = t.tip();
+    let kept = t.rpc("getblockhash", json!([h1]));
+    t.wait("the first block's fetch held at a proxy", 60, || sum(&proxies, "block") > asked);
+    let second = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.13).to_string();
+    let filters = sum(&proxies, "cfilter");
+    t.mine(1);
+    let h2 = t.tip();
+    let old = t.rpc("getblockhash", json!([h2]));
+    t.wait("the second block's filter at Kyoto", 30, || sum(&proxies, "cfilter") > filters);
+    std::thread::sleep(Duration::from_secs(1));
+    chain(&["reorg", "1"]);
+    let new = t.rpc("getblockhash", json!([h2]));
+    assert_ne!(old, new);
+    t.wait("Kyoto on the new branch", 30, || kyoto(&t)["headers"].as_u64() > Some(h2));
+    release();
+    t.synced();
+    t.wait("both payments", 90, || {
+        let (a, b) = (t.row(&first), t.row(&second));
+        a["state"] == "confirmed" && b["state"] == "confirmed" && b["blockHash"] == new
+    });
+    assert_eq!(t.row(&first)["blockHash"], kept);
+    assert_eq!(kyoto(&t)["restarts"], restarts, "the same client throughout: {}", kyoto(&t));
+    println!("KYOTO {old} at {h2}, matched while {kept} was held, replaced before its fetch; the payment came in {new}");
+    t.engine.shutdown();
+}
+
+/// The update stream ends while the node runs on (a test hook ends it after an update): the core
+/// reports it in `lastStop` and the log, and a new client takes over, from the wallet's chain,
+/// with no reopen. A close afterwards stops everything within seconds and starts nothing. Run alone.
+#[test]
+#[ignore]
+fn kyoto_restarts_a_client_whose_updates_ended() {
+    let logs = Logs::capture();
+    if common::chain_env().is_none() {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    }
+    let (t, proxies, _root) = kyoto_behind_proxies(1);
+    let restarts = kyoto(&t)["restarts"].as_u64().unwrap();
+
+    END_KYOTO_UPDATES.store(true, Ordering::SeqCst);
+    t.mine(1);
+    t.wait("the end reported and a new client", 60, || {
+        let k = kyoto(&t);
+        k["restarts"].as_u64().unwrap() > restarts && k["running"] == true
+    });
+    let k = kyoto(&t);
+    assert_eq!((k["restarts"].as_u64(), k["lastStop"].as_str()), (Some(restarts + 1), Some("updates ended: ended by a test hook")), "{k}");
+    if let Some(l) = &logs {
+        assert_eq!(l.count("the updates ended while the node ran"), 1);
+    }
+
+    // Updates again, with no reopen.
+    let paid = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.14).to_string();
+    t.mine(1);
+    t.synced();
+    t.wait("the payment through the new client", 90, || t.row(&paid)["state"] == "confirmed");
+    assert_eq!(kyoto(&t)["restarts"].as_u64(), Some(restarts + 1), "{}", kyoto(&t));
+    println!("KYOTO updates ended; restarted once, and the payment came through the new client");
+
+    // A close is no end of the updates: everything stops, and no client dials again.
+    let dials = sum(&proxies, "version");
+    let t0 = Instant::now();
+    t.job("close_wallet", json!({}));
+    t.wait("the sync thread to end", 10, || SYNC_THREADS.load(Ordering::SeqCst) == 0);
+    let stopped = t0.elapsed();
+    assert!(stopped < Duration::from_secs(3), "the sync ran on {stopped:?} after close");
+    std::thread::sleep(Duration::from_secs(10));
+    assert_eq!(sum(&proxies, "version"), dials, "a client dialled after the close");
+    if let Some(l) = &logs {
+        assert_eq!(l.count("the updates ended while the node ran"), 1, "the close read as an end of the updates");
+    }
+    println!("KYOTO closed in {} ms; nothing dialled in the 10 s after", stopped.as_millis());
     t.engine.shutdown();
 }

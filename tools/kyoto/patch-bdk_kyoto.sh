@@ -12,7 +12,7 @@ patches=$(cd "${3:-$(dirname "$0")/../../patches/bdk_kyoto}" && pwd)
 # the build until it is added here (README, "Kyoto patches").
 allowed=(
   src/lib.rs      # 1: matched blocks oldest first; 2: updates before the tip, and the height scanned;
-                  # 3: widening in place
+                  # 3: widening in place; 4: a matched block reorganized away is skipped
   src/builder.rs  # 3: a node built from a given chain state
 )
 

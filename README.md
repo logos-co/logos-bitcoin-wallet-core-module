@@ -2,7 +2,7 @@
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
 bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_esplora` 0.22.3, `bdk_kyoto` 0.18.1
-with three patches on `bip157` 0.7.0 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
+with four patches on `bip157` 0.7.0 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -154,7 +154,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.1 with three patches on bip157 0.7.0 (published from 0169dc3) with six, below
+bdk_kyoto 0.18.1 with four patches on bip157 0.7.0 (published from 0169dc3) with six, below
 (`kyoto.rs`, `peers.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
@@ -192,6 +192,12 @@ bdk_kyoto 0.18.1 with three patches on bip157 0.7.0 (published from 0169dc3) wit
   10 reached the tip.
 - When Kyoto runs out of peers (`NoReachablePeers`) it restarts on a fresh subset: after 2 s when the
   run got somewhere, else backing off up to 2 minutes.
+- When the client's update stream ends while its node runs on, nothing more would reach the wallet:
+  the core stops that client and starts another from the wallet's chain, after 2 s when the
+  client ran 2 minutes or more, else backing off as after a start that got nowhere, with a restart
+  counted, `lastStop` `updates ended: …` and a warning in the log. A node that stops, or a close,
+  ends the stream too; only the stop is reported. Until bdk_kyoto patch 4, a matched block
+  reorganized out of the best chain before its fetch ended it.
 - bdk_kyoto copies the wallet's address index when the client is built, so it watches the revealed
   addresses plus 25, or more after a rescan. When the wallet reveals past those, the running client
   watches them from its next filter on (bdk_kyoto patch 3; `status.kyoto.rebuilds` counts these).
@@ -275,7 +281,7 @@ and the module's Rust build depends on that check; `tools/kyoto/check-bip157.sh`
 without Nix (`--update` rewrites the vendored tree). Run against the published crate, the quorum
 and tip tests fail: that is the bug. Nothing has been sent upstream.
 
-`patches/bdk_kyoto/` holds three on bdk_kyoto 0.18.1, in `src/lib.rs` and `src/builder.rs`, the two
+`patches/bdk_kyoto/` holds four on bdk_kyoto 0.18.1, in `src/lib.rs` and `src/builder.rs`, the two
 files `tools/kyoto/patch-bdk_kyoto.sh` allows:
 
 1. matched blocks applied oldest first: the published crate drains them newest first
@@ -286,7 +292,13 @@ files `tools/kyoto/patch-bdk_kyoto.sh` allows:
 3. widening in place: `UpdateSubscriber::widen_handle()` takes the last index to watch per
    keychain, one the wallet revealed since the node was built included, and the scripts through it
    are indexed and checked from the next event on; `BuilderExt::build_with_wallet_from` builds a
-   node on a given `ChainState`, such as headers the wallet already holds.
+   node on a given `ChainState`, such as headers the wallet already holds;
+4. a matched block reorganized out of the best chain before its fetch is skipped, its replacements
+   matched by their own filters: the node drops the request it had queued (`RecvError` while it
+   runs), which ended the update stream as `NodeStopped` while the node ran on. Upstream's fix
+   (bdk-kyoto#180, on master, not yet released), ported onto patch 1's order; it goes once a
+   release carries it. It also skips an `UnknownHash` answer, which bip157 0.7.0 doesn't give for
+   a matched block: it keeps a reorganized branch's headers and fetches the block from there.
 
 0.18.1 indexes every script the filters are checked against (`extend_index_to_policy`), which our
 patch 3 on 0.18.0 did: with a recovery lookahead past the wallet's own 25, a matched block's
@@ -294,7 +306,8 @@ transaction read as irrelevant and was dropped.
 
 `rust-lib/vendor/bdk_kyoto` is the result, checked the same way (`nix build .#bdk_kyoto-check`,
 `tools/kyoto/check-bdk_kyoto.sh`); the regtest restores below fail without patch 1, and on 0.18.0
-without that indexing. Nothing has been sent upstream.
+without that indexing, and `kyoto_skips_a_matched_block_reorganized_away` without patch 4. Patches
+1 to 3 have not been sent upstream.
 
 ## Before a server's answer is applied
 
@@ -562,6 +575,8 @@ REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 \
 # a fresh chain (stop, remove CHAIN_DIR, prepare), then
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test kyoto -- --ignored --exact kyoto_is_the_authority_on_regtest --nocapture
+# then, on the same chain, kyoto_with_a_history_server, kyoto_skips_a_matched_block_reorganized_away
+# and kyoto_restarts_a_client_whose_updates_ended the same way, one at a time
 # a fresh chain each, then
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test node -- --ignored --nocapture
@@ -629,7 +644,22 @@ first: no update ever hides the payment, which confirms once the forger stops. E
 is a filter-header conflict, so each restarts the client at once (10 for 10 forged batches). Against bip157
 without patch 1, the same step fails: the wallet reports synced at the block with the payment
 missing. Run alone after it, `kyoto_with_a_history_server` adds an electrs enabled for history:
-the payment shows pending from it, then confirms on Kyoto's chain. `kyoto_first_sync_on_a_long_chain`
+the payment shows pending from it, then confirms on Kyoto's chain. Also run alone,
+`kyoto_skips_a_matched_block_reorganized_away` dials four proxies each in front of the main node
+and the follower, quorum 2, so a peer dropped for a held answer leaves spares. The proxies hold
+every block 15 s: a payment's block is matched, its fetch held, and `chain.sh reorg` replaces it,
+so the node drops the request; the payment confirms in the block that replaced it, from the same
+client. Then a block matched while another's fetch is held is replaced before its own: the node
+fetches it from the old branch, and its payment too ends in the new block. Without patch 4 the
+first step fails: a new client brings the payment (`lastStop` `updates ended: the node halted
+execution.`); without the restart below either, the wallet stays `synced` at the block before the
+payment's, its client running with both peers and no stop reported.
+`kyoto_restarts_a_client_whose_updates_ended` ends the update stream after an update (a test
+hook) while the node runs on: the core counts one restart, with `lastStop` `updates ended: ended
+by a test hook` and one warning, and a payment confirms through the new client with no reopen. A
+close then stops the sync within 3 s (48 ms on macOS), and in the 10 s after no client dials and
+nothing reads as an end of the updates. Without the restart the client runs on with its peers,
+silent. `kyoto_first_sync_on_a_long_chain`
 times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_a_live_network` restores the test phrase
 on signet or testnet4 (`LIVE_NETWORK`, signet by default) with a birthday (`LIVE_BIRTHDAY`) through
 Tor (`LIVE_PROXY`, a `socks5h://` port with IsolateDestAddr) from `LIVE_PEERS` (comma-separated

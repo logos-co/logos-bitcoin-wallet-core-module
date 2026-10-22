@@ -1,0 +1,66 @@
+From fb937527095f4aad63e600701e2b994e8ca92e4f Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Thu, 22 Oct 2026 14:03:56 -0300
+Subject: [PATCH 4/4] fix(sync): skip a matched block reorganized out of the
+ best chain
+
+A block whose filter matched can leave the best chain before it is
+fetched. The node then drops the request it had queued for it, which
+the client reads as RecvError while the node runs on, and that ended
+the update stream with NodeStopped though the node kept running: the
+wallet heard nothing more. The block is now skipped: the reorg reaches
+the update as a chain event, and the blocks that replace it have
+filters of their own. Any other fetch error still ends the stream.
+
+Upstream also skips an UnknownHash answer. bip157 0.7.0 keeps the
+headers of a reorganized branch and fetches such a block from it
+instead, so that arm is kept only to match upstream.
+
+Ported from bitcoindevkit/bdk-kyoto#180 by thunderbiscuit (eec7e3b,
+merged to master as 46d48c2, not yet released) onto patch 1's
+oldest-first loop. Drop this patch once a bdk_kyoto release carries it.
+---
+ src/lib.rs | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index f92037e..f3013b7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -49,6 +49,7 @@ use bdk_wallet::KeychainKind;
+ pub extern crate bip157;
+ 
+ use bip157::chain::BlockHeaderChanges;
++use bip157::error::FetchBlockError;
+ use bip157::tokio;
+ use bip157::IndexedBlock;
+ use bip157::ScriptBuf;
+@@ -441,11 +442,20 @@ impl<W: Wallets> UpdateSubscriber<W> {
+     async fn apply_queued_blocks(&mut self) -> Result<(), UpdateError> {
+         self.queued_blocks.sort_by_key(|(height, _)| *height);
+         while let Some(&(_, hash)) = self.queued_blocks.first() {
+-            let block = self
+-                .requester
+-                .get_block(hash)
+-                .await
+-                .map_err(|_| UpdateError::NodeStopped)?;
++            let block = match self.requester.get_block(hash).await {
++                Ok(block) => block,
++                // Reorganized out of the best chain since its filter matched, before or after the
++                // node took the request: the blocks that replace it have their own filters.
++                Err(FetchBlockError::UnknownHash) => {
++                    self.queued_blocks.remove(0);
++                    continue;
++                }
++                Err(FetchBlockError::RecvError) if self.requester.is_running() => {
++                    self.queued_blocks.remove(0);
++                    continue;
++                }
++                Err(_) => return Err(UpdateError::NodeStopped),
++            };
+             if let Some(single) = self.single_update_builder.as_mut() {
+                 single.apply_block_event(&block);
+             }
+-- 
+2.54.0 (Apple Git-157)
+
