@@ -1716,6 +1716,12 @@ impl Loop {
                     _ => unreachable!(),
                 };
                 let rec = c.inner.take();
+                // bdk_electrum 0.24.1 fails the sync on bytes that don't hash to their txid before the
+                // screen below sees them; the source is suspect all the same.
+                if r.is_err() && !rec.mismatched.is_empty() {
+                    let d = format!("{} transaction(s) whose bytes don't hash to their txid", rec.mismatched.len());
+                    self.mark_suspect(&src.id, &d);
+                }
                 let (update, last) = r.map_err(|e| e.to_string())?;
                 (update, last, rec.mismatched, rec.proofs)
             }

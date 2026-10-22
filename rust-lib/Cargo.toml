@@ -14,15 +14,15 @@ exclude = ["vendor"]
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-# The BDK cohort: bdk_wallet 3.2.0 pins bdk_chain 0.23.3, whose store pins rusqlite 0.31.
+# The BDK cohort: bdk_wallet 3.2.0 on bdk_chain 0.23.4, whose store pins rusqlite 0.31.
 bdk_wallet = { version = "=3.2.0", features = ["rusqlite"] }
-bdk_electrum = { version = "=0.24.0", default-features = false, features = ["use-rustls-ring"] }
-bdk_esplora = { version = "=0.22.2", default-features = false, features = ["std", "async-https-rustls", "tokio"] }
+bdk_electrum = { version = "=0.24.1", default-features = false, features = ["use-rustls-ring"] }
+bdk_esplora = { version = "=0.22.3", default-features = false, features = ["std", "async-https-rustls", "tokio"] }
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 # Kyoto, the light client: bdk_kyoto 0.18.1 on bip157 0.7.0 with our patches (see [patch] below).
 bdk_kyoto = "=0.18.1"
 # The local node: bitcoind_module's rpc over Logos IPC behind bitcoincore_rpc's RpcApi.
-bdk_bitcoind_rpc = "=0.22.0"
+bdk_bitcoind_rpc = "=0.22.1"
 # Pinned certificates: our own verifier on the rustls that electrum-client and esplora-client's
 # reqwest use; a pinned Esplora server gets a reqwest client of ours with that verifier.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

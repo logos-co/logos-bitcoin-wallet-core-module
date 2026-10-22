@@ -1,8 +1,8 @@
 # logos-bitcoin-wallet-core-module
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
-bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.0, `bdk_esplora` 0.22.2, `bdk_kyoto` 0.18.1
-with three patches on `bip157` 0.7.0 with six, `bdk_bitcoind_rpc` 0.22.0), running as a Rust module inside
+bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_esplora` 0.22.3, `bdk_kyoto` 0.18.1
+with three patches on `bip157` 0.7.0 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -302,9 +302,10 @@ Requests carry no chain tip (`SyncRequest::builder_at`, `FullScanRequest::builde
 are applied with `chain: None`. Then (`checks.rs`):
 
 - **Re-hash.** A wrapper around the Electrum client (`net::Checked`) re-hashes every transaction
-  against the txid it was asked for; a mismatch drops the transaction and its anchors and marks the
-  source suspect. Transactions nothing refers to, and anchors for transactions nobody sent, are left
-  out too (the Esplora path's check).
+  against the txid it was asked for; a mismatch drops the transaction and its anchors, or the whole
+  answer where bdk_electrum 0.24.1 refuses it first, and marks the source suspect. Transactions
+  nothing refers to, and anchors for transactions nobody sent, are left out too (the Esplora path's
+  check).
 - **Anchors** against the authority: kept on a match once the proof below holds; held above its
   tip (`waiting`, pending meanwhile) until the chain reaches the block and the server's next answer
   proves the transaction against that header, never on the block hash alone; dropped on a
@@ -802,7 +803,7 @@ system-DLL gate. `packages.x86_64-windows.test-bin` holds `storage.exe` (spike 4
 `p2p_proxy.exe`; both import only Windows' own DLLs. CI runs `storage.exe` under wine and on
 windows-latest.
 
-- **aws-lc-sys stays in the build.** electrum-client 0.25.0 spells its `rustls-ring` feature
+- **aws-lc-sys stays in the build.** electrum-client 0.25.2 spells its `rustls-ring` feature
   `rustls/ring`, which also turns on its own `rustls` feature and so `rustls/default`: no choice of
   features drops aws-lc-rs (`rustls?/ring` upstream would). It crosses with the builder's
   winpthreads include, and ring is the provider installed at run time. Its jitterentropy marks
