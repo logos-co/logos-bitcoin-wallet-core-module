@@ -1,7 +1,7 @@
-From 3d1daaa55dda6dcd355f83912a48bde9b355b629 Mon Sep 17 00:00:00 2001
+From e8c25c6054e4bd37cea6b93152d974b0af41fb51 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sun, 11 Oct 2026 17:53:02 -0300
-Subject: [PATCH 4/4] feat(sync): widen the scripts in place, and start from a
+Subject: [PATCH 3/3] feat(sync): widen the scripts in place, and start from a
  chain state
 
 UpdateSubscriber::widen_handle() takes the last index to watch per
@@ -167,7 +167,7 @@ index 869342b..d27f10b 100644
      match network {
          Network::Bitcoin => HashCheckpoint::taproot_activation(),
 diff --git a/src/lib.rs b/src/lib.rs
-index de9fb19..08481ea 100644
+index 3fa586f..f92037e 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -35,6 +35,7 @@
@@ -243,7 +243,7 @@ index de9fb19..08481ea 100644
      /// Whether the last update came with filters synced to the tip, not at a checkpoint.
      pub fn synced(&self) -> bool {
          self.synced
-@@ -517,6 +549,18 @@ impl UpdateBuilder {
+@@ -498,6 +530,18 @@ impl UpdateBuilder {
          }
      }
  

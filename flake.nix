@@ -38,13 +38,13 @@
           diff -r patched ${./rust-lib/vendor/bip157}
           echo "bip157 0.7.0 + $(ls ${./patches/bip157} | wc -l) patches" > $out
         '';
-      # The same for bdk_kyoto 0.18.0, patches/bdk_kyoto and tools/kyoto/patch-bdk_kyoto.sh.
+      # The same for bdk_kyoto 0.18.1, patches/bdk_kyoto and tools/kyoto/patch-bdk_kyoto.sh.
       bdkKyotoCheck = system:
         let pkgs = nixpkgs.legacyPackages.${system}; in
-        pkgs.runCommand "bdk_kyoto-0.18.0-patches-check" {
+        pkgs.runCommand "bdk_kyoto-0.18.1-patches-check" {
           crate = pkgs.fetchurl {
-            url = "https://static.crates.io/crates/bdk_kyoto/bdk_kyoto-0.18.0.crate";
-            sha256 = "cb06429fe9ed238f12bff092ae5cbb34ae51e647486d148fa51744d6e4b289d5";
+            url = "https://static.crates.io/crates/bdk_kyoto/bdk_kyoto-0.18.1.crate";
+            sha256 = "dc48e8d5e9301e29f3d60a25f897e3d6d4a3a7eada671a55239e8f22bf81eab4";
           };
           nativeBuildInputs = [ pkgs.git pkgs.gnutar pkgs.gzip pkgs.diffutils ];
         } ''
@@ -53,7 +53,7 @@
           tar xzf $crate -C pristine --strip-components=1
           bash ${./tools/kyoto/patch-bdk_kyoto.sh} pristine patched ${./patches/bdk_kyoto}
           diff -r patched ${./rust-lib/vendor/bdk_kyoto}
-          echo "bdk_kyoto 0.18.0 + $(ls ${./patches/bdk_kyoto} | wc -l) patches" > $out
+          echo "bdk_kyoto 0.18.1 + $(ls ${./patches/bdk_kyoto} | wc -l) patches" > $out
         '';
       # tools/regtest/chain.sh with bitcoind and electrs, for harnesses outside this repository.
       regtestChain = system:

@@ -1,4 +1,4 @@
-//! Kyoto, the BIP157/158 light client, as a chain authority: bdk_kyoto 0.18.0 on bip157 0.7.0
+//! Kyoto, the BIP157/158 light client, as a chain authority: bdk_kyoto 0.18.1 on bip157 0.7.0
 //! with our patches. Each start dials 8 of the node module's peers, whitelist only, chosen as
 //! `peers::choose` says, and reports back how each did; on `regtest.json`'s peers, a random 8,
 //! and a peer that fails 3 starts is skipped for a day. README, "Kyoto", has the rules and why.
