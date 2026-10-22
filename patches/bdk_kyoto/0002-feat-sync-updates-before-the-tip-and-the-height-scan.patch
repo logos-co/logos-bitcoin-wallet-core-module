@@ -1,4 +1,4 @@
-From 62f74738c13b9e1c72bfc4c0390a8f2bf63283c5 Mon Sep 17 00:00:00 2001
+From b9d95295360a98bf285f8c615b446211340d4520 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sun, 11 Oct 2026 05:33:02 -0300
 Subject: [PATCH 2/3] feat(sync): updates before the tip, and the height
@@ -14,7 +14,7 @@ there instead of starting over.
  1 file changed, 55 insertions(+), 11 deletions(-)
 
 diff --git a/src/lib.rs b/src/lib.rs
-index f0f4333..59ca38c 100644
+index c20f481..3fa586f 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -257,6 +257,12 @@ pub struct UpdateSubscriber<W: Wallets> {
@@ -30,7 +30,7 @@ index f0f4333..59ca38c 100644
      // processes events for the wallet.
      single_update_builder: Option<UpdateBuilder>,
      // process events for multiple wallets.
-@@ -281,6 +287,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+@@ -282,6 +288,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
              multiple_updates_builder: None,
              queued_blocks: Vec::new(),
              spk_cache,
@@ -41,7 +41,7 @@ index f0f4333..59ca38c 100644
              _marker: core::marker::PhantomData,
          }
      }
-@@ -311,6 +321,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+@@ -313,6 +323,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
              multiple_updates_builder: Some(update_map),
              queued_blocks: Vec::new(),
              spk_cache,
@@ -52,7 +52,7 @@ index f0f4333..59ca38c 100644
              _marker: core::marker::PhantomData,
          }
      }
-@@ -323,6 +337,15 @@ impl<W: Wallets> UpdateSubscriber<W> {
+@@ -325,6 +339,15 @@ impl<W: Wallets> UpdateSubscriber<W> {
                      if filter.contains_any(self.spk_cache.iter()) {
                          self.queued_blocks.push((filter.height(), block_hash));
                      }
@@ -68,7 +68,7 @@ index f0f4333..59ca38c 100644
                  }
                  Event::ChainUpdate(changeset) => {
                      if let Some(single) = self.single_update_builder.as_mut() {
-@@ -335,20 +358,14 @@ impl<W: Wallets> UpdateSubscriber<W> {
+@@ -337,20 +360,14 @@ impl<W: Wallets> UpdateSubscriber<W> {
                      }
                  }
                  Event::FiltersSynced(SyncUpdate {
@@ -94,7 +94,7 @@ index f0f4333..59ca38c 100644
                      return Ok(());
                  }
              }
-@@ -358,6 +375,33 @@ impl<W: Wallets> UpdateSubscriber<W> {
+@@ -360,6 +377,33 @@ impl<W: Wallets> UpdateSubscriber<W> {
  }
  
  impl<W: Wallets> UpdateSubscriber<W> {

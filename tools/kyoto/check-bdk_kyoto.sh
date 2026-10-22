@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Checks rust-lib/vendor/bdk_kyoto is bdk_kyoto 0.18.0 plus patches/bdk_kyoto, byte for byte,
+# Checks rust-lib/vendor/bdk_kyoto is bdk_kyoto 0.18.1 plus patches/bdk_kyoto, byte for byte,
 # outside Nix. With --update, rewrites the vendored tree from the patches instead.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-url=https://static.crates.io/crates/bdk_kyoto/bdk_kyoto-0.18.0.crate
-sha=cb06429fe9ed238f12bff092ae5cbb34ae51e647486d148fa51744d6e4b289d5
+url=https://static.crates.io/crates/bdk_kyoto/bdk_kyoto-0.18.1.crate
+sha=dc48e8d5e9301e29f3d60a25f897e3d6d4a3a7eada671a55239e8f22bf81eab4
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

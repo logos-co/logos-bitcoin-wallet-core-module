@@ -128,8 +128,8 @@ impl BitcoinWalletCoreModuleImpl {
 impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
     fn version(&self) -> String {
         json!({"ok": true, "version": env!("CARGO_PKG_VERSION"),
-               "crates": {"bdk_wallet": "3.2.0", "bdk_electrum": "0.24.0", "bdk_esplora": "0.22.2", "bdk_kyoto": "0.18.0",
-                          "bip157": "0.7.0+logos.4", "bdk_bitcoind_rpc": "0.22.0"}})
+               "crates": {"bdk_wallet": "3.2.0", "bdk_electrum": "0.24.1", "bdk_esplora": "0.22.3", "bdk_kyoto": "0.18.1",
+                          "bip157": "0.7.0+logos.4", "bdk_bitcoind_rpc": "0.22.1"}})
         .to_string()
     }
 

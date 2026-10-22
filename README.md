@@ -1,8 +1,8 @@
 # logos-bitcoin-wallet-core-module
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
-bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.0, `bdk_esplora` 0.22.2, `bdk_kyoto` 0.18.0
-with three patches on `bip157` 0.7.0 with four, `bdk_bitcoind_rpc` 0.22.0), running as a Rust module inside
+bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_esplora` 0.22.3, `bdk_kyoto` 0.18.1
+with three patches on `bip157` 0.7.0 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -154,7 +154,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with six, below
+bdk_kyoto 0.18.1 with three patches on bip157 0.7.0 (published from 0169dc3) with six, below
 (`kyoto.rs`, `peers.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
@@ -194,12 +194,12 @@ bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with
   run got somewhere, else backing off up to 2 minutes.
 - bdk_kyoto copies the wallet's address index when the client is built, so it watches the revealed
   addresses plus 25, or more after a rescan. When the wallet reveals past those, the running client
-  watches them from its next filter on (bdk_kyoto patch 4; `status.kyoto.rebuilds` counts these).
+  watches them from its next filter on (bdk_kyoto patch 3; `status.kyoto.rebuilds` counts these).
   Matched blocks are applied in height order (patch 1), so a spend meets its coin.
 - A scan from the birthday keeps the fewest indices any of its clients watched (`kyoto_window`).
   When it reaches the tip and the wallet used an address within the gap limit (`gapLimit`) of them, earlier
   blocks may pay addresses it never watched: it scans again from the birthday, watching about twice
-  the highest used index (patch 3 indexes every one), until the window holds
+  the highest used index (bdk_kyoto 0.18.1 indexes every one), until the window holds
   (`status.kyoto.rescans`); the regtest restores below, to index 150 out of order, take two. Each
   pass after the first runs in place: the client keeps its header chain and the filter headers its
   quorum agreed on (bip157 patch 5) and fetches only the filters again (`widen` below). Only
@@ -213,7 +213,7 @@ bdk_kyoto 0.18.0 with four patches on bip157 0.7.0 (published from 0169dc3) with
   2,016 or more at a time as they come, so a restart starts from the stored chain, then scans
   filters from the birthday (`rescan_from`). The chain starts at or below the birthday, so Kyoto
   always starts on it. Kyoto's chain is built from the authority's headers from its start to 8
-  below the tip (`ChainState::Snapshot`, bdk_kyoto patch 4): it downloads only those 8, so a reorg
+  below the tip (`ChainState::Snapshot`, bdk_kyoto patch 3): it downloads only those 8, so a reorg
   among them shows in its update. While a scan from the birthday runs, a restart holds the headers
   from the block before the birthday and goes on scanning from where it stopped, so the scan can
   still start over in place.
@@ -275,7 +275,7 @@ and the module's Rust build depends on that check; `tools/kyoto/check-bip157.sh`
 without Nix (`--update` rewrites the vendored tree). Run against the published crate, the quorum
 and tip tests fail: that is the bug. Nothing has been sent upstream.
 
-`patches/bdk_kyoto/` holds four on bdk_kyoto 0.18.0, in `src/lib.rs` and `src/builder.rs`, the two
+`patches/bdk_kyoto/` holds three on bdk_kyoto 0.18.1, in `src/lib.rs` and `src/builder.rs`, the two
 files `tools/kyoto/patch-bdk_kyoto.sh` allows:
 
 1. matched blocks applied oldest first: the published crate drains them newest first
@@ -283,17 +283,18 @@ files `tools/kyoto/patch-bdk_kyoto.sh` allows:
    so a restore lost every spend whose coin came in the same update;
 2. `UpdateSubscriber::checkpoint_every(n)`: an update every n filters as well as at the tip, with
    `scanned()` (the last filter's height) and `synced()` (at the tip or not);
-3. every script the filters are checked against is indexed (`lookahead_to_target`): with a
-   recovery lookahead past the wallet's own 25, a matched block's transaction read as irrelevant
-   and was dropped;
-4. widening in place: `UpdateSubscriber::widen_handle()` takes the last index to watch per
+3. widening in place: `UpdateSubscriber::widen_handle()` takes the last index to watch per
    keychain, one the wallet revealed since the node was built included, and the scripts through it
    are indexed and checked from the next event on; `BuilderExt::build_with_wallet_from` builds a
    node on a given `ChainState`, such as headers the wallet already holds.
 
+0.18.1 indexes every script the filters are checked against (`extend_index_to_policy`), which our
+patch 3 on 0.18.0 did: with a recovery lookahead past the wallet's own 25, a matched block's
+transaction read as irrelevant and was dropped.
+
 `rust-lib/vendor/bdk_kyoto` is the result, checked the same way (`nix build .#bdk_kyoto-check`,
-`tools/kyoto/check-bdk_kyoto.sh`); the regtest restores below fail without patches 1 and 3. Nothing
-has been sent upstream.
+`tools/kyoto/check-bdk_kyoto.sh`); the regtest restores below fail without patch 1, and on 0.18.0
+without that indexing. Nothing has been sent upstream.
 
 ## Before a server's answer is applied
 
@@ -301,9 +302,10 @@ Requests carry no chain tip (`SyncRequest::builder_at`, `FullScanRequest::builde
 are applied with `chain: None`. Then (`checks.rs`):
 
 - **Re-hash.** A wrapper around the Electrum client (`net::Checked`) re-hashes every transaction
-  against the txid it was asked for; a mismatch drops the transaction and its anchors and marks the
-  source suspect. Transactions nothing refers to, and anchors for transactions nobody sent, are left
-  out too (the Esplora path's check).
+  against the txid it was asked for; a mismatch drops the transaction and its anchors, or the whole
+  answer where bdk_electrum 0.24.1 refuses it first, and marks the source suspect. Transactions
+  nothing refers to, and anchors for transactions nobody sent, are left out too (the Esplora path's
+  check).
 - **Anchors** against the authority: kept on a match once the proof below holds; held above its
   tip (`waiting`, pending meanwhile) until the chain reaches the block and the server's next answer
   proves the transaction against that header, never on the block hash alone; dropped on a
@@ -670,7 +672,8 @@ heights, with no alert. Behind a front that answers no header they show `uncheck
 `unchecked_anchor` alert, and stay so when a new block moves the chain, the one in the block just
 below the checkpoint too: the checkpoint names that block's hash, not its transactions. Against
 bdk_kyoto without patch 1 the Kyoto restore misses a sweep of a coin that came the block before;
-without patch 3, payments past the wallet's own lookahead; without both, 8 of 24 transactions.
+on 0.18.0 without the indexing 0.18.1 brings, payments past the wallet's own lookahead; without
+both, 8 of 24 transactions.
 
 `anchors` has servers lie about a payment from Core's mempool: confirmed in a real, empty block,
 with its coinbase's empty branch for a proof. Esplora lies through `common::http_front`, which
@@ -800,7 +803,7 @@ system-DLL gate. `packages.x86_64-windows.test-bin` holds `storage.exe` (spike 4
 `p2p_proxy.exe`; both import only Windows' own DLLs. CI runs `storage.exe` under wine and on
 windows-latest.
 
-- **aws-lc-sys stays in the build.** electrum-client 0.25.0 spells its `rustls-ring` feature
+- **aws-lc-sys stays in the build.** electrum-client 0.25.2 spells its `rustls-ring` feature
   `rustls/ring`, which also turns on its own `rustls` feature and so `rustls/default`: no choice of
   features drops aws-lc-rs (`rustls?/ring` upstream would). It crosses with the builder's
   winpthreads include, and ring is the provider installed at run time. Its jitterentropy marks

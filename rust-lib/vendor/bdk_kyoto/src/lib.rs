@@ -282,7 +282,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
         graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
     ) -> UpdateSubscriber<wallets::Single> {
         let mut update_builder = UpdateBuilder::new(cp, graph);
-        update_builder.index_to_policy(policy);
+        update_builder.extend_index_to_policy(policy);
         let spk_cache = update_builder.peek_scripts_from_policy(policy);
         UpdateSubscriber {
             requester,
@@ -316,7 +316,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
         let mut spk_cache = HashSet::new();
         for wallet in wallet_iter {
             let mut update_builder = UpdateBuilder::new(wallet.2, wallet.3);
-            update_builder.index_to_policy(wallet.1);
+            update_builder.extend_index_to_policy(wallet.1);
             spk_cache.extend(update_builder.peek_scripts_from_policy(wallet.1));
             update_map.insert(wallet.0, update_builder);
         }
@@ -530,25 +530,6 @@ impl UpdateBuilder {
         }
     }
 
-    // Filters are checked against every script the policy peeks, which can reach past the index's
-    // own lookahead: the index derives them all, or a matched block's transaction reads as irrelevant.
-    fn index_to_policy(&mut self, policy: SyncPolicy) {
-        let n = match policy {
-            SyncPolicy::Recovery {
-                used_script_index, ..
-            } => used_script_index,
-            SyncPolicy::SyncFromLast { lookahead: Some(n) } => n,
-            _ => return,
-        };
-        let revealed = self.graph.index.last_revealed_indices();
-        for keychain in [KeychainKind::External, KeychainKind::Internal] {
-            let top = revealed.get(&keychain).copied().unwrap_or(0).saturating_add(n);
-            if let Some(top) = top.checked_sub(1) {
-                let _ = self.graph.index.lookahead_to_target(keychain, top);
-            }
-        }
-    }
-
     // Indexes each keychain's scripts through its target, and returns them all from index 0.
     fn watch_to(&mut self, targets: &BTreeMap<KeychainKind, u32>) -> HashSet<ScriptBuf> {
         let mut scripts = HashSet::new();
@@ -565,6 +546,26 @@ impl UpdateBuilder {
         let height = block.height;
         let block = &block.block;
         let _ = self.graph.apply_block_relevant(block, height);
+    }
+
+    // Derive the scripts a sync policy checks filters against into the index, when they go
+    // beyond the wallet's lookahead. Otherwise blocks matched by those scripts would be applied
+    // without their transactions. Covers the same range as `peek_scripts`.
+    fn extend_index_to_policy(&mut self, policy: SyncPolicy) {
+        let to_index = match policy {
+            SyncPolicy::SyncFromLast { lookahead: Some(n) } => n,
+            SyncPolicy::Recovery {
+                used_script_index, ..
+            } => used_script_index,
+            SyncPolicy::NewWallet | SyncPolicy::SyncFromLast { lookahead: None } => return,
+        };
+        let index = &mut self.graph.index;
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            let last_revealed = index.last_revealed_index(keychain).unwrap_or(0);
+            if let Some(target) = last_revealed.saturating_add(to_index).checked_sub(1) {
+                let _ = index.lookahead_to_target(keychain, target);
+            }
+        }
     }
 
     #[inline]

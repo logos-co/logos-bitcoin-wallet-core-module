@@ -47,7 +47,7 @@ jobs:
       - name: The vendored bip157 is 0.7.0 plus patches/bip157, within the allowlist
         run: tools/kyoto/check-bip157.sh
 
-      - name: The vendored bdk_kyoto is 0.18.0 plus patches/bdk_kyoto, within the allowlist
+      - name: The vendored bdk_kyoto is 0.18.1 plus patches/bdk_kyoto, within the allowlist
         run: tools/kyoto/check-bdk_kyoto.sh
 
       - name: cargo test --no-default-features
