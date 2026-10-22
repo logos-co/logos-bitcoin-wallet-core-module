@@ -1,7 +1,7 @@
-From b9d95295360a98bf285f8c615b446211340d4520 Mon Sep 17 00:00:00 2001
+From 37f42a99239f64819a19150750b7470ff7db8733 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sun, 11 Oct 2026 05:33:02 -0300
-Subject: [PATCH 2/3] feat(sync): updates before the tip, and the height
+Subject: [PATCH 2/4] feat(sync): updates before the tip, and the height
  scanned
 
 UpdateSubscriber::checkpoint_every(n) also yields an update after every n

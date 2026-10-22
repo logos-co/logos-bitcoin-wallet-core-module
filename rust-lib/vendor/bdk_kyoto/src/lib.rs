@@ -49,6 +49,7 @@ use bdk_wallet::KeychainKind;
 pub extern crate bip157;
 
 use bip157::chain::BlockHeaderChanges;
+use bip157::error::FetchBlockError;
 use bip157::tokio;
 use bip157::IndexedBlock;
 use bip157::ScriptBuf;
@@ -441,11 +442,20 @@ impl<W: Wallets> UpdateSubscriber<W> {
     async fn apply_queued_blocks(&mut self) -> Result<(), UpdateError> {
         self.queued_blocks.sort_by_key(|(height, _)| *height);
         while let Some(&(_, hash)) = self.queued_blocks.first() {
-            let block = self
-                .requester
-                .get_block(hash)
-                .await
-                .map_err(|_| UpdateError::NodeStopped)?;
+            let block = match self.requester.get_block(hash).await {
+                Ok(block) => block,
+                // Reorganized out of the best chain since its filter matched, before or after the
+                // node took the request: the blocks that replace it have their own filters.
+                Err(FetchBlockError::UnknownHash) => {
+                    self.queued_blocks.remove(0);
+                    continue;
+                }
+                Err(FetchBlockError::RecvError) if self.requester.is_running() => {
+                    self.queued_blocks.remove(0);
+                    continue;
+                }
+                Err(_) => return Err(UpdateError::NodeStopped),
+            };
             if let Some(single) = self.single_update_builder.as_mut() {
                 single.apply_block_event(&block);
             }
