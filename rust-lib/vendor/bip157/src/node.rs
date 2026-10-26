@@ -78,7 +78,7 @@ impl Node {
         } = config;
         // Set up a communication channel between the node and client
         let (info_tx, info_rx) = mpsc::channel::<Info>(32);
-        let (warn_tx, warn_rx) = mpsc::unbounded_channel::<Warning>();
+        let (warn_tx, warn_rx) = mpsc::channel::<Warning>(512);
         let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
         let (ctx, crx) = mpsc::unbounded_channel::<ClientMessage>();
         let client = Client::new(info_rx, warn_rx, event_rx, ctx);
@@ -117,7 +117,7 @@ impl Node {
                 peer_map,
                 required_peers: required_peers.into(),
                 dialog,
-                block_queue: BlockQueue::new(),
+                block_queue: BlockQueue::new(peer_timeout_config.response_timeout),
                 client_recv: crx,
                 peer_recv: mrx,
                 headers_only_sync,
@@ -138,15 +138,16 @@ impl Node {
             self.required_peers
         ));
         let mut last_block = LastBlockMonitor::new();
+        last_block.reset();
         let mut interval = tokio::time::interval(LOOP_TIMEOUT);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             // Try to advance the state of the node
-            self.advance_state(&mut last_block).await;
+            self.advance_state(&mut last_block);
             // Connect to more peers if we need them and remove old connections
             self.dispatch().await?;
             // If there are blocks we need in the queue, we should request them of a random peer
-            self.get_blocks().await;
+            self.get_blocks();
             // Either handle a message from a remote peer or from our client
             select! {
                 peer = self.peer_recv.recv() => {
@@ -156,15 +157,19 @@ impl Node {
                                 PeerMessage::Version(version) => {
                                     self.peer_map.set_services(peer_thread.nonce, version.services);
                                     let response = self.handle_version(peer_thread.nonce, version).await?;
-                                    self.peer_map.send_message(peer_thread.nonce, response).await;
+                                    self.peer_map.send_message(peer_thread.nonce, response);
                                     crate::debug!(format!("[{}]: version", peer_thread.nonce));
                                 }
                                 PeerMessage::Headers(headers) => {
-                                    last_block.reset();
+                                    let previous_tip = self.chain.header_chain.tip_hash();
                                     crate::debug!(format!("[{}]: headers", peer_thread.nonce));
-                                    match self.handle_headers(peer_thread.nonce, headers).await {
+                                    let response = self.handle_headers(peer_thread.nonce, headers).await;
+                                    if self.chain.header_chain.tip_hash() != previous_tip {
+                                        last_block.reset();
+                                    }
+                                    match response {
                                         Some(response) => {
-                                            self.peer_map.send_message(peer_thread.nonce, response).await;
+                                            self.peer_map.send_message(peer_thread.nonce, response);
                                         }
                                         None => continue,
                                     }
@@ -173,7 +178,7 @@ impl Node {
                                     crate::debug!(format!("[{}]: filter headers", peer_thread.nonce));
                                     match self.handle_cf_headers(peer_thread.nonce, cf_headers).await {
                                         Some(response) => {
-                                            self.peer_map.broadcast(response).await;
+                                            self.peer_map.broadcast(response);
                                         }
                                         None => continue,
                                     }
@@ -181,14 +186,14 @@ impl Node {
                                 PeerMessage::Filter(filter) => {
                                     match self.handle_filter(peer_thread.nonce, filter).await {
                                         Some(response) => {
-                                            self.peer_map.send_message(peer_thread.nonce, response).await;
+                                            self.peer_map.send_message(peer_thread.nonce, response);
                                         }
                                         None => continue,
                                     }
                                 }
                                 PeerMessage::Block(block) => match self.handle_block(peer_thread.nonce, block).await {
                                     Some(response) => {
-                                        self.peer_map.send_message(peer_thread.nonce, response).await;
+                                        self.peer_map.send_message(peer_thread.nonce, response);
                                     }
                                     None => continue,
                                 },
@@ -196,7 +201,7 @@ impl Node {
                                     crate::debug!(format!("[{}]: inv", peer_thread.nonce));
                                     match self.handle_inventory_blocks(blocks) {
                                         Some(response) => {
-                                            self.peer_map.send_message(peer_thread.nonce, response).await;
+                                            self.peer_map.send_message(peer_thread.nonce, response);
                                         }
                                         None => continue,
                                     }
@@ -218,11 +223,12 @@ impl Node {
                             },
                             ClientMessage::Rescan(height_opt) => {
                                 if let Some(response) = self.rescan(height_opt) {
-                                    self.peer_map.broadcast(response).await;
+                                    self.peer_map.broadcast(response);
                                 }
                             },
                             ClientMessage::GetBlock(request) => {
-                                let height_opt = self.chain.header_chain.height_of_hash(request.data());
+                                let (block_hash, _) = request.data();
+                                let height_opt = self.chain.header_chain.height_of_hash(block_hash);
                                 if height_opt.is_none() {
                                     let (_, oneshot) = request.into_values();
                                     let err_reponse = oneshot.send(Err(FetchBlockError::UnknownHash));
@@ -231,7 +237,7 @@ impl Node {
                                     }
                                 } else {
                                     crate::debug!(
-                                        format!("Adding block {} to queue", request.data())
+                                        format!("Adding block {} to queue", block_hash)
                                     );
                                     self.block_queue.add(request);
                                 }
@@ -293,7 +299,7 @@ impl Node {
                                 };
                             }
                             ClientMessage::UnsubscribeGossip => {
-                                self.peer_map.unsubscribe_from_gossip().await;
+                                self.peer_map.unsubscribe_from_gossip();
                             }
                             ClientMessage::NoOp => (),
                         }
@@ -336,10 +342,10 @@ impl Node {
     }
 
     // If there are blocks in the queue, we should request them of a random peer
-    async fn get_blocks(&mut self) {
+    fn get_blocks(&mut self) {
         if let Some(block_request) = self.pop_block_queue() {
             crate::debug!("Sending block request to random peer");
-            self.peer_map.send_random(block_request).await;
+            self.peer_map.send_random(block_request);
         }
     }
 
@@ -351,12 +357,11 @@ impl Node {
         drop(queue);
         crate::debug!("Sending transaction to a random peer");
         self.peer_map
-            .send_random(MainThreadMessage::BroadcastPending)
-            .await;
+            .send_random(MainThreadMessage::BroadcastPending);
     }
 
     // Try to continue with the syncing process
-    async fn advance_state(&mut self, last_block: &mut LastBlockMonitor) {
+    fn advance_state(&mut self, last_block: &mut LastBlockMonitor) {
         match self.state {
             // This state is updated upon receiving new block headers
             NodeState::Behind => (),
@@ -381,7 +386,7 @@ impl Node {
                 if last_block.stale() {
                     self.dialog.send_warning(Warning::PotentialStaleTip);
                     crate::debug!("Disconnecting from remote nodes to find new connections");
-                    self.peer_map.broadcast(MainThreadMessage::Disconnect).await;
+                    self.peer_map.broadcast(MainThreadMessage::Disconnect);
                     last_block.reset();
                 }
             }
@@ -409,7 +414,7 @@ impl Node {
 
     // After we receiving some chain-syncing message, we decide what chain of data needs to be
     // requested next.
-    async fn next_stateful_message(&mut self) -> Option<MainThreadMessage> {
+    fn next_stateful_message(&mut self) -> Option<MainThreadMessage> {
         if self.state == NodeState::Behind {
             let headers = GetHeadersMessage {
                 version: WTXID_VERSION,
@@ -456,24 +461,18 @@ impl Node {
         self.peer_map.tried(nonce).await;
         // First we signal for ADDRV2 support
         self.peer_map
-            .send_message(nonce, MainThreadMessage::SendAddrV2)
-            .await;
+            .send_message(nonce, MainThreadMessage::SendAddrV2);
         // Then for BIP 339 witness transaction broadcast
         self.peer_map
-            .send_message(nonce, MainThreadMessage::WtxidRelay)
-            .await;
+            .send_message(nonce, MainThreadMessage::WtxidRelay);
+        self.peer_map.send_message(nonce, MainThreadMessage::Verack);
         self.peer_map
-            .send_message(nonce, MainThreadMessage::Verack)
-            .await;
-        self.peer_map
-            .send_message(nonce, MainThreadMessage::SendHeaders)
-            .await;
+            .send_message(nonce, MainThreadMessage::SendHeaders);
         // Request peer addresses unless restricted to the whitelist only, or to report them.
         if !self.peer_map.whitelist_only || self.peer_map.report_peers {
             crate::debug!("Requesting new addresses");
             self.peer_map
-                .send_message(nonce, MainThreadMessage::GetAddr)
-                .await;
+                .send_message(nonce, MainThreadMessage::GetAddr);
         }
         // Inform the user we are connected to all required peers
         if self.peer_map.live().eq(&self.required_peers) {
@@ -501,7 +500,8 @@ impl Node {
                     if self.state != NodeState::Behind {
                         self.state = NodeState::Behind;
                     }
-                    self.chain.send_chain_update();
+                    self.dialog
+                        .send_info(Info::NewChainHeight(self.chain.header_chain.height()));
                 }
                 HeaderSyncEffect::Empty => {
                     if self.state == NodeState::Behind {
@@ -512,7 +512,8 @@ impl Node {
                     if self.state != NodeState::HeadersSynced {
                         self.state = NodeState::HeadersSynced;
                     }
-                    self.chain.send_chain_update();
+                    self.dialog
+                        .send_info(Info::NewChainHeight(self.chain.header_chain.height()));
                     self.block_queue.remove(&reorgs);
                 }
             },
@@ -524,7 +525,7 @@ impl Node {
                 return Some(MainThreadMessage::Disconnect);
             }
         }
-        self.next_stateful_message().await
+        self.next_stateful_message()
     }
 
     // Compact filter headers may result in a number of outcomes, including the need to audit filters.
@@ -533,11 +534,10 @@ impl Node {
         peer_id: PeerId,
         cf_headers: CFHeaders,
     ) -> Option<MainThreadMessage> {
-        self.chain.send_chain_update();
         match self.chain.sync_cf_headers(peer_id, cf_headers) {
             Ok(potential_message) => match potential_message {
                 CFHeaderChanges::AddedToQueue => None,
-                CFHeaderChanges::Extended => self.next_stateful_message().await,
+                CFHeaderChanges::Extended => self.next_stateful_message(),
                 CFHeaderChanges::Conflict => {
                     self.dialog.send_warning(Warning::UnexpectedSyncError {
                         warning: "Found a conflict while peers are sending filter headers".into(),
@@ -550,7 +550,9 @@ impl Node {
                     warning: format!("Compact filter header syncing encountered an error: {e}"),
                 });
                 self.peer_map.ban(peer_id).await;
-                Some(MainThreadMessage::Disconnect)
+                self.peer_map
+                    .send_message(peer_id, MainThreadMessage::Disconnect);
+                None
             }
         }
     }
@@ -564,12 +566,9 @@ impl Node {
         match self.chain.sync_filter(filter) {
             Ok(potential_message) => {
                 let FilterCheck { was_last_in_batch } = potential_message;
-                if was_last_in_batch {
-                    self.chain.send_chain_update();
-                    if !self.chain.is_filters_synced() {
-                        let next_filters = self.chain.next_filter_message();
-                        return Some(MainThreadMessage::GetFilters(next_filters));
-                    }
+                if was_last_in_batch && !self.chain.is_filters_synced() {
+                    let next_filters = self.chain.next_filter_message();
+                    return Some(MainThreadMessage::GetFilters(next_filters));
                 }
                 None
             }
@@ -637,8 +636,9 @@ impl Node {
             self.state,
             NodeState::FilterHeadersSynced | NodeState::FiltersSynced
         ) {
-            let next_block_hash = self.block_queue.pop();
-            return next_block_hash.map(MainThreadMessage::GetBlock);
+            let next_block = self.block_queue.pop();
+            return next_block
+                .map(|(hash, block_type)| MainThreadMessage::GetBlock(hash, block_type));
         }
         None
     }

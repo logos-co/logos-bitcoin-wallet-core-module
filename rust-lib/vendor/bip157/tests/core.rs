@@ -8,7 +8,7 @@ use bip157::{
     chain::{checkpoints::HashCheckpoint, BlockHeaderChanges, ChainState},
     client::Client,
     node::Node,
-    Address, BlockHash, Event, GossipMonitorRequestBuilder, Info, ServiceFlags, Transaction,
+    BlockHash, Event, GossipMonitorRequestBuilder, Info, Package, ServiceFlags, Transaction,
     TrustedPeer, Warning,
 };
 use bitcoin::{
@@ -20,10 +20,10 @@ use bitcoin::{
     },
     secp256k1::SecretKey,
     sighash::{Prevouts, SighashCache},
-    Amount, KnownHrp, OutPoint, ScriptBuf, Sequence, TapSighashType, TxIn, TxOut, Witness,
+    Address, Amount, KnownHrp, OutPoint, ScriptBuf, Sequence, TapSighashType, TxIn, TxOut, Witness,
 };
-use corepc_node::serde_json;
-use corepc_node::{anyhow, exe_path};
+use bitcoind::serde_json;
+use bitcoind::{anyhow, exe_path};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -32,10 +32,10 @@ fn setup_debug_output() {
 }
 
 // Start the bitcoin daemon either through an environment variable or by download
-fn start_bitcoind(with_v2_transport: bool) -> anyhow::Result<(corepc_node::Node, SocketAddrV4)> {
+fn start_bitcoind(with_v2_transport: bool) -> anyhow::Result<(bitcoind::BitcoinD, SocketAddrV4)> {
     let path = exe_path()?;
-    let mut conf = corepc_node::Conf::default();
-    conf.p2p = corepc_node::P2P::Yes;
+    let mut conf = bitcoind::Conf::default();
+    conf.p2p = bitcoind::P2P::Yes;
     conf.args.push("--txindex");
     conf.args.push("--blockfilterindex");
     conf.args.push("--peerblockfilters");
@@ -49,7 +49,7 @@ fn start_bitcoind(with_v2_transport: bool) -> anyhow::Result<(corepc_node::Node,
     } else {
         conf.args.push("--v2transport=0");
     }
-    let bitcoind = corepc_node::Node::with_conf(path, &conf)?;
+    let bitcoind = bitcoind::BitcoinD::with_conf(path, &conf)?;
     let socket_addr = bitcoind.params.p2p_socket.unwrap();
     Ok((bitcoind, socket_addr))
 }
@@ -68,16 +68,16 @@ fn new_node(
     (node, client)
 }
 
-fn num_blocks(rpc: &corepc_node::Client) -> i64 {
+fn num_blocks(rpc: &bitcoind::Client) -> i64 {
     rpc.get_blockchain_info().unwrap().blocks
 }
 
-fn best_hash(rpc: &corepc_node::Client) -> BlockHash {
+fn best_hash(rpc: &bitcoind::Client) -> BlockHash {
     rpc.get_best_block_hash().unwrap().block_hash().unwrap()
 }
 
 async fn mine_blocks(
-    rpc: &corepc_node::Client,
+    rpc: &bitcoind::Client,
     miner: &bitcoin::Address<NetworkChecked>,
     num_blocks: usize,
     time: u64,
@@ -86,7 +86,7 @@ async fn mine_blocks(
     tokio::time::sleep(Duration::from_secs(time)).await;
 }
 
-async fn invalidate_block(rpc: &corepc_node::Client, hash: &bitcoin::BlockHash) {
+async fn invalidate_block(rpc: &bitcoind::Client, hash: &bitcoin::BlockHash) {
     let value = serde_json::to_value(hash).unwrap();
     rpc.call::<()>("invalidateblock", &[value]).unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -106,7 +106,7 @@ async fn sync_assert(best: &bitcoin::BlockHash, channel: &mut UnboundedReceiver<
     }
 }
 
-async fn print_logs(mut info_rx: Receiver<Info>, mut warn_rx: UnboundedReceiver<Warning>) {
+async fn print_logs(mut info_rx: Receiver<Info>, mut warn_rx: Receiver<Warning>) {
     loop {
         tokio::select! {
             log = info_rx.recv() => {
@@ -667,6 +667,126 @@ async fn tx_can_broadcast() {
         .unwrap();
 }
 
+fn sign_key_spend(unsigned_tx: Transaction, keypair: &Keypair, prevout: TxOut) -> Transaction {
+    let secp = Secp256k1::new();
+    let sighash_type = TapSighashType::Default;
+    let prevouts = vec![prevout];
+    let prevouts = Prevouts::All(&prevouts);
+    let mut unsigned_tx = unsigned_tx;
+    let mut sighasher = SighashCache::new(&mut unsigned_tx);
+    let sighash = sighasher
+        .taproot_key_spend_signature_hash(0, &prevouts, sighash_type)
+        .unwrap();
+    let tweaked: bitcoin::key::TweakedKeypair = keypair.tap_tweak(&secp, None);
+    let msg = bitcoin::secp256k1::Message::from(sighash);
+    let signature = secp.sign_schnorr(&msg, &tweaked.to_keypair());
+    let signature = bitcoin::taproot::Signature {
+        signature,
+        sighash_type,
+    };
+    *sighasher.witness_mut(0).unwrap() = Witness::p2tr_key_spend(&signature);
+    sighasher.into_transaction().to_owned()
+}
+
+#[tokio::test]
+async fn one_parent_one_child_can_broadcast() {
+    setup_debug_output();
+    let amount_to_us = Amount::from_sat(100_000);
+    let child_fee = Amount::from_sat(2_000);
+    let (bitcoind, socket_addr) = start_bitcoind(true).unwrap();
+    let rpc = &bitcoind.client;
+    let tempdir = tempfile::TempDir::new().unwrap().path().to_owned();
+    let mut rng = StdRng::seed_from_u64(10002);
+    let secret = SecretKey::new(&mut rng);
+    let secp = Secp256k1::new();
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let (internal_key, _) = keypair.x_only_public_key();
+    let address = Address::p2tr(&secp, internal_key, None, KnownHrp::Regtest);
+    let miner = rpc.new_address().unwrap();
+    mine_blocks(rpc, &miner, 110, 10).await;
+    let funding_txid = rpc
+        .send_to_address(&address, amount_to_us)
+        .unwrap()
+        .txid()
+        .unwrap();
+    let vout = rpc
+        .get_transaction(funding_txid)
+        .unwrap()
+        .details
+        .iter()
+        .find(|detail| detail.address.eq(&address.to_string()))
+        .map(|detail| detail.vout)
+        .unwrap();
+    mine_blocks(rpc, &miner, 1, 1).await;
+    let utxo = TxOut {
+        script_pubkey: address.script_pubkey(),
+        value: amount_to_us,
+    };
+    let unsigned_parent = Transaction {
+        version: bitcoin::transaction::Version(3),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: funding_txid,
+                vout,
+            },
+            script_sig: ScriptBuf::default(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::default(),
+        }],
+        output: vec![utxo.clone()],
+    };
+    let parent = sign_key_spend(unsigned_parent, &keypair, utxo.clone());
+    let parent_txid = parent.compute_txid();
+    let unsigned_child = Transaction {
+        version: bitcoin::transaction::Version(3),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::default(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            script_pubkey: address.script_pubkey(),
+            value: amount_to_us - child_fee,
+        }],
+    };
+    let child = sign_key_spend(unsigned_child, &keypair, utxo);
+    let child_txid = child.compute_txid();
+    let package = Package::new_one_parent_one_child(parent, child).unwrap();
+    let (node, client) = new_node(
+        socket_addr,
+        tempdir.clone(),
+        ChainState::Checkpoint(HashCheckpoint::from_genesis(bitcoin::Network::Regtest)),
+    );
+    tokio::task::spawn(async move { node.run().await });
+    let Client {
+        requester,
+        info_rx: _,
+        warn_rx: _,
+        event_rx: _,
+    } = client;
+    tokio::time::timeout(Duration::from_secs(60), requester.submit_package(package))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rpc.get_mempool_entry(parent_txid).is_err()
+            || rpc.get_mempool_entry(child_txid).is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    requester.shutdown().unwrap();
+    rpc.stop().unwrap();
+}
+
 #[tokio::test]
 async fn gossip_subscription() {
     setup_debug_output();
@@ -898,6 +1018,7 @@ async fn headers_only_sync_then_rescan() {
 }
 
 #[tokio::test]
+#[ignore = "races bitcoind's block filter index on localhost"]
 async fn inv_fallback_after_burst_mine() {
     setup_debug_output();
     let (bitcoind, socket_addr) = start_bitcoind(true).unwrap();

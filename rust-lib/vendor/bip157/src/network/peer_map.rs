@@ -14,7 +14,7 @@ use bitcoin::{
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use tokio::{
     sync::{
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, error::TrySendError, Receiver, Sender},
         Mutex,
     },
     task::JoinHandle,
@@ -24,8 +24,11 @@ use crate::{
     broadcaster::BroadcastQueue,
     default_port_from_network,
     network::{
-        dns::bootstrap_dns, error::PeerError, gossip::GossipMonitor, peer::Peer, PeerId,
-        PeerTimeoutConfig, RelayPolicy,
+        dns::{bootstrap_dns, resolve_hostname_socks5},
+        error::PeerError,
+        gossip::GossipMonitor,
+        peer::Peer,
+        PeerId, PeerTimeoutConfig, RelayPolicy,
     },
     BlockType, Dialog, Info, TrustedPeer, TrustedPeerInner,
 };
@@ -33,6 +36,21 @@ use crate::{
 use super::{AddressBook, ConnectionType, MainThreadMessage, PeerThreadMessage};
 
 const LOCAL_HOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+fn deliver(
+    ptx: &Sender<MainThreadMessage>,
+    handle: &JoinHandle<Result<(), PeerError>>,
+    message: MainThreadMessage,
+) -> bool {
+    match ptx.try_send(message) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            handle.abort();
+            false
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
+}
 
 // Preferred peers to connect to based on the user configuration
 type Whitelist = Vec<TrustedPeer>;
@@ -269,9 +287,9 @@ impl PeerMap {
     }
 
     // Send a message to the specified peer
-    pub async fn send_message(&self, nonce: PeerId, message: MainThreadMessage) {
+    pub fn send_message(&self, nonce: PeerId, message: MainThreadMessage) {
         if let Some(peer) = self.map.get(&nonce) {
-            let _ = peer.ptx.send(message).await;
+            deliver(&peer.ptx, &peer.handle, message);
             return;
         }
         match &self.gossip {
@@ -281,7 +299,7 @@ impl PeerMap {
             } => {
                 if let Some(peer) = active_peer {
                     if peer.id == nonce {
-                        let _ = peer.ptx.send(message).await;
+                        deliver(&peer.ptx, &peer.handle, message);
                     }
                 }
             }
@@ -290,22 +308,20 @@ impl PeerMap {
     }
 
     // Broadcast to all connected peers, returning if at least one peer received the message.
-    pub async fn broadcast(&self, message: MainThreadMessage) -> bool {
+    pub fn broadcast(&self, message: MainThreadMessage) -> bool {
         let active = self.map.values().filter(|peer| !peer.handle.is_finished());
         let mut sends = Vec::new();
         for peer in active {
-            let res = peer.ptx.send(message.clone()).await;
-            sends.push(res.is_ok());
+            sends.push(deliver(&peer.ptx, &peer.handle, message.clone()));
         }
         sends.into_iter().any(|res| res)
     }
 
     // Send to a random peer, returning true if the message was sent.
-    pub async fn send_random(&self, message: MainThreadMessage) -> bool {
+    pub fn send_random(&self, message: MainThreadMessage) -> bool {
         let mut rng = StdRng::from_entropy();
         if let Some((_, peer)) = self.map.iter().choose(&mut rng) {
-            let res = peer.ptx.send(message).await;
-            return res.is_ok();
+            return deliver(&peer.ptx, &peer.handle, message);
         }
         false
     }
@@ -322,10 +338,22 @@ impl PeerMap {
                 TrustedPeerInner::Addr(addr) => addr,
                 TrustedPeerInner::Hostname(host) => {
                     crate::debug!(format!("Resolving hostname {host}:{port}"));
-                    match tokio::net::lookup_host((host.as_str(), port)).await {
-                        Ok(iter) => {
-                            let resolved: Vec<AddrV2> = iter
-                                .map(|sa| match sa.ip() {
+                    let lookup = match &self.connector {
+                        ConnectionType::ClearNet => tokio::net::lookup_host((host.as_str(), port))
+                            .await
+                            .ok()
+                            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<IpAddr>>()),
+                        ConnectionType::Socks5Proxy(proxy) => {
+                            resolve_hostname_socks5(proxy.0, &host)
+                                .await
+                                .map(|ip| vec![ip])
+                        }
+                    };
+                    match lookup {
+                        Some(ips) => {
+                            let resolved: Vec<AddrV2> = ips
+                                .into_iter()
+                                .map(|ip| match ip {
                                     IpAddr::V4(ip) => AddrV2::Ipv4(ip),
                                     IpAddr::V6(ip) => AddrV2::Ipv6(ip),
                                 })
@@ -352,7 +380,7 @@ impl PeerMap {
                             }
                             continue;
                         }
-                        Err(_) => {
+                        None => {
                             crate::debug!(format!("Failed to resolve hostname {host}"));
                             continue;
                         }
@@ -368,7 +396,7 @@ impl PeerMap {
         let mut db_lock = self.db.lock().await;
         if db_lock.is_empty() {
             crate::debug!("Bootstrapping peers with DNS");
-            let new_peers = bootstrap_dns(self.network)
+            let new_peers = bootstrap_dns(self.network, &self.connector)
                 .await
                 .into_iter()
                 .map(|ip| match ip {
@@ -435,14 +463,14 @@ impl PeerMap {
         }
     }
 
-    pub async fn unsubscribe_from_gossip(&mut self) {
+    pub fn unsubscribe_from_gossip(&mut self) {
         match core::mem::take(&mut self.gossip) {
             GossipSubscriptionStatus::Subscribed {
                 monitor: _,
                 active_peer,
             } => {
                 if let Some(peer) = active_peer {
-                    let _ = peer.ptx.send(MainThreadMessage::Disconnect).await;
+                    deliver(&peer.ptx, &peer.handle, MainThreadMessage::Disconnect);
                 }
                 self.gossip = GossipSubscriptionStatus::Unsubscribed;
             }
@@ -483,7 +511,7 @@ mod tests {
     async fn a_peer_is_handshaking_until_its_version_or_its_end() {
         let (mtx, _mrx) = mpsc::channel(1);
         let (info_tx, _infos) = mpsc::channel(1);
-        let (warn_tx, _warnings) = mpsc::unbounded_channel();
+        let (warn_tx, _warnings) = mpsc::channel(1);
         let (event_tx, _events) = mpsc::unbounded_channel();
         let dialog = Arc::new(Dialog::new(info_tx, warn_tx, event_tx));
         let mut peers = PeerMap::new(
