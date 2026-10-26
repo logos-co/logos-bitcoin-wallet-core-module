@@ -285,9 +285,9 @@ pub enum Feed {
     Gossip { from: String, addrs: Vec<AddrV2Message> },
 }
 
-/// The phase a client is in, for status. Kyoto reports progress only as whole batches finish, so
-/// a catch-up within one batch reads `syncing` until its filters are in; `headers` in status
-/// is Kyoto's best header, to compare with a peer's tip.
+/// The phase a client is in, for status. Kyoto reports filter headers only as whole batches
+/// finish, so a catch-up within one batch reads `syncing` until its filter headers are in;
+/// `headers` in status is Kyoto's best header, to compare with a peer's tip.
 pub fn phase(updated: bool, fraction: f32) -> &'static str {
     // Filter headers count a quarter of the work; past it, filters are downloading.
     match (updated, fraction) {
@@ -429,7 +429,7 @@ impl Client {
                 woken.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
-        rt.spawn(drain_logs(logging, tx.clone(), dial.clone(), stop, wake));
+        rt.spawn(drain_logs(logging, tx.clone(), dial.clone(), Heights::new(start.from.0, start.known_to), stop, wake));
         let (seen, connected, best_header) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)), Arc::new(Mutex::new(start.from.0)));
         let now = Arc::new(Mutex::new(vec![]));
         rt.spawn(watch_peers(requester.clone(), dial.clone(), Watched { seen: seen.clone(), now: now.clone(), connected: connected.clone(), best_header: best_header.clone() }));
@@ -576,11 +576,50 @@ fn addr_text(addr: &AddrV2, port: u16) -> String {
     }
 }
 
+/// The heights Kyoto reached since it started at `base`, for the share done: filter headers
+/// count a quarter of the work, filters the rest, as bip157 0.7's progress weighed them.
+#[derive(Debug, Clone, Copy)]
+struct Heights {
+    base: u32,
+    tip: u32,
+    filter_headers: u32,
+    filters: u32,
+}
+
+impl Heights {
+    fn new(base: u32, tip: u32) -> Self {
+        Heights { base, tip: tip.max(base), filter_headers: base, filters: base }
+    }
+
+    /// Takes in a height Kyoto reached; false for any other info.
+    fn reached(&mut self, info: &Info) -> bool {
+        match *info {
+            Info::NewChainHeight(h) => self.tip = h,
+            Info::CFHeadersAdded(h) => self.filter_headers = h,
+            Info::FilterAdded(h) => self.filters = h,
+            _ => return false,
+        }
+        true
+    }
+
+    fn fraction(&self) -> f32 {
+        let total = self.tip.saturating_sub(self.base);
+        if total == 0 {
+            return 0.0;
+        }
+        let done = |h: u32| h.saturating_sub(self.base).min(total) as f32;
+        (done(self.filter_headers) + 3.0 * done(self.filters)) / (4.0 * total as f32)
+    }
+}
+
 /// Hands one of Kyoto's infos on; false once the sync thread is gone.
-fn forward(info: Info, tx: &Sender<Feed>, dial: &[(String, Peer)], latest: &mut Option<(f32, u32)>) -> bool {
+fn forward(info: Info, tx: &Sender<Feed>, dial: &[(String, Peer)], heights: &mut Heights, latest: &mut Option<(f32, u32)>) -> bool {
+    if heights.reached(&info) {
+        *latest = Some((heights.fraction(), heights.tip));
+        return true;
+    }
     let named = |addr: &AddrV2, port: u16| dial.iter().find(|(_, p)| p.is_at(addr, port)).map(|(t, _)| t.clone());
     match info {
-        Info::Progress(p) => *latest = Some((p.fraction_complete(), p.chain_height())),
         Info::Dial { addr, port, outcome } => {
             tracing::debug!(target: "bitcoin", "kyoto: dialled {}: {outcome}", addr_text(&addr, port));
             // A name on the user's network dials addresses no listed peer names.
@@ -597,8 +636,8 @@ fn forward(info: Info, tx: &Sender<Feed>, dial: &[(String, Peer)], latest: &mut 
     true
 }
 
-async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>, dial: Vec<(String, Peer)>, mut stop: tokio::sync::oneshot::Receiver<Option<String>>, wake: Arc<std::sync::atomic::AtomicBool>) {
-    // A first sync reports progress thousands of times: the latest goes out every 250 ms.
+async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>, dial: Vec<(String, Peer)>, mut heights: Heights, mut stop: tokio::sync::oneshot::Receiver<Option<String>>, wake: Arc<std::sync::atomic::AtomicBool>) {
+    // A first sync reports a height per filter: the latest share goes out every 250 ms.
     let (mut latest, mut sent): (Option<(f32, u32)>, Option<(f32, u32)>) = (None, None);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     // Closed channels drop out; only the stop ends this.
@@ -608,7 +647,7 @@ async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>, d
             why = &mut stop => {
                 // What the node reported before it stopped goes first.
                 while let Ok(info) = logs.info_subscriber.try_recv() {
-                    if !forward(info, &tx, &dial, &mut latest) {
+                    if !forward(info, &tx, &dial, &mut heights, &mut latest) {
                         return;
                     }
                 }
@@ -628,7 +667,7 @@ async fn drain_logs(mut logs: bdk_kyoto::LoggingSubscribers, tx: Sender<Feed>, d
             }
             info = logs.info_subscriber.recv(), if infos => match info {
                 Some(i) => {
-                    if !forward(i, &tx, &dial, &mut latest) {
+                    if !forward(i, &tx, &dial, &mut heights, &mut latest) {
                         return;
                     }
                 }
@@ -916,5 +955,22 @@ mod tests {
         assert_eq!(builtin_checkpoint(BNetwork::Mainnet, 800_000).0, 709_631);
         assert_eq!(builtin_checkpoint(BNetwork::Mainnet, 600_000).0, 481_823);
         assert_eq!(builtin_checkpoint(BNetwork::Signet, 300_000).0, 0);
+    }
+
+    #[test]
+    fn the_share_done_from_kyotos_heights() {
+        let mut h = Heights::new(1_000, 1_000);
+        assert_eq!(h.fraction(), 0.0, "nothing to check yet");
+        assert!(h.reached(&Info::NewChainHeight(3_000)));
+        assert!(h.reached(&Info::CFHeadersAdded(3_000)));
+        assert_eq!((h.fraction(), phase(false, h.fraction())), (0.25, "filters"), "filter headers done");
+        assert!(h.reached(&Info::FilterAdded(2_000)));
+        assert_eq!(h.fraction(), 0.625);
+        // A rescan checks the filters again, from where it starts.
+        assert!(h.reached(&Info::FilterAdded(1_500)));
+        assert_eq!(h.fraction(), 0.4375);
+        assert!(h.reached(&Info::FilterAdded(3_000)));
+        assert_eq!(h.fraction(), 1.0);
+        assert!(!h.reached(&Info::ConnectionsMet));
     }
 }

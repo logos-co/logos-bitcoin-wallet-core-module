@@ -86,15 +86,15 @@ pub use {
     crate::chain::ChainState,
     crate::client::{Client, Requester},
     crate::error::{ClientError, NodeError},
-    crate::messages::{DialOutcome, Event, Info, Progress, RejectPayload, SyncUpdate, Warning},
+    crate::messages::{DialOutcome, Event, Info, RejectPayload, SyncUpdate, Warning},
     crate::node::Node,
 };
 
 #[doc(inline)]
 pub use bitcoin::{
     bip158::BlockFilter, block::Header, p2p::address::AddrV2, p2p::address::AddrV2Message,
-    p2p::message_network::RejectReason, p2p::ServiceFlags, Address, Block, BlockHash, FeeRate,
-    Network, ScriptBuf, Transaction, Wtxid,
+    p2p::message_network::RejectReason, p2p::ServiceFlags, Block, BlockHash, FeeRate, Network,
+    ScriptBuf, Transaction, Wtxid,
 };
 
 pub extern crate tokio;
@@ -123,7 +123,7 @@ pub enum FilterType {
     Basic,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum BlockType {
     #[default]
     Legacy,
@@ -289,9 +289,9 @@ impl TrustedPeer {
     /// Create a new trusted peer from a DNS hostname.
     ///
     /// The hostname is stored as-is and resolved to an IP address at the
-    /// time a connection is attempted, via [`tokio::net::lookup_host`]. If
-    /// resolution fails or yields no addresses, the peer is skipped and
-    /// the next configured peer is tried.
+    /// time a connection is attempted, via [`tokio::net::lookup_host`], or through
+    /// the Socks5 proxy if one is configured. If resolution fails or yields no
+    /// addresses, the peer is skipped and the next configured peer is tried.
     pub fn from_hostname(hostname: impl Into<String>, port: u16) -> Self {
         Self {
             address: TrustedPeerInner::Hostname(hostname.into()),
@@ -440,14 +440,14 @@ fn default_port_from_network(network: &Network) -> u16 {
 #[derive(Debug, Clone)]
 struct Dialog {
     info_tx: Sender<Info>,
-    warn_tx: UnboundedSender<Warning>,
+    warn_tx: Sender<Warning>,
     event_tx: UnboundedSender<Event>,
 }
 
 impl Dialog {
     fn new(
         info_tx: Sender<Info>,
-        warn_tx: UnboundedSender<Warning>,
+        warn_tx: Sender<Warning>,
         event_tx: UnboundedSender<Event>,
     ) -> Self {
         Self {
@@ -458,7 +458,7 @@ impl Dialog {
     }
 
     fn send_warning(&self, warning: Warning) {
-        let _ = self.warn_tx.send(warning);
+        let _ = self.warn_tx.try_send(warning);
     }
 
     fn send_info(&self, info: Info) {

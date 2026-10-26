@@ -22,14 +22,16 @@ use bitcoin::{
         message_network::VersionMessage,
         Magic,
     },
-    Block, BlockHash, FeeRate, Wtxid,
+    Block, BlockHash, FeeRate, Transaction, Txid, Wtxid,
 };
 use socks::{create_socks5, SocksConnection};
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
 
 use error::Socks5Error;
 
-use crate::{network::gossip::GossipMonitor, DialOutcome, Socks5Proxy};
+use crate::{
+    broadcaster::TxIdentifier, network::gossip::GossipMonitor, BlockType, DialOutcome, Socks5Proxy,
+};
 
 pub(crate) mod dns;
 pub(crate) mod error;
@@ -42,7 +44,7 @@ pub(crate) mod reader;
 pub(crate) mod socks;
 
 pub const PROTOCOL_VERSION: u32 = 70016;
-pub const KYOTO_VERSION: &str = "0.7.0";
+pub const KYOTO_VERSION: &str = "0.8.0";
 pub const RUST_BITCOIN_VERSION: &str = "0.32.8";
 
 const THIRTY_MINS: Duration = Duration::from_secs(60 * 30);
@@ -232,6 +234,8 @@ struct MessageState {
     version_handshake: VersionHandshakeState,
     verack: VerackState,
     sent_txs: HashSet<Wtxid>,
+    announced_txs: HashSet<Wtxid>,
+    announced_input_txs: HashSet<Txid>,
     timed_message_state: HashMap<TimeSensitiveId, Instant>,
     ping_state: PingState,
     filter_rate: FilterRate,
@@ -244,6 +248,8 @@ impl MessageState {
             version_handshake: Default::default(),
             verack: Default::default(),
             sent_txs: Default::default(),
+            announced_txs: Default::default(),
+            announced_input_txs: Default::default(),
             timed_message_state: Default::default(),
             ping_state: PingState::default(),
             filter_rate: FilterRate::default(),
@@ -258,8 +264,35 @@ impl MessageState {
         self.version_handshake = self.version_handshake.finish();
     }
 
-    fn sent_tx(&mut self, wtxid: Wtxid) {
-        self.sent_txs.insert(wtxid);
+    fn receive_version(&mut self) -> bool {
+        match self.version_handshake.receive_version() {
+            Some(state) => {
+                self.version_handshake = state;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn sent_tx(&mut self, transaction: &Transaction) {
+        self.sent_txs.insert(transaction.compute_wtxid());
+        self.announced_input_txs.extend(
+            transaction
+                .input
+                .iter()
+                .map(|input| input.previous_output.txid),
+        );
+    }
+
+    fn announced_txs(&mut self, wtxids: &[Wtxid]) {
+        self.announced_txs.extend(wtxids);
+    }
+
+    fn was_announced(&self, id: TxIdentifier) -> bool {
+        match id {
+            TxIdentifier::Legacy(txid) => self.announced_input_txs.contains(&txid),
+            TxIdentifier::Witness(wtxid) => self.announced_txs.contains(&wtxid),
+        }
     }
 
     fn unknown_rejection(&mut self, wtxid: Wtxid) -> bool {
@@ -281,6 +314,9 @@ enum VersionHandshakeState {
     Started {
         at: tokio::time::Instant,
     },
+    VersionReceived {
+        at: tokio::time::Instant,
+    },
     Completed,
 }
 
@@ -288,6 +324,13 @@ impl VersionHandshakeState {
     fn start(self) -> Self {
         Self::Started {
             at: tokio::time::Instant::now(),
+        }
+    }
+
+    fn receive_version(self) -> Option<Self> {
+        match self {
+            Self::Started { at } => Some(Self::VersionReceived { at }),
+            _ => None,
         }
     }
 
@@ -301,7 +344,7 @@ impl VersionHandshakeState {
 
     fn is_unresponsive(&self, timeout: Duration) -> bool {
         match self {
-            Self::Started { at } => at.elapsed() > timeout,
+            Self::Started { at } | Self::VersionReceived { at } => at.elapsed() > timeout,
             _ => false,
         }
     }
@@ -429,6 +472,14 @@ impl TimeSensitiveId {
     fn from_slice(slice: [u8; 32]) -> Self {
         Self(slice)
     }
+
+    fn from_cf_headers_stop_hash(stop_hash: BlockHash) -> Self {
+        let mut id = stop_hash.to_byte_array();
+        for (byte, tag) in id.iter_mut().zip(Self::CF_HEADER_MSG.0) {
+            *byte ^= tag;
+        }
+        Self(id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -441,7 +492,7 @@ pub(crate) enum MainThreadMessage {
     GetHeaders(GetHeadersMessage),
     GetFilterHeaders(GetCFHeaders),
     GetFilters(GetCFilters),
-    GetBlock(BlockHash),
+    GetBlock(BlockHash, Option<BlockType>),
     Disconnect,
     BroadcastPending,
     Verack,
@@ -453,13 +504,14 @@ impl MainThreadMessage {
     ) -> Option<(TimeSensitiveId, Instant)> {
         match self {
             MainThreadMessage::GetHeaders(_) => Some((TimeSensitiveId::HEADER_MSG, Instant::now())),
-            MainThreadMessage::GetFilterHeaders(_) => {
-                Some((TimeSensitiveId::CF_HEADER_MSG, Instant::now()))
-            }
+            MainThreadMessage::GetFilterHeaders(get_cf_headers) => Some((
+                TimeSensitiveId::from_cf_headers_stop_hash(get_cf_headers.stop_hash),
+                Instant::now(),
+            )),
             MainThreadMessage::GetFilters(_) => {
                 Some((TimeSensitiveId::C_FILTER_MSG, Instant::now()))
             }
-            MainThreadMessage::GetBlock(hash) => {
+            MainThreadMessage::GetBlock(hash, _) => {
                 let id = hash.to_raw_hash().to_byte_array();
                 Some((TimeSensitiveId::from_slice(id), Instant::now()))
             }
@@ -637,7 +689,7 @@ mod tests {
         let transaction: Transaction = deserialize(&hex::decode("0200000000010158e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd7501000000171600145f275f436b09a8cc9a2eb2a2f528485c68a56323feffffff02d8231f1b0100000017a914aed962d6654f9a2b36608eb9d64d2b260db4f1118700c2eb0b0000000017a914b7f5faf40e3d40a5a459b1db3535f2b72fa921e88702483045022100a22edcc6e5bc511af4cc4ae0de0fcd75c7e04d8c1c3a8aa9d820ed4b967384ec02200642963597b9b1bc22c75e9f3e117284a962188bf5e8a74c895089046a20ad770121035509a48eb623e10aace8bfd0212fdb8a8e5af3c94b0b133b95e114cab89e4f7965000000").unwrap()).unwrap();
         let wtxid = transaction.compute_wtxid();
         let mut message_state = MessageState::new(Duration::from_secs(2));
-        message_state.sent_tx(wtxid);
+        message_state.sent_tx(&transaction);
         assert!(!message_state.unknown_rejection(wtxid));
         assert!(message_state.unknown_rejection(wtxid));
     }

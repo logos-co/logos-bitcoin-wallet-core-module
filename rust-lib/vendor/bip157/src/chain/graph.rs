@@ -142,7 +142,7 @@ impl BlockTree {
                 && !params.allow_min_difficulty_blocks
                 && new_height.is_adjustment_multiple(self.network)
             {
-                self.compute_next_work_required(new_height)
+                self.compute_next_work_required(prev_hash)
             } else {
                 self.active_tip.next_work_required
             };
@@ -183,7 +183,7 @@ impl BlockTree {
             .iter()
             .position(|fork| fork.hash.eq(&prev_hash))
         {
-            let fork = self.candidate_forks.swap_remove(fork_index);
+            let fork = self.candidate_forks[fork_index];
             if let Some(node) = self.headers.get(&fork.hash) {
                 let new_height = node.height.increment();
                 let params = self.network.params();
@@ -191,7 +191,7 @@ impl BlockTree {
                     && !params.allow_min_difficulty_blocks
                     && new_height.is_adjustment_multiple(self.network)
                 {
-                    self.compute_next_work_required(new_height)
+                    self.compute_next_work_required(prev_hash)
                 } else {
                     fork.next_work_required
                 };
@@ -203,6 +203,7 @@ impl BlockTree {
                         });
                     }
                 }
+                self.candidate_forks.swap_remove(fork_index);
                 let acc_work = node.acc_work + new_header.work();
                 let new_tip = Tip {
                     hash: new_hash,
@@ -243,7 +244,7 @@ impl BlockTree {
                     && !params.allow_min_difficulty_blocks
                     && new_height.is_adjustment_multiple(self.network)
                 {
-                    self.compute_next_work_required(new_height)
+                    self.compute_next_work_required(prev_hash)
                 } else {
                     Some(node.header.bits)
                 };
@@ -277,6 +278,15 @@ impl BlockTree {
         let mut curr_hash = new_best.hash;
         let mut connections = Vec::new();
         let mut disconnections = Vec::new();
+        while let Some((&height, &hash)) = self.canonical_hashes.last_key_value() {
+            if height <= new_best.height {
+                break;
+            }
+            self.canonical_hashes.remove(&height);
+            if let Some(node) = self.headers.get(&hash) {
+                disconnections.push(IndexedHeader::new(node.height, node.header));
+            }
+        }
         loop {
             match self.headers.get(&curr_hash) {
                 Some(node) => {
@@ -308,7 +318,7 @@ impl BlockTree {
         }
     }
 
-    fn compute_next_work_required(&self, new_height: Height) -> Option<CompactTarget> {
+    fn compute_next_work_required(&self, parent: BlockHash) -> Option<CompactTarget> {
         // Do not audit the diffulty for `Testnet`. Auditing the difficulty properly for a testnet
         // will result in convoluted logic. This is a critical code block for mainnet and should be
         // as readable as possible
@@ -317,15 +327,17 @@ impl BlockTree {
         }
         let adjustment_period =
             Height::from_u64_checked(self.network.params().difficulty_adjustment_interval())?;
-        let epoch_start = new_height.checked_sub(adjustment_period)?;
-        let epoch_end = new_height.checked_sub(1)?;
-        let epoch_start_hash = self.canonical_hashes.get(&epoch_start)?;
-        let epoch_end_hash = self.canonical_hashes.get(&epoch_end)?;
-        let epoch_start_header = self.headers.get(epoch_start_hash).map(|node| node.header)?;
-        let epoch_end_header = self.headers.get(epoch_end_hash).map(|node| node.header)?;
+        let epoch_end = self.headers.get(&parent)?;
+        let epoch_start_height = epoch_end
+            .height
+            .increment()
+            .checked_sub(adjustment_period)?;
+        let epoch_start = self
+            .ancestors(parent)
+            .find(|node| node.height == epoch_start_height)?;
         let new_target = CompactTarget::from_header_difficulty_adjustment(
-            epoch_start_header,
-            epoch_end_header,
+            epoch_start.header,
+            epoch_end.header,
             self.network,
         );
         Some(new_target)
@@ -437,16 +449,6 @@ impl BlockTree {
         self.iter_data().all(|node| node.filter_checked)
     }
 
-    pub(crate) fn total_filters_synced(&self) -> u32 {
-        self.iter_data().filter(|node| node.filter_checked).count() as u32
-    }
-
-    pub(crate) fn total_filter_headers_synced(&self) -> u32 {
-        self.iter_data()
-            .filter(|node| node.filter_commitment.is_some() || node.cf_header_assumed)
-            .count() as u32
-    }
-
     pub(crate) fn locators(&self) -> Vec<BlockHash> {
         let mut locators = Vec::new();
         locators.push(self.active_tip.hash);
@@ -463,14 +465,14 @@ impl BlockTree {
         locators.into_iter().rev().collect()
     }
 
-    pub(crate) fn internal_chain_len(&self) -> usize {
-        self.canonical_hashes.len()
+    pub(crate) fn iter_data(&self) -> BlockNodeIterator<'_> {
+        self.ancestors(self.active_tip.hash)
     }
 
-    pub(crate) fn iter_data(&self) -> BlockNodeIterator<'_> {
+    fn ancestors(&self, hash: BlockHash) -> BlockNodeIterator<'_> {
         BlockNodeIterator {
             block_tree: self,
-            current: self.active_tip.hash,
+            current: hash,
         }
     }
 
@@ -515,7 +517,7 @@ impl<'a> Iterator for BlockNodeIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corepc_node::serde_json;
+    use bitcoind::serde_json;
     use std::fs::File;
     use std::str::FromStr;
 
@@ -714,5 +716,197 @@ mod tests {
         chain.assume_checked_to(4);
         assert!(chain.filters_synced());
         assert!(chain.filter_headers_synced());
+    }
+
+    fn store_node(
+        tree: &mut BlockTree,
+        height: u32,
+        header: Header,
+        previous_work: Work,
+        canonical: bool,
+    ) -> Work {
+        let work = previous_work + header.work();
+        tree.headers
+            .insert(header.block_hash(), BlockNode::new(height, header, work));
+        if canonical {
+            tree.canonical_hashes.insert(height, header.block_hash());
+        }
+        work
+    }
+
+    #[test]
+    fn test_shorter_fork_reorg() {
+        let network = Network::Bitcoin;
+        let hard = CompactTarget::from_consensus(0x1c0ffff0);
+        let easy = CompactTarget::from_consensus(0x1c3fffc0);
+        let mut common = genesis_block(network).header;
+        common.bits = hard;
+        common.time = 1_600_000_000 + 1_000_000;
+        let mut tree = BlockTree::new(Tip::from_checkpoint(2013, common.prev_blockhash), network);
+        let common_work = store_node(&mut tree, 2014, common, Work::zero(), true);
+        let mut old = common;
+        old.prev_blockhash = common.block_hash();
+        old.time = 1_600_000_000 + 4 * 1_209_600;
+        let mut old_work = store_node(&mut tree, 2015, old, common_work, true);
+        let mut old_branch = vec![old];
+        for height in 2016..=2020 {
+            let mut next = old;
+            next.prev_blockhash = old.block_hash();
+            next.time += 600;
+            next.bits = easy;
+            old_work = store_node(&mut tree, height, next, old_work, true);
+            old_branch.push(next);
+            old = next;
+        }
+        tree.active_tip = Tip {
+            hash: old.block_hash(),
+            height: 2020,
+            next_work_required: Some(easy),
+        };
+
+        let mut fork = common;
+        fork.prev_blockhash = common.block_hash();
+        fork.time = 1_600_000_000 + 1_209_600;
+        let mut fork_work = store_node(&mut tree, 2015, fork, common_work, false);
+        let mut next = fork;
+        next.prev_blockhash = fork.block_hash();
+        next.time += 600;
+        fork = next;
+        fork_work = store_node(&mut tree, 2016, fork, fork_work, false);
+        assert!(fork_work < old_work);
+        tree.candidate_forks.push(Tip {
+            hash: fork.block_hash(),
+            height: 2016,
+            next_work_required: Some(hard),
+        });
+
+        let mut winning = fork;
+        winning.prev_blockhash = fork.block_hash();
+        winning.time += 600;
+        assert!(fork_work + winning.work() > old_work);
+        let disconnected = match tree.accept_header(winning) {
+            AcceptHeaderChanges::Reorganization { disconnected, .. } => disconnected,
+            other => panic!("expected a shorter, higher-work reorganization: {other:?}"),
+        };
+        assert_eq!(tree.height(), 2017);
+        let old_tail_hash = old_branch.last().unwrap().block_hash();
+        assert_eq!(
+            tree.height_of_hash_canonical_only(old_tail_hash),
+            None,
+            "the displaced height-2020 block is still advertised as canonical"
+        );
+        for height in 2018..=2020 {
+            assert_eq!(tree.block_hash_at_height(height), None);
+            assert_eq!(tree.header_at_height(height), None);
+        }
+        assert_eq!(disconnected.len(), old_branch.len());
+        for header in old_branch {
+            assert!(disconnected.iter().any(|entry| entry.header == header));
+        }
+    }
+
+    fn mine_child(parent: Header, delay: u32, bits: CompactTarget) -> Header {
+        let mut child = parent;
+        child.prev_blockhash = parent.block_hash();
+        child.time += delay;
+        child.bits = bits;
+        child.nonce = 0;
+        while child.validate_pow(child.target()).is_err() {
+            child.nonce += 1;
+        }
+        child
+    }
+
+    #[test]
+    fn test_rejected_fork_extension_keeps_fork() {
+        let mut tree = BlockTree::from_genesis(Network::Regtest);
+        let genesis = genesis_block(Network::Regtest).header;
+        let bits = genesis.bits;
+        let common = mine_child(genesis, 600, bits);
+        let a2 = mine_child(common, 600, bits);
+        let a3 = mine_child(a2, 600, bits);
+        let b2 = mine_child(common, 601, bits);
+        let b3 = mine_child(b2, 600, bits);
+        for header in [common, a2, a3, b2, b3] {
+            tree.accept_header(header);
+        }
+        assert_eq!(tree.tip_hash(), a3.block_hash());
+
+        let invalid = mine_child(b3, 600, CompactTarget::from_consensus(0x2100ffff));
+        assert!(matches!(
+            tree.accept_header(invalid),
+            AcceptHeaderChanges::Rejected(HeaderRejection::InvalidPow { .. })
+        ));
+        assert_eq!(tree.tip_hash(), a3.block_hash());
+
+        let b4 = mine_child(b3, 601, bits);
+        assert!(matches!(
+            tree.accept_header(b4),
+            AcceptHeaderChanges::Reorganization { .. }
+        ));
+        assert_eq!(tree.tip_hash(), b4.block_hash());
+    }
+
+    #[test]
+    fn test_fork_retarget_uses_fork_ancestors() {
+        let network = Network::Bitcoin;
+        let template = genesis_block(network).header;
+        let bits = CompactTarget::from_consensus(0x1c0ffff0);
+        let mut tree = BlockTree::new(Tip::from_checkpoint(2015, template.block_hash()), network);
+        let mut epoch = Vec::new();
+        for height in 2016..=4031 {
+            let mut header = template;
+            header.prev_blockhash = tree.tip_hash();
+            header.bits = bits;
+            header.time = 1_600_000_000 + (height - 2016) * 600;
+            if height == 4031 {
+                header.time += 600;
+            }
+            assert!(matches!(
+                tree.accept_header(header),
+                AcceptHeaderChanges::Accepted { .. }
+            ));
+            epoch.push(header);
+        }
+        let start = epoch[0];
+        let canonical_end = epoch[2015];
+        let fork_parent = epoch[2014];
+
+        let canonical_bits =
+            CompactTarget::from_header_difficulty_adjustment(start, canonical_end, network);
+        let mut canonical_next = template;
+        canonical_next.prev_blockhash = canonical_end.block_hash();
+        canonical_next.bits = canonical_bits;
+        canonical_next.time = canonical_end.time + 600;
+        assert!(matches!(
+            tree.accept_header(canonical_next),
+            AcceptHeaderChanges::Accepted { .. }
+        ));
+
+        let mut fork_end = canonical_end;
+        fork_end.prev_blockhash = fork_parent.block_hash();
+        fork_end.time -= 600;
+        assert!(matches!(
+            tree.accept_header(fork_end),
+            AcceptHeaderChanges::ExtendedFork { .. }
+        ));
+        let fork_bits = CompactTarget::from_header_difficulty_adjustment(start, fork_end, network);
+        assert_ne!(fork_bits, canonical_bits);
+
+        let mut invalid_fork_next = canonical_next;
+        invalid_fork_next.prev_blockhash = fork_end.block_hash();
+        assert!(matches!(
+            tree.accept_header(invalid_fork_next),
+            AcceptHeaderChanges::Rejected(HeaderRejection::InvalidPow { .. })
+        ));
+        assert!(!tree.contains(invalid_fork_next.block_hash()));
+
+        let mut fork_next = invalid_fork_next;
+        fork_next.bits = fork_bits;
+        assert!(matches!(
+            tree.accept_header(fork_next),
+            AcceptHeaderChanges::Reorganization { .. }
+        ));
+        assert_eq!(tree.tip_hash(), fork_next.block_hash());
     }
 }

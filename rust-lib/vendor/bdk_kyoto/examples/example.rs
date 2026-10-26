@@ -1,5 +1,5 @@
 use bdk_kyoto::builder::{Builder, BuilderExt};
-use bdk_kyoto::{HashCheckpoint, Info, Receiver, SyncConfig, UnboundedReceiver, Warning};
+use bdk_kyoto::{HashCheckpoint, Info, Receiver, SyncConfig, Warning};
 use bdk_wallet::bitcoin::Network;
 use bdk_wallet::{KeychainKind, Wallet};
 use tokio::select;
@@ -13,15 +13,18 @@ const USER_SCRIPTS_USED: u32 = 1_000;
 
 async fn traces(
     mut info_subscriber: Receiver<Info>,
-    mut warning_subscriber: UnboundedReceiver<Warning>,
+    mut warning_subscriber: Receiver<Warning>,
 ) {
     loop {
         select! {
             info = info_subscriber.recv() => {
                 if let Some(info) = info {
                     match info {
-                        Info::Progress(p) => {
-                            tracing::info!("chain height: {}, filter download progress: {}%", p.chain_height(), p.percentage_complete());
+                        Info::NewChainHeight(height) => {
+                            tracing::info!("chain height: {height}");
+                        },
+                        Info::CFHeadersAdded(height) => {
+                            tracing::info!("filter headers to height: {height}");
                         },
                         Info::BlockReceived(b) => {
                             tracing::info!("downloaded block: {b}");

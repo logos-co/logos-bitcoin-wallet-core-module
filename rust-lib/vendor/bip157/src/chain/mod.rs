@@ -109,7 +109,7 @@ pub(crate) struct FilterCommitment {
 pub(crate) struct FilterRequestState {
     pub last_filter_request: Option<FilterRequest>,
     pub last_filter_header_request: Option<FilterHeaderRequest>,
-    pub pending_batch: Option<(PeerId, CFHeaderBatch)>,
+    pub pending_batch: Option<(Vec<PeerId>, CFHeaderBatch)>,
     pub agreement_state: FilterHeaderAgreements,
     prev_cf_header_stop_hashes: VecDeque<BlockHash>,
 }
@@ -142,9 +142,8 @@ impl FilterRequestState {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FilterRequest {
-    #[allow(unused)]
-    pub start_height: u32,
-    pub stop_hash: BlockHash,
+    pub next_height: u32,
+    pub stop_height: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -154,33 +153,18 @@ pub(crate) struct FilterHeaderRequest {
     pub expected_prev_filter_header: Option<FilterHeader>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FilterHeaderAgreements {
-    // The distinct peers that sent the pending batch: a peer repeating itself is one vote.
-    agreed: Vec<PeerId>,
     required: u8,
 }
 
 impl FilterHeaderAgreements {
     pub(crate) fn new(required: u8) -> Self {
-        Self {
-            agreed: Vec::new(),
-            required,
-        }
+        Self { required }
     }
 
-    pub(crate) fn got_agreement(&mut self, peer_id: PeerId) {
-        if !self.agreed.contains(&peer_id) {
-            self.agreed.push(peer_id);
-        }
-    }
-
-    pub(crate) fn enough_agree(&self) -> bool {
-        self.agreed.len() >= usize::from(self.required)
-    }
-
-    pub(crate) fn reset_agreements(&mut self) {
-        self.agreed.clear();
+    pub(crate) fn enough_agree(&self, peers: &[PeerId]) -> bool {
+        peers.len() >= self.required as usize
     }
 }
 

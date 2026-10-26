@@ -2,7 +2,7 @@
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
 bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_esplora` 0.22.3, `bdk_kyoto` 0.18.1
-with four patches on `bip157` 0.7.0 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
+with five patches on `bip157` 0.8.0 with five, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -154,7 +154,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.1 with four patches on bip157 0.7.0 (published from 0169dc3) with six, below
+bdk_kyoto 0.18.1 with five patches on bip157 0.8.0 (published from ac722e6) with five, below
 (`kyoto.rs`, `peers.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
@@ -169,7 +169,7 @@ bdk_kyoto 0.18.1 with four patches on bip157 0.7.0 (published from 0169dc3) with
 - After each start the core reports to the node module (`report_peers`) how each peer it tried
   did: `ok` when the version handshake showed bits 0, 3 and 6 (and protocol 70016), else a
   `reason`: `timeout`, `refused`, `unreachable`, `services`, or `conflict` for a peer set aside
-  after a filter-header conflict (bip157 patch 6). A dial that failed on this side, at the SOCKS
+  after a filter-header conflict (bip157 patch 5). A dial that failed on this side, at the SOCKS
   proxy or the local network, says nothing of the peer and isn't reported; nor are a start's
   failures when none of its peers answered (offline, or Tor still starting), nor the user's own
   peers. Kyoto asks each peer for addresses (`getaddr`), and the core reports those that are onion
@@ -186,7 +186,7 @@ bdk_kyoto 0.18.1 with four patches on bip157 0.7.0 (published from 0169dc3) with
 - The quorum (`required_peers`, also the connection count) is 3 on mainnet and 2 on signet, however
   few peers it may dial; on testnet4, 2, or as many as it may dial down to 1, and then
   `status.kyoto.onePeerDecides` is true, for the app's one-operator notice. Over Tor a peer has 30 s for the TCP handshake, 15 s per response
-  (the version handshake after the SOCKS connect included) and 240 s per filter batch (patch 3);
+  (the version handshake after the SOCKS connect included) and 240 s per filter batch (bip157 patch 2);
   directly, 5 s, bip157's default 5 s and 30 s. On bip157's default, one mainnet start in ten
   through 8 listed onion peers ran out of peers in the peer-list crawler's runs; on 15 s, 10 of
   10 reached the tip.
@@ -208,7 +208,7 @@ bdk_kyoto 0.18.1 with four patches on bip157 0.7.0 (published from 0169dc3) with
   the highest used index (bdk_kyoto 0.18.1 indexes every one), until the window holds
   (`status.kyoto.rescans`); the regtest restores below, to index 150 out of order, take two. Each
   pass after the first runs in place: the client keeps its header chain and the filter headers its
-  quorum agreed on (bip157 patch 5) and fetches only the filters again (`widen` below). Only
+  quorum agreed on (bip157 patch 4) and fetches only the filters again (`widen` below). Only
   used addresses a gap-limit scan reaches count, from index 0 and never past `gapLimit` unused in a row:
   the public test phrase also has payments far beyond (testnet4 index 313 after 151), which a
   window happens to hold now and then, and which would otherwise widen it again and again.
@@ -243,27 +243,27 @@ bdk_kyoto 0.18.1 with four patches on bip157 0.7.0 (published from 0169dc3) with
   connection limit (135% CPU after one rebuild, before this).
 - `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, quorum, onePeerDecides,
   headers, progress, connected, dialled, skipped, restarts, rebuilds, rescans, window, lastWarning,
-  lastStop, lastConflict, gossiped, learned }`. Kyoto counts progress by finished batches, so a
-  catch-up within one batch reads `syncing` until its filters are in; `headers` is Kyoto's best
-  header; `window` is the highest index the client watches per keychain; `gossiped` counts the
-  addresses peers sent since the wallet opened and `learned` those kept for the node module.
+  lastStop, lastConflict, gossiped, learned }`. `progress` weighs filter headers a quarter and
+  filters the rest, from the heights Kyoto reports since its start: filter headers by finished
+  batches, filters one by one, so a catch-up within one batch reads `syncing` until its filter
+  headers are in; `headers` is Kyoto's best header; `window` is the highest index the client
+  watches per keychain; `gossiped` counts the addresses peers sent since the wallet opened and
+  `learned` those kept for the node module.
 
 ### Kyoto patches
 
-`patches/bip157/` holds six patches on bip157 0.7.0 as published, in `git format-patch` form, each
+`patches/bip157/` holds five patches on bip157 0.8.0 as published, in `git format-patch` form, each
 with unit tests:
 
-1. distinct peers count toward the filter-header quorum, and unsolicited `cfheaders` are dropped
-   (`chain/chain.rs`, `chain/mod.rs`, `network/peer.rs`): one peer repeating a forged batch no longer
-   meets a quorum by itself;
-2. no false conflict when the tip moves between two answers (`chain/chain.rs`);
-3. a configurable deadline for filter batches, `Builder::filter_batch_timeout` (`network/mod.rs`,
+1. no false conflict when the tip moves between two answers (`chain/chain.rs`): a conflict
+   disconnects every peer;
+2. a configurable deadline for filter batches, `Builder::filter_batch_timeout` (`network/mod.rs`,
    `network/peer.rs`, `builder.rs`);
-4. a random nonce in each version message (`network/outbound.rs`); the user agent still names Kyoto;
-5. a rescan keeps the filter headers the quorum agreed on and checks only the filters again
+3. a random nonce in each version message (`network/outbound.rs`); the user agent still names Kyoto;
+4. a rescan keeps the filter headers the quorum agreed on and checks only the filters again
    (`chain/graph.rs`, `chain/chain.rs`): `rescan_from` cleared them, so a scan that started over
    downloaded every filter header from there again;
-6. `Builder::report_peers`: how each dial ends, as `Info::Dial` with the peer's address and port
+5. `Builder::report_peers`: how each dial ends, as `Info::Dial` with the peer's address and port
    (its version's services and protocol, timed out, refused, unreachable, or failed on this side),
    and every `addrv2` message as `Info::Addresses` with its sender; peers are asked for addresses
    with `whitelist_only` too, and out of peers to dial the node waits for the handshakes in flight
@@ -273,16 +273,22 @@ with unit tests:
    the destination, a proxy that can't be reached of nothing. bip157's client gossip subscription
    (#607) is for transactions only; nothing showed the addresses peers sent.
 
-`tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those thirteen files: a patch
+On 0.7.0 a sixth came first: distinct peers toward the filter-header quorum, and unsolicited
+`cfheaders` dropped. 0.8.0 counts each peer once ("Same peer cannot share the same CF headers", one
+of its fixes from the Loupe security review) and asks every peer for each batch, so it went; the
+tests behind it pass on the published 0.8.0.
+
+`tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those twelve files: a patch
 touching any other file fails the build until the file is added there, with a reason.
 `rust-lib/vendor/bip157` is the result, used through `[patch.crates-io]`. `nix build
 .#bip157-check` rebuilds it from the published crate (fetched by hash) and diffs it byte for byte,
 and the module's Rust build depends on that check; `tools/kyoto/check-bip157.sh` does the same
-without Nix (`--update` rewrites the vendored tree). Run against the published crate, the quorum
-and tip tests fail: that is the bug. Nothing has been sent upstream.
+without Nix (`--update` rewrites the vendored tree). Run against the published crate, the tip test
+fails: that is the bug. The quorum patch went upstream as Kyoto #612, closed for 0.8.0's fix; the
+others have not been sent.
 
-`patches/bdk_kyoto/` holds four on bdk_kyoto 0.18.1, in `src/lib.rs` and `src/builder.rs`, the two
-files `tools/kyoto/patch-bdk_kyoto.sh` allows:
+`patches/bdk_kyoto/` holds five on bdk_kyoto 0.18.1, in the files `tools/kyoto/patch-bdk_kyoto.sh`
+allows (`src/lib.rs`, `src/builder.rs`, and for patch 5 the manifest and the examples):
 
 1. matched blocks applied oldest first: the published crate drains them newest first
    (`queued_blocks.last()`, `pop()`), and bdk_chain counts a spend only once its coin is indexed,
@@ -297,8 +303,11 @@ files `tools/kyoto/patch-bdk_kyoto.sh` allows:
    matched by their own filters: the node drops the request it had queued (`RecvError` while it
    runs), which ended the update stream as `NodeStopped` while the node ran on. Upstream's fix
    (bdk-kyoto#180, on master, not yet released), ported onto patch 1's order; it goes once a
-   release carries it. It also skips an `UnknownHash` answer, which bip157 0.7.0 doesn't give for
-   a matched block: it keeps a reorganized branch's headers and fetches the block from there.
+   release carries it. It also skips an `UnknownHash` answer, which bip157 doesn't give for a
+   matched block: it keeps a reorganized branch's headers and fetches the block from there;
+5. bip157 0.8.0: the requirement, the bounded warning receiver in `LoggingSubscribers`, and the
+   examples' progress from the heights that replace `Info::Progress`. The published 0.18.1, and
+   bdk-kyoto's master, require bip157 0.7.
 
 0.18.1 indexes every script the filters are checked against (`extend_index_to_policy`), which our
 patch 3 on 0.18.0 did: with a recovery lookahead past the wallet's own 25, a matched block's
@@ -635,14 +644,14 @@ chain completes. Three more rounds close while the next round's call is held, an
 
 `kyoto`, with Kyoto as the authority and one electrs only cross-checked (`checkOnly`): Kyoto's peers sit behind
 `examples/p2p_proxy.rs`, which forwards, delays answers, goes down, or forges one block's filter
-header and filter and sends the forged batch five times, enough for a quorum of three without
-patch 1; the test connects all three peers. It receives, sends through Kyoto's
+header and filter and sends the forged batch five times, enough for a quorum of three on bip157
+0.7.0 as published; the test connects all three peers. It receives, sends through Kyoto's
 peers and confirms; re-anchors across a reorg; rebuilds the client after 30 addresses are revealed
 (a test hook) and finds a payment to the last; restarts after `NoReachablePeers` when every peer
 goes down, and finds the payment made meanwhile; and holds out against a forging peer that answers
 first: no update ever hides the payment, which confirms once the forger stops. Each forged batch
 is a filter-header conflict, so each restarts the client at once (10 for 10 forged batches). Against bip157
-without patch 1, the same step fails: the wallet reports synced at the block with the payment
+0.7.0 as published, the same step failed: the wallet reported synced at the block with the payment
 missing. Run alone after it, `kyoto_with_a_history_server` adds an electrs enabled for history:
 the payment shows pending from it, then confirms on Kyoto's chain. Also run alone,
 `kyoto_skips_a_matched_block_reorganized_away` dials four proxies each in front of the main node
@@ -887,7 +896,7 @@ bundle, the keystore side and the core run on Windows and reach it directly unde
 
 ## Not yet
 
-- Kyoto reports its progress only as whole batches finish.
+- Kyoto reports filter headers only as whole batches finish.
 - A scan that starts over, wider, downloads every filter from the birthday again, though no
   header or filter header: Kyoto keeps no filters. A history spread far past the first window can
   take several passes.
