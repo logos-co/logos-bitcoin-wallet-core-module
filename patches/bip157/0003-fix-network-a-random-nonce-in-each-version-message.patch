@@ -1,4 +1,4 @@
-From 0686f283f4a09e824fcbc0e794a747ace5555f71 Mon Sep 17 00:00:00 2001
+From 7e3eb6adafb738ff8dff2c7472956b71fcf00da6 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sat, 10 Oct 2026 22:33:18 -0300
 Subject: [PATCH 3/5] fix(network): a random nonce in each version message

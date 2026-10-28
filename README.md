@@ -2,7 +2,7 @@
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
 bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_esplora` 0.22.3, `bdk_kyoto` 0.18.1
-with five patches on `bip157` 0.8.0 with five, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
+and `bip157` 0.8.1 with five patches each, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -154,7 +154,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.1 with five patches on bip157 0.8.0 (published from ac722e6) with five, below
+bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches each, below
 (`kyoto.rs`, `peers.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
@@ -252,7 +252,7 @@ bdk_kyoto 0.18.1 with five patches on bip157 0.8.0 (published from ac722e6) with
 
 ### Kyoto patches
 
-`patches/bip157/` holds five patches on bip157 0.8.0 as published, in `git format-patch` form, each
+`patches/bip157/` holds five patches on bip157 0.8.1 as published, in `git format-patch` form, each
 with unit tests:
 
 1. no false conflict when the tip moves between two answers (`chain/chain.rs`): a conflict

@@ -1,4 +1,4 @@
-From 08843b3f980e269c6af2f0a25fd8bcbc2d21e7fa Mon Sep 17 00:00:00 2001
+From 507e6ae5248503293f43f5c4a010cf9afa197586 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sun, 11 Oct 2026 17:48:22 -0300
 Subject: [PATCH 4/5] fix(chain): a rescan keeps the agreed filter headers
@@ -13,10 +13,10 @@ don't change with the scripts: a rescan now only checks the filters again.
  2 files changed, 31 insertions(+), 2 deletions(-)
 
 diff --git a/src/chain/chain.rs b/src/chain/chain.rs
-index b687a2c..5b3b5d8 100644
+index 2840452..b74208a 100644
 --- a/src/chain/chain.rs
 +++ b/src/chain/chain.rs
-@@ -413,7 +413,7 @@ impl Chain {
+@@ -406,7 +406,7 @@ impl Chain {
          self.request_state.pending_batch = None;
      }
  
@@ -26,7 +26,7 @@ index b687a2c..5b3b5d8 100644
          self.header_chain.reset_filter_state();
      }
 diff --git a/src/chain/graph.rs b/src/chain/graph.rs
-index 1e8cb0c..53051fb 100644
+index da19bf2..44ecc4c 100644
 --- a/src/chain/graph.rs
 +++ b/src/chain/graph.rs
 @@ -432,11 +432,11 @@ impl BlockTree {
@@ -42,7 +42,7 @@ index 1e8cb0c..53051fb 100644
          }
      }
  
-@@ -546,6 +546,35 @@ mod tests {
+@@ -585,6 +585,35 @@ mod tests {
          graph_cases.scenarios[index].clone()
      }
  
