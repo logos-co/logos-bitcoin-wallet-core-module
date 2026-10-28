@@ -1,4 +1,4 @@
-From df610eba2db7d46480319c8f2820fb424bd3bc0f Mon Sep 17 00:00:00 2001
+From 0b25ebdb586b7179ee7903c3698ff828cae3b34b Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sat, 10 Oct 2026 22:32:57 -0300
 Subject: [PATCH 2/5] feat(builder): a configurable deadline for filter batches
@@ -33,7 +33,7 @@ index f1dc654..631893b 100644
      /// believed to be at the current chain tip, filters will be downloaded for newly mined
      /// blocks. This feature is intended for new wallets that have never received a payment.
 diff --git a/src/network/mod.rs b/src/network/mod.rs
-index a5aefb3..5d94c9f 100644
+index 30c930a..03b9e83 100644
 --- a/src/network/mod.rs
 +++ b/src/network/mod.rs
 @@ -52,7 +52,7 @@ const TWO_HOUR: Duration = Duration::from_secs(60 * 60 * 2);

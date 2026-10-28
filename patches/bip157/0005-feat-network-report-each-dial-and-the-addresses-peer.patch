@@ -1,4 +1,4 @@
-From 93f1953e608b4e3de59259bbb29cfdfc82b9ca31 Mon Sep 17 00:00:00 2001
+From be76924819463e1f243339baacd8232bb44e1005 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Mon, 12 Oct 2026 17:06:27 -0300
 Subject: [PATCH 5/5] feat(network): report each dial and the addresses peers
@@ -219,7 +219,7 @@ index f8ac2bc..0b4e02d 100644
          }
      }
 diff --git a/src/network/mod.rs b/src/network/mod.rs
-index 5d94c9f..3ae6211 100644
+index 03b9e83..9f39b73 100644
 --- a/src/network/mod.rs
 +++ b/src/network/mod.rs
 @@ -27,9 +27,11 @@ use bitcoin::{

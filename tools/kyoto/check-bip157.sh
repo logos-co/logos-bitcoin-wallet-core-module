@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Checks rust-lib/vendor/bip157 is bip157 0.8.0 plus patches/bip157, byte for byte, outside Nix.
+# Checks rust-lib/vendor/bip157 is bip157 0.8.1 plus patches/bip157, byte for byte, outside Nix.
 # With --update, rewrites the vendored tree from the patches instead.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-url=https://static.crates.io/crates/bip157/bip157-0.8.0.crate
-sha=6f266f15d0ab3f322d0d9db39db442f148a407c840e5eb2a54074b0ff011f85f
+url=https://static.crates.io/crates/bip157/bip157-0.8.1.crate
+sha=467c3414d72f1393576c2c86f13ae04dd55da722f1c364bbede5dc9805995421
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

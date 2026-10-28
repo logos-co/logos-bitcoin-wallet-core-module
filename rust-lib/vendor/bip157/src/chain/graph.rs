@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::HashCheckpoint;
 
@@ -432,11 +432,22 @@ impl BlockTree {
         false
     }
 
-    // Filter headers the quorum agreed on stay: a rescan only fetches the filters again.
+    // Filter headers the quorum agreed on stay, as far as they run unbroken from the bottom: the
+    // next request starts where they end. Assumed ones are dropped, so one above them can't stay.
     pub(crate) fn reset_filter_state(&mut self) {
-        for node in self.headers.values_mut() {
+        let mut kept = HashSet::new();
+        for hash in self.canonical_hashes.range(1..).map(|(_, hash)| *hash) {
+            match self.headers.get(&hash) {
+                Some(node) if node.filter_commitment.is_some() => kept.insert(hash),
+                _ => break,
+            };
+        }
+        for (hash, node) in self.headers.iter_mut() {
             node.filter_checked = false;
             node.cf_header_assumed = false;
+            if !kept.contains(hash) {
+                node.filter_commitment = None;
+            }
         }
     }
 
@@ -467,6 +478,45 @@ impl BlockTree {
 
     pub(crate) fn iter_data(&self) -> BlockNodeIterator<'_> {
         self.ancestors(self.active_tip.hash)
+    }
+
+    // The lowest height of the canonical chain above genesis, or the tip if there is none.
+    pub(crate) fn lowest_stored_block_height(&self) -> Height {
+        self.canonical_hashes
+            .range(1..)
+            .next()
+            .map(|(&height, _)| height)
+            .unwrap_or(self.active_tip.height)
+    }
+
+    //For contiguous properties (being known, filter checked, etc.) we use binary search to find
+    //the `BlockNode` for which it holds.
+    pub(crate) fn highest_block_node_where(
+        &self,
+        pred: impl Fn(&BlockNode) -> bool,
+    ) -> Option<&BlockNode> {
+        let mut low = self
+            .canonical_hashes
+            .range(1..)
+            .next()
+            .map(|(&height, _)| height)?;
+        let mut high = self.active_tip.height;
+        let mut found = None;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            match self
+                .canonical_hashes
+                .get(&mid)
+                .and_then(|hash| self.headers.get(hash))
+            {
+                Some(node) if pred(node) => {
+                    found = Some(node);
+                    low = mid + 1;
+                }
+                _ => high = mid - 1,
+            }
+        }
+        found
     }
 
     fn ancestors(&self, hash: BlockHash) -> BlockNodeIterator<'_> {
@@ -571,8 +621,14 @@ mod tests {
         }
         assert!(hashes.iter().all(|h| chain.is_filter_checked(h)));
         chain.reset_filter_state();
-        assert!(hashes.iter().all(|h| !chain.is_filter_checked(h)), "the filters are checked again");
-        assert!(hashes.iter().all(|h| chain.filter_commitment(*h).is_some()), "the agreed filter headers stay");
+        assert!(
+            hashes.iter().all(|h| !chain.is_filter_checked(h)),
+            "the filters are checked again"
+        );
+        assert!(
+            hashes.iter().all(|h| chain.filter_commitment(*h).is_some()),
+            "the agreed filter headers stay"
+        );
     }
 
     #[test]

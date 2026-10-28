@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Replays patches/bip157 onto bip157 0.8.0 as published and holds them to an allowlist.
+# Replays patches/bip157 onto bip157 0.8.1 as published and holds them to an allowlist.
 # Usage: patch-bip157.sh <pristine crate dir> <out dir> [patch dir]
 set -euo pipefail
 
@@ -34,7 +34,7 @@ git init -q .
 git config user.email build@logos.invalid
 git config user.name logos-bitcoin-wallet-core-module
 git add -A
-git commit -q -m "bip157 0.8.0 as published"
+git commit -q -m "bip157 0.8.1 as published"
 base=$(git rev-parse HEAD)
 git am -q "$patches"/*.patch
 

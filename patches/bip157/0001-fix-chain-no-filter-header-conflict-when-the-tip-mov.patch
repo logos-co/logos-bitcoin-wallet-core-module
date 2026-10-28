@@ -1,4 +1,4 @@
-From e1b9d48fda0534be6672b09f5aa017af2a7299bb Mon Sep 17 00:00:00 2001
+From c30c837cd0d2d98fb9f6093a15f7150645613d5b Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sat, 10 Oct 2026 22:32:33 -0300
 Subject: [PATCH 1/5] fix(chain): no filter-header conflict when the tip moves
@@ -13,7 +13,7 @@ an earlier stop hash is now dropped and the vote starts over.
  1 file changed, 37 insertions(+)
 
 diff --git a/src/chain/chain.rs b/src/chain/chain.rs
-index 2da34fa..b687a2c 100644
+index 80fb5e8..2840452 100644
 --- a/src/chain/chain.rs
 +++ b/src/chain/chain.rs
 @@ -212,6 +212,8 @@ impl Chain {
@@ -25,7 +25,7 @@ index 2da34fa..b687a2c 100644
              Some((agreeing_peers, pending)) => {
                  if agreeing_peers.contains(&peer_id) {
                      self.request_state.pending_batch = Some((agreeing_peers, pending));
-@@ -1284,4 +1286,39 @@ mod tests {
+@@ -1277,4 +1279,39 @@ mod tests {
          assert_eq!(cf_header_sync_res.unwrap(), CFHeaderChanges::AddedToQueue);
          assert!(!chain.is_cf_headers_synced());
      }

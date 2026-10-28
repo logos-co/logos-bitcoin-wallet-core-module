@@ -2,7 +2,7 @@
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
 bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_esplora` 0.22.3, `bdk_kyoto` 0.18.1
-with five patches on `bip157` 0.8.0 with five, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
+and `bip157` 0.8.1 with five patches each, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -165,7 +165,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.1 with five patches on bip157 0.8.0 (published from ac722e6) with five, below
+bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches each, below
 (`kyoto.rs`, `peers.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
@@ -263,7 +263,7 @@ bdk_kyoto 0.18.1 with five patches on bip157 0.8.0 (published from ac722e6) with
 
 ### Kyoto patches
 
-`patches/bip157/` holds five patches on bip157 0.8.0 as published, in `git format-patch` form, each
+`patches/bip157/` holds five patches on bip157 0.8.1 as published, in `git format-patch` form, each
 with unit tests:
 
 1. no false conflict when the tip moves between two answers (`chain/chain.rs`): a conflict
@@ -273,7 +273,10 @@ with unit tests:
 3. a random nonce in each version message (`network/outbound.rs`); the user agent still names Kyoto;
 4. a rescan keeps the filter headers the quorum agreed on and checks only the filters again
    (`chain/graph.rs`, `chain/chain.rs`): `rescan_from` cleared them, so a scan that started over
-   downloaded every filter header from there again;
+   downloaded every filter header from there again. Only their unbroken run from the bottom stays:
+   after a headers-only start the lowest were assumed, not fetched, and one kept above them sent
+   the next request to the tip, where every answer mismatched, so a rescan from below an earlier
+   one stalled;
 5. `Builder::report_peers`: how each dial ends, as `Info::Dial` with the peer's address and port
    (its version's services and protocol, timed out, refused, unreachable, or failed on this side),
    and every `addrv2` message as `Info::Addresses` with its sender; peers are asked for addresses
@@ -288,6 +291,10 @@ On 0.7.0 a sixth came first: distinct peers toward the filter-header quorum, and
 `cfheaders` dropped. 0.8.0 counts each peer once ("Same peer cannot share the same CF headers", one
 of its fixes from the Loupe security review) and asks every peer for each batch, so it went; the
 tests behind it pass on the published 0.8.0.
+
+0.8.1 finds the next filter header and filter to fetch by binary search, which assumes each
+forms one run from the bottom; a rescan clears every filter check, and patch 4 keeps only such a
+run of filter headers.
 
 `tools/kyoto/patch-bip157.sh` replays them and holds them to an allowlist of those twelve files: a patch
 touching any other file fails the build until the file is added there, with a reason.
