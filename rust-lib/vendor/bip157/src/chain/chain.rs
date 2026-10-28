@@ -1314,4 +1314,30 @@ mod tests {
         assert_eq!(changes, CFHeaderChanges::Extended);
         assert!(chain.is_cf_headers_synced());
     }
+
+    #[tokio::test]
+    async fn a_lower_rescan_after_assumed_filter_headers_asks_from_its_start() {
+        let mut chain = new_regtest(base_block(), 1);
+        let scenario = load_scenario();
+        let headers = scenario.most_work_headers();
+        assert!(chain.sync_chain(headers.clone()).is_ok());
+        // Headers only to 2498, so its filter headers are assumed; 2499 to 2501 came after, agreed.
+        chain.header_chain.assume_checked_to(2498);
+        for header in &headers[2..] {
+            let commitment = crate::chain::FilterCommitment {
+                header: FilterHeader::from_byte_array([1; 32]),
+                filter_hash: FilterHash::from_byte_array([2; 32]),
+            };
+            chain
+                .header_chain
+                .set_commitment(commitment, header.block_hash());
+        }
+        // A rescan from 2497: 2498's filter header was never fetched, so the request starts there.
+        chain.clear_filters();
+        chain.header_chain.assume_checked_to(2497);
+        let message = chain.next_cf_header_message();
+        assert_eq!(message.start_height, 2498);
+        let request = chain.request_state.last_filter_header_request.unwrap();
+        assert_eq!(request.expected_prev_filter_header, None);
+    }
 }

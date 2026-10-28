@@ -1,4 +1,4 @@
-From 912ea119524c1f9fac4b7da7892d54f493e54ca7 Mon Sep 17 00:00:00 2001
+From be76924819463e1f243339baacd8232bb44e1005 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Mon, 12 Oct 2026 17:06:27 -0300
 Subject: [PATCH 5/5] feat(network): report each dial and the addresses peers

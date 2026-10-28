@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::HashCheckpoint;
 
@@ -432,11 +432,22 @@ impl BlockTree {
         false
     }
 
-    // Filter headers the quorum agreed on stay: a rescan only fetches the filters again.
+    // Filter headers the quorum agreed on stay, as far as they run unbroken from the bottom: the
+    // next request starts where they end. Assumed ones are dropped, so one above them can't stay.
     pub(crate) fn reset_filter_state(&mut self) {
-        for node in self.headers.values_mut() {
+        let mut kept = HashSet::new();
+        for hash in self.canonical_hashes.range(1..).map(|(_, hash)| *hash) {
+            match self.headers.get(&hash) {
+                Some(node) if node.filter_commitment.is_some() => kept.insert(hash),
+                _ => break,
+            };
+        }
+        for (hash, node) in self.headers.iter_mut() {
             node.filter_checked = false;
             node.cf_header_assumed = false;
+            if !kept.contains(hash) {
+                node.filter_commitment = None;
+            }
         }
     }
 
@@ -610,8 +621,14 @@ mod tests {
         }
         assert!(hashes.iter().all(|h| chain.is_filter_checked(h)));
         chain.reset_filter_state();
-        assert!(hashes.iter().all(|h| !chain.is_filter_checked(h)), "the filters are checked again");
-        assert!(hashes.iter().all(|h| chain.filter_commitment(*h).is_some()), "the agreed filter headers stay");
+        assert!(
+            hashes.iter().all(|h| !chain.is_filter_checked(h)),
+            "the filters are checked again"
+        );
+        assert!(
+            hashes.iter().all(|h| chain.filter_commitment(*h).is_some()),
+            "the agreed filter headers stay"
+        );
     }
 
     #[test]

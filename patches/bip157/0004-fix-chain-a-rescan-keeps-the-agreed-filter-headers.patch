@@ -1,4 +1,4 @@
-From 507e6ae5248503293f43f5c4a010cf9afa197586 Mon Sep 17 00:00:00 2001
+From f3b23c13ac7a6ee55285ce47538a6f9b2103217d Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sun, 11 Oct 2026 17:48:22 -0300
 Subject: [PATCH 4/5] fix(chain): a rescan keeps the agreed filter headers
@@ -7,13 +7,18 @@ Requester::rescan and rescan_from cleared every filter commitment along with
 the filter checks, so a rescan for new scripts downloaded all the filter
 headers again before the filters. The filter headers the quorum agreed on
 don't change with the scripts: a rescan now only checks the filters again.
+
+Only the run of them unbroken from the bottom of the chain stays. After a
+headers-only sync the lowest filter headers were assumed, not fetched, and a
+rescan drops that: one kept above them made the next request start at the
+tip, against the tip's own filter header, so every answer mismatched.
 ---
- src/chain/chain.rs |  2 +-
- src/chain/graph.rs | 31 ++++++++++++++++++++++++++++++-
- 2 files changed, 31 insertions(+), 2 deletions(-)
+ src/chain/chain.rs | 28 ++++++++++++++++++++++++-
+ src/chain/graph.rs | 52 +++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 76 insertions(+), 4 deletions(-)
 
 diff --git a/src/chain/chain.rs b/src/chain/chain.rs
-index 2840452..b74208a 100644
+index 2840452..df877bb 100644
 --- a/src/chain/chain.rs
 +++ b/src/chain/chain.rs
 @@ -406,7 +406,7 @@ impl Chain {
@@ -25,24 +30,73 @@ index 2840452..b74208a 100644
      pub(crate) fn clear_filters(&mut self) {
          self.header_chain.reset_filter_state();
      }
+@@ -1314,4 +1314,30 @@ mod tests {
+         assert_eq!(changes, CFHeaderChanges::Extended);
+         assert!(chain.is_cf_headers_synced());
+     }
++
++    #[tokio::test]
++    async fn a_lower_rescan_after_assumed_filter_headers_asks_from_its_start() {
++        let mut chain = new_regtest(base_block(), 1);
++        let scenario = load_scenario();
++        let headers = scenario.most_work_headers();
++        assert!(chain.sync_chain(headers.clone()).is_ok());
++        // Headers only to 2498, so its filter headers are assumed; 2499 to 2501 came after, agreed.
++        chain.header_chain.assume_checked_to(2498);
++        for header in &headers[2..] {
++            let commitment = crate::chain::FilterCommitment {
++                header: FilterHeader::from_byte_array([1; 32]),
++                filter_hash: FilterHash::from_byte_array([2; 32]),
++            };
++            chain
++                .header_chain
++                .set_commitment(commitment, header.block_hash());
++        }
++        // A rescan from 2497: 2498's filter header was never fetched, so the request starts there.
++        chain.clear_filters();
++        chain.header_chain.assume_checked_to(2497);
++        let message = chain.next_cf_header_message();
++        assert_eq!(message.start_height, 2498);
++        let request = chain.request_state.last_filter_header_request.unwrap();
++        assert_eq!(request.expected_prev_filter_header, None);
++    }
+ }
 diff --git a/src/chain/graph.rs b/src/chain/graph.rs
-index da19bf2..44ecc4c 100644
+index da19bf2..d723600 100644
 --- a/src/chain/graph.rs
 +++ b/src/chain/graph.rs
-@@ -432,11 +432,11 @@ impl BlockTree {
+@@ -1,4 +1,4 @@
+-use std::collections::{BTreeMap, HashMap};
++use std::collections::{BTreeMap, HashMap, HashSet};
+ 
+ use crate::HashCheckpoint;
+ 
+@@ -432,11 +432,22 @@ impl BlockTree {
          false
      }
  
-+    // Filter headers the quorum agreed on stay: a rescan only fetches the filters again.
++    // Filter headers the quorum agreed on stay, as far as they run unbroken from the bottom: the
++    // next request starts where they end. Assumed ones are dropped, so one above them can't stay.
      pub(crate) fn reset_filter_state(&mut self) {
-         for node in self.headers.values_mut() {
+-        for node in self.headers.values_mut() {
++        let mut kept = HashSet::new();
++        for hash in self.canonical_hashes.range(1..).map(|(_, hash)| *hash) {
++            match self.headers.get(&hash) {
++                Some(node) if node.filter_commitment.is_some() => kept.insert(hash),
++                _ => break,
++            };
++        }
++        for (hash, node) in self.headers.iter_mut() {
              node.filter_checked = false;
              node.cf_header_assumed = false;
 -            node.filter_commitment = None;
++            if !kept.contains(hash) {
++                node.filter_commitment = None;
++            }
          }
      }
  
-@@ -585,6 +585,35 @@ mod tests {
+@@ -585,6 +596,41 @@ mod tests {
          graph_cases.scenarios[index].clone()
      }
  
@@ -71,8 +125,14 @@ index da19bf2..44ecc4c 100644
 +        }
 +        assert!(hashes.iter().all(|h| chain.is_filter_checked(h)));
 +        chain.reset_filter_state();
-+        assert!(hashes.iter().all(|h| !chain.is_filter_checked(h)), "the filters are checked again");
-+        assert!(hashes.iter().all(|h| chain.filter_commitment(*h).is_some()), "the agreed filter headers stay");
++        assert!(
++            hashes.iter().all(|h| !chain.is_filter_checked(h)),
++            "the filters are checked again"
++        );
++        assert!(
++            hashes.iter().all(|h| chain.filter_commitment(*h).is_some()),
++            "the agreed filter headers stay"
++        );
 +    }
 +
      #[test]
