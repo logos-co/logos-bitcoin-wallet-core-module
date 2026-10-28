@@ -55,7 +55,7 @@ path = "tests/client.rs"
 version = "3"
 
 [dependencies.bip157]
-version = "0.7.0"
+version = "0.8.0"
 
 [dev-dependencies.anyhow]
 version = "1.0"

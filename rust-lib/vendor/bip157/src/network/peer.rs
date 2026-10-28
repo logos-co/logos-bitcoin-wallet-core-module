@@ -1,5 +1,5 @@
 extern crate tokio;
-use std::{sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 use addrman::Record;
 use bip324::futures::{Protocol, ProtocolReader};
@@ -22,7 +22,11 @@ use tokio::{
 
 use crate::network::gossip::TransactionCheck;
 use crate::network::RelayPolicy;
-use crate::{broadcaster::BroadcastQueue, messages::Warning, BlockType, DialOutcome, Dialog, Info};
+use crate::{
+    broadcaster::{BroadcastQueue, TxIdentifier},
+    messages::Warning,
+    BlockType, DialOutcome, Dialog, Info,
+};
 
 use super::{
     error::PeerError,
@@ -34,28 +38,10 @@ use super::{
 };
 
 const LOOP_TIMEOUT: Duration = Duration::from_millis(500);
+// Writes over Tor may be slow during bootstrap, but we cap the absolute time a peer can be stuck
+// during a write. For a reasonable peer, this is a large grace period.
+const ABSOLUTE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
-
-// Filter header requests sent to this peer and not yet answered.
-#[derive(Debug, Default, Clone, Copy)]
-struct CfHeaderRequests(u32);
-
-impl CfHeaderRequests {
-    fn ask(&mut self) {
-        self.0 = self.0.saturating_add(1);
-    }
-
-    // False for a batch nobody asked this peer for.
-    fn answer(&mut self) -> bool {
-        match self.0.checked_sub(1) {
-            Some(left) => {
-                self.0 = left;
-                true
-            }
-            None => false,
-        }
-    }
-}
 
 pub(crate) struct Peer {
     nonce: PeerId,
@@ -70,7 +56,6 @@ pub(crate) struct Peer {
     message_state: MessageState,
     tx_queue: Arc<Mutex<BroadcastQueue>>,
     relay_policy: RelayPolicy,
-    cf_header_requests: CfHeaderRequests,
     report_peers: bool,
     dial_reported: bool,
 }
@@ -104,7 +89,6 @@ impl Peer {
             timeout_config,
             message_state: MessageState::new(timeout_config.response_timeout),
             tx_queue,
-            cf_header_requests: CfHeaderRequests::default(),
             report_peers,
             dial_reported: false,
         }
@@ -146,6 +130,7 @@ impl Peer {
     ) -> Result<(), PeerError> {
         let start_time = Instant::now();
         let (tx, mut rx) = mpsc::channel(32);
+        let reader_tx = tx.clone();
         let (reader, mut writer) = connection.into_split();
         let reader = BufReader::new(reader);
         // If a peer signals for V2 we will use it, otherwise just use plaintext.
@@ -180,7 +165,14 @@ impl Peer {
         let message = outbound_messages.version_message(&self.relay_policy);
         self.write_bytes(&mut writer, message).await?;
         self.message_state.start_version_handshake();
-        let read_handle = tokio::spawn(async move { peer_reader.read_from_remote().await });
+        let read_handle = tokio::spawn(async move {
+            // Cancel safety: This is not called in a loop, and once `reader_tx` is closed we do
+            // not care about parsing messages any longer
+            select! {
+                result = peer_reader.read_from_remote() => result,
+                _ = reader_tx.closed() => Ok(()),
+            }
+        });
         let mut interval = tokio::time::interval(LOOP_TIMEOUT);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -225,7 +217,7 @@ impl Peer {
                                     match e {
                                         // We were told by the reader thread to disconnect from this peer
                                         PeerError::DisconnectCommand => return Ok(()),
-                                        _ => continue,
+                                        e => return Err(e),
                                     }
                                 },
                             }
@@ -243,12 +235,12 @@ impl Peer {
                                     match e {
                                         // We were told by the main thread to disconnect from this peer
                                         PeerError::DisconnectCommand => return Ok(()),
-                                        _ => continue,
+                                        e => return Err(e),
                                     }
                                 },
                             }
                         },
-                        None => continue,
+                        None => return Ok(()),
                     }
                 }
                 _ = interval.tick() => continue,
@@ -271,7 +263,7 @@ impl Peer {
         }
         match message {
             ReaderMessage::Version(version) => {
-                if self.message_state.version_handshake.is_complete() {
+                if !self.message_state.receive_version() {
                     return Err(PeerError::DisconnectCommand);
                 }
                 self.report_dial(DialOutcome::Version {
@@ -309,11 +301,6 @@ impl Peer {
                 Ok(())
             }
             ReaderMessage::FilterHeaders(cf_headers) => {
-                // Unsolicited batches are dropped, so a peer cannot answer more than it was asked.
-                if !self.cf_header_requests.answer() {
-                    self.dialog.send_warning(Warning::UnsolicitedMessage);
-                    return Ok(());
-                }
                 self.main_thread_sender
                     .send(PeerThreadMessage {
                         nonce: self.nonce,
@@ -403,39 +390,24 @@ impl Peer {
                 RelayPolicy::BlocksOnly => Ok(()),
             },
             ReaderMessage::GetData(requests) => {
-                let mut tx_queue = self.tx_queue.lock().await;
                 for inv in requests {
-                    match inv {
-                        Inventory::WTx(wtxid) => {
-                            let transaction = tx_queue.fetch_tx(wtxid);
-                            if let Some(transaction) = transaction {
-                                let msg = message_generator.broadcast_transaction(transaction);
-                                self.write_bytes(writer, msg).await?;
-                                self.message_state.sent_tx(wtxid);
-                                tx_queue.sent_transaction_payload(wtxid);
-                            }
+                    let id: TxIdentifier = match inv {
+                        Inventory::WTx(wtxid) => wtxid.into(),
+                        Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                            txid.into()
                         }
-                        Inventory::Transaction(txid) => {
-                            let transaction = tx_queue.fetch_tx(txid);
-                            if let Some(transaction) = transaction {
-                                let wtxid = transaction.compute_wtxid();
-                                let msg = message_generator.broadcast_transaction(transaction);
-                                self.write_bytes(writer, msg).await?;
-                                self.message_state.sent_tx(wtxid);
-                                tx_queue.sent_transaction_payload(wtxid);
-                            }
-                        }
-                        Inventory::WitnessTransaction(txid) => {
-                            let transaction = tx_queue.fetch_tx(txid);
-                            if let Some(transaction) = transaction {
-                                let wtxid = transaction.compute_wtxid();
-                                let msg = message_generator.broadcast_transaction(transaction);
-                                self.write_bytes(writer, msg).await?;
-                                self.message_state.sent_tx(wtxid);
-                                tx_queue.sent_transaction_payload(wtxid);
-                            }
-                        }
-                        _ => (),
+                        _ => continue,
+                    };
+                    if !self.message_state.was_announced(id) {
+                        continue;
+                    }
+                    let transaction = self.tx_queue.lock().await.fetch_tx(id);
+                    if let Some(transaction) = transaction {
+                        let wtxid = transaction.compute_wtxid();
+                        self.message_state.sent_tx(&transaction);
+                        let msg = message_generator.broadcast_transaction(transaction);
+                        self.write_bytes(writer, msg).await?;
+                        self.tx_queue.lock().await.sent_transaction_payload(wtxid);
                     }
                 }
                 Ok(())
@@ -500,7 +472,10 @@ impl Peer {
     {
         let time_sensitive = request.time_sensitive_message_start();
         if let Some((msg_id, time)) = time_sensitive {
-            self.message_state.timed_message_state.insert(msg_id, time);
+            self.message_state
+                .timed_message_state
+                .entry(msg_id)
+                .or_insert(time);
         }
         match request {
             MainThreadMessage::GetAddr => {
@@ -524,7 +499,6 @@ impl Peer {
                 self.write_bytes(writer, message).await?;
             }
             MainThreadMessage::GetFilterHeaders(config) => {
-                self.cf_header_requests.ask();
                 let message = message_generator.serialize(NetworkMessage::GetCFHeaders(config));
                 self.write_bytes(writer, message).await?;
             }
@@ -535,8 +509,8 @@ impl Peer {
                 let message = message_generator.serialize(NetworkMessage::GetCFilters(config));
                 self.write_bytes(writer, message).await?;
             }
-            MainThreadMessage::GetBlock(message) => {
-                let message = message_generator.block(message);
+            MainThreadMessage::GetBlock(hash, block_type) => {
+                let message = message_generator.block(hash, block_type);
                 self.write_bytes(writer, message).await?;
             }
             MainThreadMessage::BroadcastPending => {
@@ -549,6 +523,7 @@ impl Peer {
                     queue.pending_wtxid()
                 };
                 if !wtxids.is_empty() {
+                    self.message_state.announced_txs(&wtxids);
                     let message = message_generator.announce_transactions(wtxids);
                     self.write_bytes(writer, message).await?;
                 }
@@ -567,6 +542,7 @@ impl Peer {
                     queue.pending_wtxid()
                 };
                 if !wtxids.is_empty() {
+                    self.message_state.announced_txs(&wtxids);
                     let message = message_generator.announce_transactions(wtxids);
                     self.write_bytes(writer, message).await?;
                 }
@@ -580,8 +556,12 @@ impl Peer {
     where
         W: AsyncWrite + Send + Unpin,
     {
-        writer.write_all(&message).await?;
-        writer.flush().await?;
+        tokio::time::timeout(ABSOLUTE_WRITE_TIMEOUT, async {
+            writer.write_all(&message).await?;
+            writer.flush().await
+        })
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
         Ok(())
     }
 
@@ -609,6 +589,249 @@ impl Peer {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::{
+        absolute::LockTime,
+        consensus::deserialize,
+        constants::genesis_block,
+        hashes::Hash,
+        p2p::{address::AddrV2, message::RawNetworkMessage, message_filter::CFHeaders},
+        transaction::Version,
+        Amount, FilterHash, FilterHeader, OutPoint, ScriptBuf, Transaction, TxIn, TxOut,
+    };
+
+    use super::*;
+    use crate::{
+        chain::{chain::Chain, error::CFHeaderSyncError, CFHeaderChanges, ChainState},
+        FilterType, Package,
+    };
+
+    fn transaction_peer(id: u32, tx_queue: Arc<Mutex<BroadcastQueue>>) -> Peer {
+        let (to_node, _node_rx) = mpsc::channel(8);
+        let (_to_peer, from_node) = mpsc::channel(8);
+        let (info_tx, _info_rx) = mpsc::channel(8);
+        let (warn_tx, _warn_rx) = mpsc::channel(8);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let address = AddrV2::Ipv4(std::net::Ipv4Addr::LOCALHOST);
+        let mut peer = Peer::new(
+            PeerId(id),
+            Record::new_from_addrv2_source(address.clone(), 18444, ServiceFlags::NONE, &address),
+            Network::Regtest,
+            BlockType::Witness,
+            RelayPolicy::BlocksOnly,
+            to_node,
+            from_node,
+            Arc::new(Dialog::new(info_tx, warn_tx, event_tx)),
+            Arc::new(Mutex::new(AddressBook::new())),
+            PeerTimeoutConfig::default(),
+            tx_queue,
+            false,
+        );
+        peer.message_state.finish_version_handshake();
+        peer
+    }
+
+    async fn get_data(
+        peer: &mut Peer,
+        generator: &mut MessageGenerator,
+        inv: Inventory,
+    ) -> Option<Transaction> {
+        let mut writer = Vec::new();
+        peer.handle_peer_message(ReaderMessage::GetData(vec![inv]), &mut writer, generator)
+            .await
+            .unwrap();
+        if writer.is_empty() {
+            return None;
+        }
+        let message: RawNetworkMessage = deserialize(&writer).unwrap();
+        match message.into_payload() {
+            NetworkMessage::Tx(transaction) => Some(transaction),
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_data_only_serves_announced_transactions() {
+        let parent: Transaction = deserialize(&hex::decode("0200000000010158e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd7501000000171600145f275f436b09a8cc9a2eb2a2f528485c68a56323feffffff02d8231f1b0100000017a914aed962d6654f9a2b36608eb9d64d2b260db4f1118700c2eb0b0000000017a914b7f5faf40e3d40a5a459b1db3535f2b72fa921e88702483045022100a22edcc6e5bc511af4cc4ae0de0fcd75c7e04d8c1c3a8aa9d820ed4b967384ec02200642963597b9b1bc22c75e9f3e117284a962188bf5e8a74c895089046a20ad770121035509a48eb623e10aace8bfd0212fdb8a8e5af3c94b0b133b95e114cab89e4f7965000000").unwrap()).unwrap();
+        let parent_txid = parent.compute_txid();
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let child_wtxid = child.compute_wtxid();
+        let tx_queue = Arc::new(Mutex::new(BroadcastQueue::new()));
+        let (callback, completion) = tokio::sync::oneshot::channel();
+        tx_queue.lock().await.add_to_queue(
+            Package::new_one_parent_one_child(parent.clone(), child.clone()).unwrap(),
+            callback,
+        );
+        let mut generator = MessageGenerator {
+            network: Network::Regtest,
+            transport: Transport::V1,
+            block_type: BlockType::Witness,
+        };
+        let mut probing_peer = transaction_peer(1, tx_queue.clone());
+        let mut announced_peer = transaction_peer(2, tx_queue);
+        announced_peer
+            .main_thread_request(
+                MainThreadMessage::BroadcastPending,
+                &mut tokio::io::sink(),
+                &mut generator,
+            )
+            .await
+            .unwrap();
+
+        let parent_inv = Inventory::WitnessTransaction(parent_txid);
+        let child_inv = Inventory::WTx(child_wtxid);
+        assert!(get_data(&mut probing_peer, &mut generator, child_inv)
+            .await
+            .is_none());
+        assert!(get_data(&mut probing_peer, &mut generator, parent_inv)
+            .await
+            .is_none());
+        assert!(get_data(&mut announced_peer, &mut generator, parent_inv)
+            .await
+            .is_none());
+        assert_eq!(
+            get_data(&mut announced_peer, &mut generator, child_inv).await,
+            Some(child)
+        );
+        assert_eq!(
+            get_data(&mut announced_peer, &mut generator, parent_inv).await,
+            Some(parent)
+        );
+        assert_eq!(completion.await.unwrap(), child_wtxid);
+        assert!(get_data(&mut probing_peer, &mut generator, child_inv)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_cfheaders_do_not_clear_pending_request() {
+        let network = Network::Regtest;
+        let (info_tx, _info_rx) = mpsc::channel(32);
+        let (warn_tx, _warn_rx) = mpsc::channel(8);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let dialog = Arc::new(Dialog::new(info_tx, warn_tx, event_tx));
+        let mut chain = Chain::new(
+            network,
+            ChainState::Snapshot(vec![]),
+            dialog.clone(),
+            1,
+            FilterType::Basic,
+        );
+        let (to_node, mut node_rx) = mpsc::channel(32);
+        let (_to_peer, from_node) = mpsc::channel(32);
+        let address = AddrV2::Ipv4(std::net::Ipv4Addr::LOCALHOST);
+        let services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
+        let mut peer = Peer::new(
+            PeerId(1),
+            Record::new_from_addrv2_source(address.clone(), 18444, services, &address),
+            network,
+            BlockType::Legacy,
+            RelayPolicy::BlocksOnly,
+            to_node,
+            from_node,
+            dialog,
+            Arc::new(Mutex::new(AddressBook::new())),
+            PeerTimeoutConfig::default(),
+            Arc::new(Mutex::new(BroadcastQueue::new())),
+            false,
+        );
+        peer.message_state.finish_version_handshake();
+        let mut generator = MessageGenerator {
+            network,
+            transport: Transport::V1,
+            block_type: BlockType::Legacy,
+        };
+        let mut writer = tokio::io::sink();
+        let mut parent = genesis_block(network).header;
+        let mut previous_filter_header = FilterHeader::all_zeros();
+        let filter_hash = FilterHash::hash(&[0]);
+        let mut stale_response = None;
+
+        for height in 1..=3 {
+            let mut header = parent;
+            header.prev_blockhash = parent.block_hash();
+            header.time += 600;
+            header.nonce = 0;
+            while header.validate_pow(header.target()).is_err() {
+                header.nonce += 1;
+            }
+            chain.sync_chain(vec![header]).unwrap();
+            parent = header;
+            let request = chain.next_cf_header_message();
+            assert_eq!(request.start_height, height);
+            peer.main_thread_request(
+                MainThreadMessage::GetFilterHeaders(request.clone()),
+                &mut writer,
+                &mut generator,
+            )
+            .await
+            .unwrap();
+            if height == 3 {
+                break;
+            }
+            let response = CFHeaders {
+                filter_type: 0,
+                stop_hash: request.stop_hash,
+                previous_filter_header,
+                filter_hashes: vec![filter_hash],
+            };
+            peer.handle_peer_message(
+                ReaderMessage::FilterHeaders(response.clone()),
+                &mut writer,
+                &mut generator,
+            )
+            .await
+            .unwrap();
+            let forwarded = node_rx.recv().await.unwrap();
+            let PeerMessage::FilterHeaders(payload) = forwarded.message else {
+                panic!("expected filter headers");
+            };
+            assert!(matches!(
+                chain.sync_cf_headers(forwarded.nonce, payload),
+                Ok(CFHeaderChanges::Extended)
+            ));
+            previous_filter_header = filter_hash.filter_header(&previous_filter_header);
+            stale_response = Some(response);
+        }
+
+        peer.handle_peer_message(
+            ReaderMessage::FilterHeaders(stale_response.unwrap()),
+            &mut writer,
+            &mut generator,
+        )
+        .await
+        .unwrap();
+        let forwarded = node_rx.try_recv().unwrap();
+        let PeerMessage::FilterHeaders(mut payload) = forwarded.message else {
+            panic!("expected filter headers");
+        };
+        assert!(matches!(
+            chain.sync_cf_headers(forwarded.nonce, payload.clone()),
+            Ok(CFHeaderChanges::AddedToQueue)
+        ));
+        assert!(!chain.is_cf_headers_synced());
+        payload.stop_hash = parent.block_hash();
+        assert!(matches!(
+            chain.sync_cf_headers(forwarded.nonce, payload),
+            Err(CFHeaderSyncError::PrevHeaderMismatch)
+        ));
+        tokio::time::advance(peer.timeout_config.response_timeout + Duration::from_secs(1)).await;
+        assert!(peer.message_state.unresponsive());
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -629,7 +852,7 @@ mod tests {
     use crate::network::{PeerTimeoutConfig, RelayPolicy};
     use crate::{BlockType, DialOutcome, Dialog, Event, Info, Warning};
 
-    use super::{CfHeaderRequests, Peer};
+    use super::Peer;
 
     // A reporting peer task dialled to a loopback socket the test speaks for.
     struct Dialled {
@@ -639,7 +862,7 @@ mod tests {
         _rest: (
             mpsc::Receiver<PeerThreadMessage>,
             mpsc::Sender<MainThreadMessage>,
-            mpsc::UnboundedReceiver<Warning>,
+            mpsc::Receiver<Warning>,
             mpsc::UnboundedReceiver<Event>,
         ),
     }
@@ -650,7 +873,7 @@ mod tests {
         let local = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let (remote, _) = listener.accept().await.unwrap();
         let (info_tx, infos) = mpsc::channel(32);
-        let (warn_tx, warn_rx) = mpsc::unbounded_channel();
+        let (warn_tx, warn_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (main_tx, main_rx) = mpsc::channel(32);
         let (to_peer, from_main) = mpsc::channel(32);
@@ -805,16 +1028,5 @@ mod tests {
             !rest.iter().any(|i| matches!(i, Info::Dial { .. })),
             "one outcome per dial"
         );
-    }
-
-    #[test]
-    fn only_requested_filter_headers_are_answers() {
-        let mut requests = CfHeaderRequests::default();
-        assert!(!requests.answer());
-        requests.ask();
-        requests.ask();
-        assert!(requests.answer());
-        assert!(requests.answer());
-        assert!(!requests.answer());
     }
 }

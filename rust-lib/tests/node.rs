@@ -46,6 +46,12 @@ fn node(t: &T) -> Value {
     t.engine.status()["node"].clone()
 }
 
+/// The gap names every payment's block. A filter's false positive (1 in 784,931 a script and block)
+/// may add one below the prune height that holds nothing of the wallet's.
+fn names(gap: &Value, heights: &[u64]) -> bool {
+    gap["heights"].as_array().is_some_and(|h| heights.iter().all(|x| h.contains(&json!(x))))
+}
+
 fn local() -> RegtestConfig {
     RegtestConfig { local: true, poll_secs: Some(1), ..Default::default() }
 }
@@ -120,10 +126,10 @@ fn restore_from_a_pruned_node() {
     t.wait("the node without peers", 30, || pruned("getconnectioncount", json!([])) == 0);
     {
         let (r, _rpc, _dir) = restore(&t, local());
-        t.wait("the node's scan to the tip", 120, || node(&r)["prunedGap"]["heights"].as_array().is_some_and(|h| h.len() == 3) && r.engine.status()["synced"] == true);
+        t.wait("the node's scan to the tip", 120, || names(&node(&r)["prunedGap"], &heights) && r.engine.status()["synced"] == true);
         let gap = node(&r)["prunedGap"].clone();
         assert_eq!((gap["via"].clone(), gap["resolved"].clone()), (Value::Null, json!(false)), "{gap}");
-        assert_eq!(gap["heights"], json!(heights), "{gap}");
+        assert!(names(&gap, &heights), "{gap}");
         assert_eq!(r.sats("confirmed"), 0, "the pruned blocks hold every payment");
         r.engine.shutdown();
     }
@@ -134,7 +140,7 @@ fn restore_from_a_pruned_node() {
         let (r, _rpc, _dir) = restore(&t, RegtestConfig { electrum: vec![format!("tcp://{electrum}")], ..local() });
         t.wait("the gap covered by the server", 120, || node(&r)["prunedGap"]["resolved"] == true && r.sats("confirmed") == balance);
         let gap = node(&r)["prunedGap"].clone();
-        assert_eq!((gap["via"].as_str(), gap["heights"].clone()), (Some("electrum-0"), json!(heights)), "{gap}");
+        assert!(gap["via"] == "electrum-0" && names(&gap, &heights), "{gap}");
         assert_eq!(r.engine.status()["authority"]["kind"], "local_node");
         r.engine.shutdown();
     }

@@ -13,7 +13,7 @@ use super::{
     CFHeaderBatch, CFHeaderChanges, ChainState, Filter, FilterCheck, FilterHeaderRequest,
     FilterRequest, FilterRequestState, HeaderSyncEffect, HeaderValidationExt, PeerId,
 };
-use crate::{chain::BlockHeaderChanges, messages::Event, Dialog, Info, Progress};
+use crate::{chain::BlockHeaderChanges, messages::Event, Dialog, Info};
 use crate::{FilterType, IndexedFilter};
 
 const CF_HEADER_BATCH_SIZE: u32 = 1_999;
@@ -173,11 +173,12 @@ impl Chain {
             if expected.ne(batch.prev_header()) {
                 // This is an older message and we already have the headers corresponding to this
                 // message
-                if self
-                    .header_chain
-                    .iter_data()
-                    .filter_map(|node| node.filter_commitment)
-                    .any(|commit| commit.header.eq(batch.prev_header()))
+                if batch.stop_hash().ne(&request.stop_hash)
+                    && self
+                        .header_chain
+                        .iter_data()
+                        .filter_map(|node| node.filter_commitment)
+                        .any(|commit| commit.header.eq(batch.prev_header()))
                 {
                     return Ok(CFHeaderChanges::AddedToQueue);
                 } else {
@@ -210,48 +211,34 @@ impl Chain {
             return Err(CFHeaderSyncError::StartHeightMisalignment);
         }
 
-        let pending_batch = match self.request_state.pending_batch.take() {
+        let mut agreeing_peers = match self.request_state.pending_batch.take() {
             // The pending batch answered an earlier request, before the tip moved: start over.
-            Some((_, pending)) if pending.stop_hash().ne(&batch.stop_hash()) => {
-                self.request_state.agreement_state.reset_agreements();
-                None
-            }
-            other => other,
-        };
-        match pending_batch {
-            Some((id, pending)) => {
-                if peer_id.eq(&id) {
-                    // A repeat from the same peer adds no vote; the batch stays pending.
-                    self.request_state.pending_batch = Some((id, pending));
+            Some((_, pending)) if pending.stop_hash().ne(&batch.stop_hash()) => Vec::new(),
+            Some((agreeing_peers, pending)) => {
+                if agreeing_peers.contains(&peer_id) {
+                    self.request_state.pending_batch = Some((agreeing_peers, pending));
                     return Ok(CFHeaderChanges::AddedToQueue);
                 }
                 if pending.ne(&batch) {
-                    self.request_state.pending_batch = None;
-                    self.request_state.agreement_state.reset_agreements();
-                    Ok(CFHeaderChanges::Conflict)
-                } else {
-                    self.request_state.agreement_state.got_agreement(peer_id);
-                    if self.request_state.agreement_state.enough_agree() {
-                        self.request_state.agreement_state.reset_agreements();
-                        self.push_cf_header_batch(batch, request.stop_hash);
-                        Ok(CFHeaderChanges::Extended)
-                    } else {
-                        self.request_state.pending_batch = Some((id, batch));
-                        Ok(CFHeaderChanges::AddedToQueue)
-                    }
+                    return Ok(CFHeaderChanges::Conflict);
                 }
+                agreeing_peers
             }
-            None => {
-                self.request_state.agreement_state.got_agreement(peer_id);
-                if self.request_state.agreement_state.enough_agree() {
-                    self.request_state.agreement_state.reset_agreements();
-                    self.push_cf_header_batch(batch, request.stop_hash);
-                    Ok(CFHeaderChanges::Extended)
-                } else {
-                    self.request_state.pending_batch = Some((peer_id, batch));
-                    Ok(CFHeaderChanges::AddedToQueue)
-                }
-            }
+            None => Vec::new(),
+        };
+        agreeing_peers.push(peer_id);
+        if self
+            .request_state
+            .agreement_state
+            .enough_agree(&agreeing_peers)
+        {
+            self.push_cf_header_batch(batch, request.stop_hash);
+            self.dialog
+                .send_info(Info::CFHeadersAdded(height_of_stop_hash));
+            Ok(CFHeaderChanges::Extended)
+        } else {
+            self.request_state.pending_batch = Some((agreeing_peers, batch));
+            Ok(CFHeaderChanges::AddedToQueue)
         }
     }
 
@@ -344,23 +331,37 @@ impl Chain {
                 return Err(CFilterSyncError::UnknownFilterHash);
             }
         }
-        let height = self
+        let Some(height) = self
             .header_chain
-            .height_of_hash(filter_message.block_hash)
-            .ok_or(CFilterSyncError::UnknownFilterHash)?;
+            .height_of_hash_canonical_only(filter_message.block_hash)
+        else {
+            return Ok(FilterCheck {
+                was_last_in_batch: false,
+            });
+        };
         let header = self
             .header_chain
             .header_at_hash(filter_message.block_hash)
             .ok_or(CFilterSyncError::UnknownFilterHash)?;
+        let request = self
+            .request_state
+            .last_filter_request
+            .as_mut()
+            .ok_or(CFilterSyncError::UnrequestedStophash)?;
+        if height.ne(&request.next_height) {
+            if height > request.next_height && height <= request.stop_height {
+                return Err(CFilterSyncError::OutOfOrderFilter);
+            }
+            return Ok(FilterCheck {
+                was_last_in_batch: false,
+            });
+        }
+        request.next_height = height + 1;
+        let was_last_in_batch = height.eq(&request.stop_height);
         let indexed_filter = IndexedFilter::new(height, header, filter);
         self.dialog.send_event(Event::IndexedFilter(indexed_filter));
         self.header_chain.check_filter(filter_message.block_hash);
-        let stop_hash = self
-            .request_state
-            .last_filter_request
-            .ok_or(CFilterSyncError::UnrequestedStophash)?
-            .stop_hash;
-        let was_last_in_batch = filter_message.block_hash.eq(&stop_hash);
+        self.dialog.send_info(Info::FilterAdded(height));
         Ok(FilterCheck { was_last_in_batch })
     }
 
@@ -376,14 +377,23 @@ impl Chain {
             }
             last_unchecked_filter = block_data.height;
         }
-        let stop_hash_index = last_unchecked_filter + FILTER_BATCH_SIZE;
+        let stop_height = match self.request_state.last_filter_request {
+            Some(in_flight)
+                if in_flight.next_height.eq(&last_unchecked_filter)
+                    && last_unchecked_filter.le(&in_flight.stop_height) =>
+            {
+                in_flight.stop_height
+            }
+            _ => last_unchecked_filter + FILTER_BATCH_SIZE,
+        }
+        .min(self.header_chain.height());
         let stop_hash = self
             .header_chain
-            .block_hash_at_height(stop_hash_index)
+            .block_hash_at_height(stop_height)
             .unwrap_or(self.header_chain.tip_hash());
         self.request_state.last_filter_request = Some(FilterRequest {
-            stop_hash,
-            start_height: last_unchecked_filter,
+            next_height: last_unchecked_filter,
+            stop_height,
         });
         GetCFilters {
             filter_type: self.filter_type.into(),
@@ -399,7 +409,6 @@ impl Chain {
 
     // Reset the compact filter queue because we received a new block
     pub(crate) fn clear_compact_filter_queue(&mut self) {
-        self.request_state.agreement_state.reset_agreements();
         self.request_state.last_filter_header_request = None;
         self.request_state.pending_batch = None;
     }
@@ -407,23 +416,6 @@ impl Chain {
     // Check every filter again for new scripts; the agreed filter headers stay.
     pub(crate) fn clear_filters(&mut self) {
         self.header_chain.reset_filter_state();
-    }
-
-    pub(crate) fn send_chain_update(&self) {
-        self.dialog.send_info(Info::Progress(Progress::new(
-            self.header_chain.total_filter_headers_synced(),
-            self.header_chain.total_filters_synced(),
-            self.header_chain.internal_chain_len() as u32,
-            self.header_chain.height(),
-        )));
-        crate::debug!(format!(
-            "Headers: {} CFHeaders: ({}/{}) CFilters: ({}/{})",
-            self.header_chain.height(),
-            self.header_chain.total_filter_headers_synced(),
-            self.header_chain.internal_chain_len() as u32,
-            self.header_chain.total_filters_synced(),
-            self.header_chain.internal_chain_len() as u32,
-        ));
     }
 }
 
@@ -440,8 +432,9 @@ mod tests {
         p2p::message_filter::{CFHeaders, CFilter},
         BlockHash, FilterHash, FilterHeader,
     };
-    use corepc_node::serde_json;
+    use bitcoind::serde_json;
 
+    use crate::chain::error::CFilterSyncError;
     use crate::chain::ChainState;
     use crate::FilterType;
     use crate::{
@@ -454,7 +447,7 @@ mod tests {
 
     fn new_regtest(anchor: HashCheckpoint, peers: u8) -> Chain {
         let (info_tx, _) = tokio::sync::mpsc::channel::<Info>(1);
-        let (warn_tx, _) = tokio::sync::mpsc::unbounded_channel::<Warning>();
+        let (warn_tx, _) = tokio::sync::mpsc::channel::<Warning>(1);
         let (event_tx, _) = tokio::sync::mpsc::unbounded_channel::<Event>();
         Chain::new(
             bitcoin::Network::Regtest,
@@ -568,6 +561,196 @@ mod tests {
         serde_json::from_reader(&file).unwrap()
     }
 
+    #[test]
+    fn receiving_stop_filter_first_must_not_skip_unreceived_filters() {
+        let scenario = load_scenario();
+        let mut chain = new_regtest(base_block(), 2);
+        chain.sync_chain(scenario.most_work_headers()).unwrap();
+        let request = chain.next_cf_header_message();
+        let headers = CFHeaders {
+            filter_type: 0,
+            stop_hash: request.stop_hash,
+            previous_filter_header: scenario.prev_header(),
+            filter_hashes: scenario.n_most_work_filter_hashes(5),
+        };
+        chain.sync_cf_headers(1.into(), headers.clone()).unwrap();
+        chain.sync_cf_headers(2.into(), headers).unwrap();
+        assert!(chain.is_cf_headers_synced());
+        let original = chain.next_filter_message();
+
+        let stop_filter = scenario.filters().last().unwrap().clone();
+        let _ = chain.sync_filter(stop_filter);
+        assert!(!chain.is_filters_synced());
+
+        let retry = chain.next_filter_message();
+        assert_eq!(
+            retry.start_height, original.start_height,
+            "a stop-hash response permanently advanced past missing filters"
+        );
+    }
+
+    #[test]
+    fn reissued_filter_request_keeps_in_flight_stop() {
+        let scenario = load_scenario();
+        let mut chain = new_regtest(base_block(), 1);
+        let first_headers = scenario.n_most_work_headers(3);
+        chain.sync_chain(first_headers.clone()).unwrap();
+        let request = chain.next_cf_header_message();
+        chain
+            .sync_cf_headers(
+                1.into(),
+                CFHeaders {
+                    filter_type: 0,
+                    stop_hash: request.stop_hash,
+                    previous_filter_header: scenario.prev_header(),
+                    filter_hashes: scenario.n_most_work_filter_hashes(3),
+                },
+            )
+            .unwrap();
+        let original = chain.next_filter_message();
+        let mut filters = scenario.filters().into_iter();
+        chain.sync_filter(filters.next().unwrap()).unwrap();
+
+        chain.sync_chain(scenario.most_work_headers()).unwrap();
+        let previous_filter_header = chain
+            .header_chain
+            .filter_commitment(first_headers[2].block_hash())
+            .unwrap()
+            .header;
+        let request = chain.next_cf_header_message();
+        chain
+            .sync_cf_headers(
+                1.into(),
+                CFHeaders {
+                    filter_type: 0,
+                    stop_hash: request.stop_hash,
+                    previous_filter_header,
+                    filter_hashes: scenario.n_most_work_filter_hashes(5)[3..].to_vec(),
+                },
+            )
+            .unwrap();
+        let reissued = chain.next_filter_message();
+        assert_eq!(reissued.stop_hash, original.stop_hash);
+
+        assert!(
+            !chain
+                .sync_filter(filters.next().unwrap())
+                .unwrap()
+                .was_last_in_batch
+        );
+        assert!(
+            chain
+                .sync_filter(filters.next().unwrap())
+                .unwrap()
+                .was_last_in_batch
+        );
+    }
+
+    #[test]
+    fn test_stale_filter_replay_ignored() {
+        let scenario = load_scenario();
+        let mut chain = new_regtest(base_block(), 1);
+        let (info_tx, _) = tokio::sync::mpsc::channel::<Info>(1);
+        let (warn_tx, _) = tokio::sync::mpsc::channel::<Warning>(1);
+        let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        chain.dialog = Arc::new(Dialog::new(info_tx, warn_tx, event_tx));
+
+        let stale = scenario.stale_chain.first().unwrap();
+        let stale_hash = stale.header.0.block_hash();
+        let mut old_headers = scenario.n_most_work_headers(3);
+        old_headers.push(stale.header.0);
+        chain.sync_chain(old_headers).unwrap();
+        let old_request = chain.next_cf_header_message();
+        let mut old_hashes = scenario.n_most_work_filter_hashes(3);
+        old_hashes.push(stale.filter_hash());
+        chain
+            .sync_cf_headers(
+                1.into(),
+                CFHeaders {
+                    filter_type: 0,
+                    stop_hash: old_request.stop_hash,
+                    previous_filter_header: scenario.prev_header(),
+                    filter_hashes: old_hashes,
+                },
+            )
+            .unwrap();
+
+        chain.sync_chain(scenario.most_work_headers()).unwrap();
+        let shared_hash = scenario.most_work_headers()[2].block_hash();
+        let previous_filter_header = chain
+            .header_chain
+            .filter_commitment(shared_hash)
+            .unwrap()
+            .header;
+        let new_request = chain.next_cf_header_message();
+        chain
+            .sync_cf_headers(
+                1.into(),
+                CFHeaders {
+                    filter_type: 0,
+                    stop_hash: new_request.stop_hash,
+                    previous_filter_header,
+                    filter_hashes: scenario.n_most_work_filter_hashes(5)[3..].to_vec(),
+                },
+            )
+            .unwrap();
+        chain.next_filter_message();
+        while events.try_recv().is_ok() {}
+
+        let mut filters = scenario.filters().into_iter();
+        for filter in filters.by_ref().take(3) {
+            chain.sync_filter(filter).unwrap();
+        }
+        let stale_filter = CFilter {
+            filter_type: 0,
+            block_hash: stale_hash,
+            filter: stale.filter.0.clone(),
+        };
+        assert!(!chain.sync_filter(stale_filter).unwrap().was_last_in_batch);
+        for filter in filters {
+            chain.sync_filter(filter).unwrap();
+        }
+
+        let mut emitted = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::IndexedFilter(filter) = event {
+                emitted.push(filter.block_hash());
+            }
+        }
+        let expected: Vec<BlockHash> = scenario
+            .most_work_headers()
+            .iter()
+            .map(|header| header.block_hash())
+            .collect();
+        assert_eq!(emitted, expected);
+        assert!(chain.is_filters_synced());
+    }
+
+    #[test]
+    fn compact_filter_quorum_counts_each_peer_only_once() {
+        for peer_ids in [[1_u32, 1, 1, 1, 1], [1_u32, 2, 2, 2, 2]] {
+            let scenario = load_scenario();
+            let mut chain = new_regtest(base_block(), 3);
+            chain.sync_chain(scenario.most_work_headers()).unwrap();
+            let request = chain.next_cf_header_message();
+            let empty_filter_hash = FilterHash::from_raw_hash(sha256d::Hash::hash(&[0]));
+            let forged = CFHeaders {
+                filter_type: 0,
+                stop_hash: request.stop_hash,
+                previous_filter_header: scenario.prev_header(),
+                filter_hashes: vec![empty_filter_hash; 5],
+            };
+            for peer_id in peer_ids {
+                let result = chain.sync_cf_headers(peer_id.into(), forged.clone());
+                assert!(
+                    !matches!(result, Ok(CFHeaderChanges::Extended)),
+                    "fewer than three distinct peers authenticated forged empty filters"
+                );
+                assert!(!chain.is_cf_headers_synced());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_fork_includes_old_vals() {
         let gen = base_block();
@@ -630,9 +813,19 @@ mod tests {
         assert_eq!(CFHeaderChanges::Extended, append_attempt);
         assert!(chain.is_cf_headers_synced());
         chain.next_filter_message();
-        for filter in scenario.filters().into_iter().rev() {
-            assert!(chain.sync_filter(filter).is_ok())
+        let filters = scenario.filters();
+        for filter in filters[1..].iter().rev() {
+            assert!(matches!(
+                chain.sync_filter(filter.clone()),
+                Err(CFilterSyncError::OutOfOrderFilter)
+            ));
         }
+        assert!(!chain.is_filters_synced());
+        let (last, rest) = filters.split_last().unwrap();
+        for filter in rest {
+            assert!(!chain.sync_filter(filter.clone()).unwrap().was_last_in_batch);
+        }
+        assert!(chain.sync_filter(last.clone()).unwrap().was_last_in_batch);
         assert!(chain.is_filters_synced());
     }
 
@@ -665,7 +858,7 @@ mod tests {
             filter: mismatch_filter,
         });
         assert!(sync_filter_1.is_err());
-        let good_filter = scenario.filters().last().unwrap().clone();
+        let good_filter = scenario.filters().first().unwrap().clone();
         let sync_filter_1 = chain.sync_filter(good_filter);
         assert!(sync_filter_1.is_ok());
     }
@@ -830,6 +1023,8 @@ mod tests {
         assert!(sync_filter_1.is_ok());
         let sync_filter_2 = chain.sync_filter(filters[1].clone());
         assert!(sync_filter_2.is_ok());
+        let sync_filter_3 = chain.sync_filter(filters[2].clone());
+        assert!(sync_filter_3.is_ok());
         let sync_filter_4 = chain.sync_filter(filters[3].clone());
         assert!(sync_filter_4.is_ok());
     }
@@ -1099,47 +1294,6 @@ mod tests {
             previous_filter_header: scenario.prev_header(),
             filter_hashes,
         }
-    }
-
-    #[tokio::test]
-    async fn one_peer_repeating_a_batch_is_one_vote() {
-        let mut chain = new_regtest(base_block(), 2);
-        let scenario = load_scenario();
-        assert!(chain.sync_chain(scenario.most_work_headers()).is_ok());
-        chain.next_cf_header_message();
-        let stale_hash = scenario.stale_chain[0].filter_hash();
-        let mut forged_hashes = scenario.n_most_work_filter_hashes(4);
-        forged_hashes.push(stale_hash);
-        let forged = cf_headers(&scenario, forged_hashes);
-        for _ in 0..5 {
-            let changes = chain.sync_cf_headers(7.into(), forged.clone()).unwrap();
-            assert_eq!(changes, CFHeaderChanges::AddedToQueue);
-        }
-        assert!(!chain.is_cf_headers_synced());
-        let tip = scenario.last_block_hash();
-        assert_ne!(chain.header_chain.filter_hash(tip), Some(stale_hash));
-        // A second peer with the real batch disagrees: a conflict, never the forged batch.
-        let honest = cf_headers(&scenario, scenario.n_most_work_filter_hashes(5));
-        let changes = chain.sync_cf_headers(8.into(), honest).unwrap();
-        assert_eq!(changes, CFHeaderChanges::Conflict);
-        assert!(!chain.is_cf_headers_synced());
-    }
-
-    #[tokio::test]
-    async fn two_peers_cannot_meet_a_quorum_of_three() {
-        let mut chain = new_regtest(base_block(), 3);
-        let scenario = load_scenario();
-        assert!(chain.sync_chain(scenario.most_work_headers()).is_ok());
-        chain.next_cf_header_message();
-        let batch = cf_headers(&scenario, scenario.n_most_work_filter_hashes(5));
-        for peer in [1, 2, 2, 1] {
-            let changes = chain.sync_cf_headers(peer.into(), batch.clone()).unwrap();
-            assert_eq!(changes, CFHeaderChanges::AddedToQueue);
-        }
-        assert!(!chain.is_cf_headers_synced());
-        let changes = chain.sync_cf_headers(3.into(), batch).unwrap();
-        assert_eq!(changes, CFHeaderChanges::Extended);
-        assert!(chain.is_cf_headers_synced());
     }
 
     #[tokio::test]

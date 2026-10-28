@@ -1,7 +1,7 @@
-From c5170e7fe9d2dd463b9e20aa1952c1b724081074 Mon Sep 17 00:00:00 2001
+From 0686f283f4a09e824fcbc0e794a747ace5555f71 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sat, 10 Oct 2026 22:33:18 -0300
-Subject: [PATCH 4/4] fix(network): a random nonce in each version message
+Subject: [PATCH 3/5] fix(network): a random nonce in each version message
 
 Every version message carried nonce 1, so a peer could recognise a Kyoto
 client from it. Each version message now carries a random nonce, as Core's
@@ -11,7 +11,7 @@ do.
  1 file changed, 18 insertions(+), 1 deletion(-)
 
 diff --git a/src/network/outbound.rs b/src/network/outbound.rs
-index 1014848..79febdf 100644
+index 43172a1..c130053 100644
 --- a/src/network/outbound.rs
 +++ b/src/network/outbound.rs
 @@ -6,6 +6,7 @@ use std::{
@@ -22,7 +22,7 @@ index 1014848..79febdf 100644
      p2p::{
          message::{NetworkMessage, RawNetworkMessage},
          message_blockdata::Inventory,
-@@ -98,9 +99,25 @@ pub(in crate::network) fn make_version(relay_policy: &RelayPolicy) -> VersionMes
+@@ -102,9 +103,25 @@ pub(in crate::network) fn make_version(relay_policy: &RelayPolicy) -> VersionMes
          timestamp: now as i64,
          receiver: from_and_recv.clone(),
          sender: from_and_recv,
@@ -49,3 +49,6 @@ index 1014848..79febdf 100644
 +        assert_eq!(nonces.len(), 8);
 +    }
 +}
+-- 
+2.54.0 (Apple Git-157)
+

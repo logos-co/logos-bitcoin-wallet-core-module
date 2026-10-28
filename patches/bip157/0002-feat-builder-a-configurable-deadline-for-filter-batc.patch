@@ -1,7 +1,7 @@
-From 807dd4f6931d8e29f6736546e122946f55aba781 Mon Sep 17 00:00:00 2001
+From df610eba2db7d46480319c8f2820fb424bd3bc0f Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sat, 10 Oct 2026 22:32:57 -0300
-Subject: [PATCH 3/4] feat(builder): a configurable deadline for filter batches
+Subject: [PATCH 2/5] feat(builder): a configurable deadline for filter batches
 
 A peer had 20 seconds, hard-coded, to send a whole batch of up to 999
 filters, about 20 MB on mainnet, which rarely arrives in time over Tor.
@@ -33,7 +33,7 @@ index f1dc654..631893b 100644
      /// believed to be at the current chain tip, filters will be downloaded for newly mined
      /// blocks. This feature is intended for new wallets that have never received a payment.
 diff --git a/src/network/mod.rs b/src/network/mod.rs
-index 8f02c27..217f797 100644
+index a5aefb3..5d94c9f 100644
 --- a/src/network/mod.rs
 +++ b/src/network/mod.rs
 @@ -52,7 +52,7 @@ const TWO_HOUR: Duration = Duration::from_secs(60 * 60 * 2);
@@ -62,7 +62,7 @@ index 8f02c27..217f797 100644
          }
      }
  }
-@@ -378,10 +381,10 @@ impl FilterRate {
+@@ -419,10 +422,10 @@ impl FilterRate {
          }
      }
  
@@ -75,7 +75,7 @@ index 8f02c27..217f797 100644
                  return true;
              }
          }
-@@ -576,7 +579,7 @@ mod tests {
+@@ -626,7 +629,7 @@ mod tests {
  
      use crate::network::{LastBlockMonitor, MessageState, PingState};
  
@@ -84,7 +84,7 @@ index 8f02c27..217f797 100644
  
      #[tokio::test(start_paused = true)]
      async fn test_version_message_state() {
-@@ -677,10 +680,14 @@ mod tests {
+@@ -727,10 +730,14 @@ mod tests {
          let block_hash_bytes = [1; 32];
          let block_hash = BlockHash::from_byte_array(block_hash_bytes);
          filter_rate.batch_requested(block_hash);
@@ -103,10 +103,10 @@ index 8f02c27..217f797 100644
      }
  }
 diff --git a/src/network/peer.rs b/src/network/peer.rs
-index 551211f..606566e 100644
+index acee7d6..7ad6fd1 100644
 --- a/src/network/peer.rs
 +++ b/src/network/peer.rs
-@@ -165,7 +165,11 @@ impl Peer {
+@@ -157,7 +157,11 @@ impl Peer {
                  self.dialog.send_warning(Warning::PeerTimedOut);
                  return Ok(());
              }
@@ -119,3 +119,6 @@ index 551211f..606566e 100644
                  self.dialog.send_warning(Warning::PeerTimedOut);
                  return Ok(());
              }
+-- 
+2.54.0 (Apple Git-157)
+

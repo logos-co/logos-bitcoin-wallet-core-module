@@ -9,7 +9,9 @@ use tokio::sync::oneshot;
 use crate::chain::block_subsidy;
 use crate::chain::IndexedHeader;
 use crate::messages::ClientRequest;
-use crate::{Event, GossipMonitorRequest, HashCheckpoint, Info, Package, TrustedPeer, Warning};
+use crate::{
+    BlockType, Event, GossipMonitorRequest, HashCheckpoint, Info, Package, TrustedPeer, Warning,
+};
 
 use super::{error::ClientError, messages::ClientMessage};
 use super::{error::FetchBlockError, IndexedBlock};
@@ -22,7 +24,7 @@ pub struct Client {
     /// Receive informational messages from the node.
     pub info_rx: mpsc::Receiver<Info>,
     /// Receive warning messages from a node.
-    pub warn_rx: mpsc::UnboundedReceiver<Warning>,
+    pub warn_rx: mpsc::Receiver<Warning>,
     /// Receive [`Event`] from a node to act on.
     pub event_rx: mpsc::UnboundedReceiver<Event>,
 }
@@ -30,7 +32,7 @@ pub struct Client {
 impl Client {
     pub(crate) fn new(
         info_rx: mpsc::Receiver<Info>,
-        warn_rx: mpsc::UnboundedReceiver<Warning>,
+        warn_rx: mpsc::Receiver<Warning>,
         event_rx: mpsc::UnboundedReceiver<Event>,
         ntx: UnboundedSender<ClientMessage>,
     ) -> Self {
@@ -114,7 +116,7 @@ impl Requester {
     /// If the node has stopped running.
     pub async fn get_block(&self, block_hash: BlockHash) -> Result<IndexedBlock, FetchBlockError> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<IndexedBlock, FetchBlockError>>();
-        let message = ClientRequest::new(block_hash, tx);
+        let message = ClientRequest::new((block_hash, None), tx);
         self.ntx
             .send(ClientMessage::GetBlock(message))
             .map_err(|_| FetchBlockError::SendError)?;
@@ -132,7 +134,7 @@ impl Requester {
         block_hash: BlockHash,
     ) -> Result<oneshot::Receiver<Result<IndexedBlock, FetchBlockError>>, FetchBlockError> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<IndexedBlock, FetchBlockError>>();
-        let message = ClientRequest::new(block_hash, tx);
+        let message = ClientRequest::new((block_hash, None), tx);
         self.ntx
             .send(ClientMessage::GetBlock(message))
             .map_err(|_| FetchBlockError::SendError)?;
@@ -150,11 +152,14 @@ impl Requester {
         block_hash: BlockHash,
     ) -> Result<FeeRate, FetchBlockError> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<IndexedBlock, FetchBlockError>>();
-        let message = ClientRequest::new(block_hash, tx);
+        let message = ClientRequest::new((block_hash, Some(BlockType::Witness)), tx);
         self.ntx
             .send(ClientMessage::GetBlock(message))
             .map_err(|_| FetchBlockError::SendError)?;
         let indexed_block = rx.await.map_err(|_| FetchBlockError::RecvError)??;
+        if !indexed_block.block.check_witness_commitment() {
+            return Err(FetchBlockError::InvalidWitnessCommitment);
+        }
         let subsidy = block_subsidy(indexed_block.height);
         let weight = indexed_block.block.weight();
         let revenue = indexed_block
@@ -312,7 +317,7 @@ impl Requester {
     }
 
     /// Unsubscribe from all transaction gossip.
-    pub async fn unsubscribe_from_gossip(&self) -> Result<(), ClientError> {
+    pub fn unsubscribe_from_gossip(&self) -> Result<(), ClientError> {
         self.ntx
             .send(ClientMessage::UnsubscribeGossip)
             .map_err(|_| ClientError::SendError)

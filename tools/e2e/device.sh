@@ -11,7 +11,7 @@ WORK="${WORK:?set WORK to a scratch directory}"; mkdir -p "$WORK"; cd "$WORK"
 source "$HERE/common.sh"
 # The mains a device account opens with (data password, origins): keystore, manager, its fixture.
 KEYSTORE=github:logos-co/logos-evm-keystore-module/40633a919d0299eca5c4511971191c8a3dd173c4
-MANAGER=github:logos-co/logos-signer-manager-module/3ef020c16f8c6a3e1f5bd56c63d3b12b5cd55f6c
+MANAGER=github:logos-co/logos-signer-manager-module/9be21c3aeaa68ba915d36bfb67b5ed563585b9b7
 DEVICE="$MANAGER?dir=doctests/mock-device"
 ACCOUNT=mock-segwit
 PEOPLE='"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]'

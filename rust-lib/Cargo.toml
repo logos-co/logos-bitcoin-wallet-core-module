@@ -19,7 +19,7 @@ bdk_wallet = { version = "=3.2.0", features = ["rusqlite"] }
 bdk_electrum = { version = "=0.24.1", default-features = false, features = ["use-rustls-ring"] }
 bdk_esplora = { version = "=0.22.3", default-features = false, features = ["std", "async-https-rustls", "tokio"] }
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
-# Kyoto, the light client: bdk_kyoto 0.18.1 on bip157 0.7.0 with our patches (see [patch] below).
+# Kyoto, the light client: bdk_kyoto 0.18.1 on bip157 0.8.0 with our patches (see [patch] below).
 bdk_kyoto = "=0.18.1"
 # The local node: bitcoind_module's rpc over Logos IPC behind bitcoincore_rpc's RpcApi.
 bdk_bitcoind_rpc = "=0.22.1"
@@ -44,7 +44,7 @@ rand = "0.8"
 zeroize = "1"
 thiserror = "2"
 # The core's keys for each wallet's data, from the signer manager, and the box they seal.
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "eab22d1a990adfb973aa8669175e366d28cf0803" }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d8cfff84327c9b2b5cdb9702d1c4217cad567cee" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
@@ -57,7 +57,7 @@ rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"]
 
 [dev-dependencies]
 tempfile = "3"
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "eab22d1a990adfb973aa8669175e366d28cf0803", features = ["mock"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d8cfff84327c9b2b5cdb9702d1c4217cad567cee", features = ["mock"] }
 
 [features]
 default = ["logos_module"]
@@ -102,7 +102,7 @@ required-features = ["test-hooks"]
 name = "peers"
 required-features = ["test-hooks"]
 
-# bip157 0.7.0 as published plus patches/bip157, held to an allowlist (tools/kyoto, README).
+# bip157 0.8.0 as published plus patches/bip157, held to an allowlist (tools/kyoto, README).
 [patch.crates-io]
 bip157 = { path = "vendor/bip157" }
 # bdk_kyoto 0.18.1 plus patches/bdk_kyoto, held to tools/kyoto/patch-bdk_kyoto.sh's allowlist.
