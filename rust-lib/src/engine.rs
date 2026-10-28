@@ -118,6 +118,8 @@ struct OpenWallet {
     /// Held while the wallet is open, zeroized when this drops.
     _key: Zeroizing<[u8; 32]>,
     descriptors: (Zeroizing<String>, Zeroizing<String>),
+    /// The account xpub from the descriptors, brought with each signature request.
+    xpub: Zeroizing<String>,
     stop: Arc<AtomicBool>,
     cancel: crate::net::Cancel,
     wake: Arc<AtomicBool>,
@@ -624,6 +626,7 @@ impl Engine {
             #[cfg(not(any(test, feature = "test-hooks")))]
             on_widen: None,
         };
+        let xpub = Zeroizing::new(manager::descriptor_xpub(&grant.external).ok_or("open result: no account xpub in the descriptor")?);
         let thread = sync::spawn(ctx, authority).map_err(|e| e.to_string())?;
         let result = json!({
             "group": grant.group, "family": grant.family, "network": network.name(), "created": created || !existed,
@@ -638,6 +641,7 @@ impl Engine {
             cell,
             _key: grant.database_key,
             descriptors: (Zeroizing::new(grant.external), Zeroizing::new(grant.internal)),
+            xpub,
             stop,
             cancel,
             wake,
@@ -940,7 +944,8 @@ impl Engine {
         cancel: &AtomicBool,
     ) -> Result<Value, String> {
         let purpose = if kind == "fee_bump" { "Raise the fee of a Bitcoin send" } else { "Bitcoin send" };
-        let intent = manager::approval_intent(group, purpose, network, &psbt.to_string());
+        let xpub = self.with_open(|w| if w.group == group { Ok(w.xpub.clone()) } else { Err("the wallet closed".into()) })?;
+        let intent = Zeroizing::new(manager::approval_intent(group, &xpub, purpose, network, &psbt.to_string()));
         if intent.len() > send::MAX_INTENT_BYTES {
             return Err("the transaction is too large to ask for approval".into());
         }

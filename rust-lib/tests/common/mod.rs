@@ -118,7 +118,7 @@ impl MockManager {
         let account = if taproot { "mock-taproot" } else { "mock-segwit" };
         let mut s = self.signer.lock().unwrap();
         let job = s
-            .sign(SignRequest { account: account.into(), payload: Payload::BtcPsbt { network: "regtest".into(), psbt: psbt_b64.into() }, secret: None })
+            .sign(SignRequest { account: account.into(), payload: Payload::BtcPsbt { network: "regtest".into(), psbt: psbt_b64.into() }, secret: None, xpub: None })
             .map_err(|e| e.to_string())?;
         let sigs = s.result(&job).map_err(|e| e.to_string())?;
         for sig in sigs {

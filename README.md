@@ -383,8 +383,11 @@ An amount below its address's dust limit (`ScriptBuf::minimal_non_dust`, Bitcoin
 address can receive is 294 sats." So is a send max that the fee leaves below the limit. Change
 that would be dust goes to the fee, as BDK decides.
 
-`sign_and_broadcast` (backend only) sends `request_approval` with exactly one psbt leg and keeps the
-receipt. While the person decides, `approvalHandle: "smh_…"` shows in `status` and in `preview`, so
+`sign_and_broadcast` (backend only) sends `request_approval` with exactly one psbt leg and the open
+wallet's account xpub, taken from its descriptors, and keeps the receipt. A signer that keeps its
+xpub sealed lists none, so the manager checks the one the request brings against the wallet's
+roster key and uses it for that request alone. The xpub lives in the core's memory while the
+wallet is open, and nowhere else. While the person decides, `approvalHandle: "smh_…"` shows in `status` and in `preview`, so
 the app can raise `evm.signing.approve` with `{ handle }`. An offer nobody acknowledges within 60 s
 settles `expired_no_ack`; the job fails with the reason and the preview stays, so a new request can be
 made. On approval it fetches the PSBT, copies only the signatures onto the PSBT it built after

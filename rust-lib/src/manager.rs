@@ -111,9 +111,18 @@ pub fn open_grant(reply: &str, net: BNetwork) -> Result<Option<OpenGrant>, Strin
     Ok(Some(grant))
 }
 
-/// A Bitcoin intent: the group and exactly one psbt leg.
-pub fn approval_intent(group: &str, purpose: &str, network: BNetwork, psbt_base64: &str) -> String {
-    json!({"group": group, "purpose": purpose, "legs": [{"kind": "psbt", "network": network.name(), "psbt": psbt_base64}]}).to_string()
+/// A Bitcoin intent: the group, its xpub and exactly one psbt leg. A signer that keeps the xpub
+/// sealed lists none, so the open wallet brings it; the manager checks it is the group's.
+pub fn approval_intent(group: &str, xpub: &str, purpose: &str, network: BNetwork, psbt_base64: &str) -> String {
+    json!({"group": group, "xpub": xpub, "purpose": purpose, "legs": [{"kind": "psbt", "network": network.name(), "psbt": psbt_base64}]}).to_string()
+}
+
+/// The account xpub in a descriptor such as `wpkh([73c5da0a/84'/1'/0']tpub…/0/*)#…`.
+pub fn descriptor_xpub(descriptor: &str) -> Option<String> {
+    use std::str::FromStr;
+    let after = &descriptor[descriptor.find(']')? + 1..];
+    let xpub = &after[..after.find('/')?];
+    bitcoin::bip32::Xpub::from_str(xpub).ok().map(|_| xpub.to_string())
 }
 
 pub fn signed_psbts(reply: &str) -> Result<Vec<String>, String> {
@@ -231,14 +240,24 @@ mod tests {
     }
 
     #[test]
+    fn the_xpub_a_request_brings_is_the_descriptors() {
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        assert_eq!(descriptor_xpub(&format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)#4ae3dsxx")).as_deref(), Some(x));
+        assert_eq!(descriptor_xpub(&format!("tr([73c5da0a/86'/1'/0']{x}/1/*)")).as_deref(), Some(x));
+        assert_eq!(descriptor_xpub("wpkh([73c5da0a/84'/1'/0']notanxpub/0/*)"), None);
+        assert_eq!(descriptor_xpub("wpkh(x)"), None);
+    }
+
+    #[test]
     fn requests_are_shaped_as_the_manager_takes_them() {
         let p: Value = serde_json::from_str(&open_params(BNetwork::Signet, Some("g_1"), None).unwrap()).unwrap();
         assert_eq!((p["group"].clone(), p["network"].clone()), (json!("g_1"), json!("signet")));
         let p: Value = serde_json::from_str(&open_params(BNetwork::Mainnet, None, Some(Family::BitcoinTaproot)).unwrap()).unwrap();
         assert_eq!((p["family"].clone(), p.get("group")), (json!("bitcoin_taproot"), None));
-        let i: Value = serde_json::from_str(&approval_intent("g_1", "Send", BNetwork::Signet, "cHNidP8=")).unwrap();
+        let i: Value = serde_json::from_str(&approval_intent("g_1", "tpubD6", "Send", BNetwork::Signet, "cHNidP8=")).unwrap();
         assert_eq!(i["legs"].as_array().unwrap().len(), 1);
         assert_eq!(i["legs"][0]["kind"], "psbt");
+        assert_eq!(i["xpub"], "tpubD6");
         assert_eq!(signed_psbts(&json!({"ok": true, "signed": ["cHNidP8="]}).to_string()).unwrap(), vec!["cHNidP8="]);
         assert!(require_approved("approved").is_ok());
         assert!(require_approved("expired_no_ack").unwrap_err().starts_with("expired_no_ack"));

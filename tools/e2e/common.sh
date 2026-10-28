@@ -6,7 +6,7 @@ CHAIN="$REPO/tools/regtest/chain.sh"; export CHAIN_DIR="$WORK/chain"
 # The keystore, manager and keys CLI at their mains after the device-account opens (2026-10-10).
 CLI=github:logos-co/logos-logoscore-cli/ca70bcdd9fc20434d423669652966e7fdd6148f0
 KEYSTORE=github:logos-co/logos-evm-keystore-module/1f3d62f306f0e4dc7e5d96d478f9770ab3713ce6
-MANAGER=github:logos-co/logos-signer-manager-module/80bc40ccbe6c689caadc736b3db2136bfbde1818
+MANAGER=github:logos-co/logos-signer-manager-module/9be21c3aeaa68ba915d36bfb67b5ed563585b9b7
 KCLI=github:logos-co/logos-evm-keystore-cli/99b7af1f6fa02258c4de2275ed3a019c1235aaba
 SCLI=github:logos-co/logos-evm-signer-cli/07929a33ec2d44901a1335064960d4a718b13ebe
 CORE=bitcoin_wallet_core_module
