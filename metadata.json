@@ -6,7 +6,7 @@
   "interface": "cdylib",
   "concurrency": "multi",
   "category": "wallet",
-  "description": "Bitcoin wallet engine: BDK, watch-only, its database encrypted under the key the keystore releases on open, signing through signer_manager_module, and a chain authority every server answer is checked against.",
+  "description": "Bitcoin wallet engine: BDK, watch-only, its database encrypted under its own key for the wallet from signer_manager_module once the person unlocks it, signing through signer_manager_module, and a chain authority every server answer is checked against.",
   "author": "Logos Core Team",
   "main": "bitcoin_wallet_core_module_plugin",
   "dependencies": ["signer_manager_module"],

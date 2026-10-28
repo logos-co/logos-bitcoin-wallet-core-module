@@ -11,21 +11,32 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
 - **Opening.** `open_wallet` asks `signer_manager_module` for an open grant (`request_open`). While
   the person decides in the keys app, `status` shows `{ state: "awaiting_open", openHandle: "sma_…" }`
   so the wallet app can raise `keystore.accounts.open` with `{ handle }`. On approval it fetches the
-  grant, builds the BDK wallet from `external`/`internal` exactly as given, opens the encrypted
-  database with `databaseKey`, and acknowledges. `close_wallet` calls `close_account` and forgets the
+  grant (the person's consent, the descriptors and the wallet's `seed`), builds the BDK wallet from
+  `external`/`internal` exactly as given, asks the signer manager for its own keys to that seed's
+  data (`data_key`, [logos.wallets/1](https://github.com/logos-co/logos-signer-interface/blob/main/docs/wallets.md)),
+  opens the encrypted database, and acknowledges. The open result and `status` name the `seed`. A
+  seed still locked in the Signer app answers
+  `locked`, and the open fails saying so. `close_wallet` calls `close_account` and forgets the
   key. The key and the descriptors live in memory only. Closing stops the sync within moments:
   it shuts the sync's Electrum sockets, so a call waiting on a server (a header download over a
   slow link) returns at once, and drops its pending Esplora and RPC requests and connection
   attempts. The sync writes nothing after that. `group` is any account id the manager
   lists for a Bitcoin family: a keystore group (`g_…`) or a device account (`shell-…`,
-  `keycard-…`). It names the wallet's directory, so only ASCII letters, digits, `_` and `-` are
-  taken, at most 80, and never a name Windows reserves.
+  `keycard-…`). Only ASCII letters, digits, `_` and `-` are taken, at most 80, and never a name
+  Windows reserves. Whichever signer's id opens it, an account is one wallet: its database is found,
+  and keyed, by the account's roster key (from its xpub).
 - **Encrypted storage.** BDK's own rusqlite store, with SQLCipher underneath: `rusqlite` 0.31 (BDK's
-  pin) with `bundled-sqlcipher` (CommonCrypto on Apple, vendored OpenSSL elsewhere), keyed with the
-  grant's 32-byte key. No custom persister was needed.
-- **A changed database key** (a device account whose data password was forgotten opens with a new
-  key) can't read the old database. It is set aside as `wallet.db.unreadable-<time>`, and the wallet
-  starts fresh and resyncs; the open result says `reset: true`.
+  pin) with `bundled-sqlcipher` (CommonCrypto on Apple, vendored OpenSSL elsewhere), keyed with
+  `data_key({ seed, scope: "wallet/<roster key>" })`. No custom persister was needed.
+- **Changed keys.** After the person changes a wallet's keys in the Signer app, its next open reads
+  the database with the earlier generation's key, encrypts it again under the current one
+  (`PRAGMA rekey`) and seals `wallet.json` again. A database no key of its seed opens is set aside as
+  `wallet.db.unreadable-<time>`, and the wallet starts fresh and resyncs; the open result says
+  `reset: true`.
+- **Locked wallets.** `list_wallets` lists the wallets of unlocked seeds and counts the others
+  (`locked`). The core asks for its keys again on the manager's `wallets_changed` and
+  `wallets_locked`; an open wallet whose seed was locked closes, and `walletsChanged(locked)` says
+  the list changed.
 - **Birthday.** `open_wallet`'s optional `birthday` (a height or a `YYYY-MM-DD` day) wins; then a
   birthday kept from an earlier open; then the grant's `birthday` day (managers with origins), mapped
   to a height from the header chain minus 288 blocks; then the family's activation height (segwit
@@ -530,14 +541,15 @@ there when the store holds that checkpoint.
   nothing is copied at open.
 - **What the file shows.** That the person uses the network, how far the chain is synced and when,
   and the lowest checkpoint a wallet on it starts from: on mainnet, whether some wallet's birthday
-  is before 481,824, 709,632 or 935,424. Wallet ids sit in plain `wallet.json` already. Nothing of a
-  wallet's is in it: its scripts, addresses, history, held anchors, the old hashes proved for its
+  is before 481,824, 709,632 or 935,424. Nothing of a wallet's is in it: its scripts, addresses, history, held anchors, the old hashes proved for its
   transactions (`core_old_hashes`) and its tip stay in its encrypted database.
 
 ## Persistence
 
 `<instance>/core.log`, `<instance>/headers/` ("Shared headers"), and `<instance>/wallets/` (0700),
-with per wallet `<network>/<group>/wallet.json` (group, family, network, created; 0600) and
+with per wallet a randomly named `<network>/w_<32 hex>/`, its `wallet.json` (0600: the format, the
+seed, and a box sealed under `data_key({ seed, scope: "wallets" })` holding the account id, its
+roster key, family, network and creation time) and
 `wallet.db` (SQLCipher, 0600): BDK's tables plus `core_headers` (only while the shared store can't
 take the wallet's chain, or until a wallet from before it writes again), `core_old_hashes`, `core_held` (anchors above the tip,
 and unchecked ones below the chain's start), `core_exposure`, `core_suspects`, `core_reported`,

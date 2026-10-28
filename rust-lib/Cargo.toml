@@ -43,6 +43,8 @@ base64 = "0.22"
 rand = "0.8"
 zeroize = "1"
 thiserror = "2"
+# The core's keys for each wallet's data, from the signer manager, and the box they seal.
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d8cfff84327c9b2b5cdb9702d1c4217cad567cee" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 

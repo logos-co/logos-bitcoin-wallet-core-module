@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use bdk_electrum::electrum_client::ElectrumApi;
 use bitcoin::{OutPoint, Psbt, Transaction, Txid};
+use logos_signer_interface::wallets::DataKey;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
@@ -32,6 +33,8 @@ pub enum Event {
     WalletState(Value),
     JobFinished { id: String, state: &'static str },
     SourceAlert(Value),
+    /// What `list_wallets` shows changed: a seed was unlocked or locked.
+    WalletsChanged { locked: usize },
 }
 
 pub type Sink = Arc<dyn Fn(Event) + Send + Sync>;
@@ -82,6 +85,8 @@ struct Light {
     state: State,
     network: Option<BNetwork>,
     group: Option<String>,
+    /// The signer manager's wallet the open one belongs to.
+    seed: Option<String>,
     family: Option<Family>,
     open_handle: Option<String>,
     approval_handle: Option<String>,
@@ -98,6 +103,7 @@ impl Default for Light {
             state: State::NoWallet,
             network: None,
             group: None,
+            seed: None,
             family: None,
             open_handle: None,
             approval_handle: None,
@@ -112,6 +118,8 @@ impl Default for Light {
 
 struct OpenWallet {
     group: String,
+    /// The signer manager's wallet it belongs to: locking that closes it.
+    seed: String,
     family: Family,
     network: BNetwork,
     cell: Arc<Mutex<Option<Cell>>>,
@@ -188,6 +196,8 @@ pub struct Engine {
     worker: std::sync::Mutex<Option<JoinHandle<()>>>,
     light: Mutex<Light>,
     open: Mutex<Option<OpenWallet>>,
+    /// Each unlocked seed's keys for its wallet files, by generation: what lists them.
+    files: Mutex<HashMap<(String, u32), DataKey>>,
     previews: Mutex<HashMap<String, Preview>>,
     next_preview: AtomicU64,
     pending_open: Mutex<Option<Arc<AtomicBool>>>,
@@ -298,6 +308,7 @@ impl Engine {
             previews: Mutex::new(HashMap::new()),
             next_preview: AtomicU64::new(0),
             pending_open: Mutex::new(None),
+            files: Mutex::new(HashMap::new()),
             last_emitted: Mutex::new(String::new()),
             closed: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -492,6 +503,7 @@ impl Engine {
             self.set_light(|l| {
                 l.state = State::Opening;
                 l.group = Some(grant.group.clone());
+                l.seed = Some(grant.seed.clone());
                 l.family = Some(grant.family);
             });
             self.open_with(network, grant, birthday, gap_limit)
@@ -507,32 +519,52 @@ impl Engine {
 
     fn open_with(self: &Arc<Self>, network: BNetwork, grant: manager::OpenGrant, birthday: Option<Birthday>, gap_limit: Option<u32>) -> Result<Value, String> {
         let wallets = self.root.clone();
-        let dir = WalletDir::new(&wallets, network, &grant.group);
-        let existed = dir.exists();
-        let meta = if existed {
-            let m = dir.meta().map_err(|e| e.to_string())?;
-            if m.family != grant.family || m.network != network {
-                return Err("the stored wallet is of another family or network".into());
+        let m = &*self.manager;
+        // The account's own scope, so whichever signer opens it, it is this database.
+        let account = manager::database_scope(grant.family, network, &grant.external)?;
+        let files = manager::data_key(m, &grant.seed, manager::WALLETS_SCOPE, None)?;
+        let files_at = |g: u32| if g == files.generation { Some(files.clone()) } else { manager::data_key(m, &grant.seed, manager::WALLETS_SCOPE, Some(g)).ok() };
+        let found = walletdir::find(&wallets, network, &grant.seed, &account, &|_, g| files_at(g));
+        let existed = found.is_some();
+        let (dir, mut meta, sealed_at) = match found {
+            Some((d, m, g)) => {
+                if m.family != grant.family || m.network != network {
+                    return Err("the stored wallet is of another family or network".into());
+                }
+                (d, m, g)
             }
-            // Ids differing only in case share a directory on macOS and Windows: never set it aside.
-            if m.group != grant.group {
-                return Err("the stored wallet belongs to another account".into());
-            }
-            m
-        } else {
-            WalletDir::new_meta(&grant.group, grant.family, network)
+            None => (WalletDir::create(&wallets, network), WalletDir::new_meta(&grant.group, &account, &grant.seed, grant.family, network), files.generation),
         };
-        // A new database key (a device account's data password forgotten) can't open the old
-        // database: it is set aside and the wallet resyncs from its birthday.
-        let (mut conn, reset) = match dir.open(&wallets, &meta, &grant.database_key) {
+        meta.group = grant.group.clone();
+        let current = walletdir::raw(&manager::data_key(m, &grant.seed, &account, None)?).map_err(|e| e.to_string())?;
+        let earlier = if sealed_at == files.generation {
+            None
+        } else {
+            Some(walletdir::raw(&manager::data_key(m, &grant.seed, &account, Some(sealed_at))?).map_err(|e| e.to_string())?)
+        };
+        // Sealed under an earlier generation, it opens with that key and moves to the current one;
+        // one a write cut short left under the current key opens with it. A database neither key
+        // opens is set aside and the wallet resyncs from its birthday.
+        let wrong = |e: &walletdir::DirError| matches!(e, walletdir::DirError::Storage(crate::storage::StorageError::WrongKey));
+        let opened = match &earlier {
+            Some(old) => match dir.open_db(&wallets, old) {
+                Ok(c) => crate::storage::rekey(&c, &current).map(|_| c).map_err(walletdir::DirError::from),
+                Err(e) if wrong(&e) => dir.open_db(&wallets, &current),
+                Err(e) => Err(e),
+            },
+            None => dir.open_db(&wallets, &current),
+        };
+        let (mut conn, reset) = match opened {
             Ok(c) => (c, None),
-            Err(walletdir::DirError::Storage(crate::storage::StorageError::WrongKey)) if existed => {
+            Err(e) if existed && wrong(&e) => {
                 let aside = dir.set_aside().map_err(|e| e.to_string())?;
-                tracing::warn!(target: "bitcoin", "{}: the database key changed; set the old database aside as {}", meta.group, aside.display());
-                (dir.open(&wallets, &meta, &grant.database_key).map_err(|e| e.to_string())?, Some(aside))
+                tracing::warn!(target: "bitcoin", "no key of its wallet opens the database; set it aside as {}", aside.display());
+                (dir.open_db(&wallets, &current).map_err(|e| e.to_string())?, Some(aside))
             }
             Err(e) => return Err(e.to_string()),
         };
+        dir.seal(&meta, &files).map_err(|e| e.to_string())?;
+        self.files.lock().insert((grant.seed.clone(), files.generation), files.clone());
         let (pw, created) = wallet::load_or_create(&mut conn, &grant.external, &grant.internal, network)?;
         let mut cell = Cell { wallet: pw, conn, network, family: grant.family, shared: self.shared_headers(network) };
         let now = now_secs();
@@ -629,17 +661,18 @@ impl Engine {
         let xpub = Zeroizing::new(manager::descriptor_xpub(&grant.external).ok_or("open result: no account xpub in the descriptor")?);
         let thread = sync::spawn(ctx, authority).map_err(|e| e.to_string())?;
         let result = json!({
-            "group": grant.group, "family": grant.family, "network": network.name(), "created": created || !existed,
+            "group": grant.group, "seed": grant.seed, "family": grant.family, "network": network.name(), "created": created || !existed,
             "reset": reset.is_some(),
             "fingerprint": grant.fingerprint, "birthday": {"height": bday, "source": source}, "needsBirthday": needs_birthday,
             "gapLimit": gap,
         });
         *self.open.lock() = Some(OpenWallet {
             group: grant.group.clone(),
+            seed: grant.seed.clone(),
             family: grant.family,
             network,
             cell,
-            _key: grant.database_key,
+            _key: current,
             descriptors: (Zeroizing::new(grant.external), Zeroizing::new(grant.internal)),
             xpub,
             stop,
@@ -662,7 +695,7 @@ impl Engine {
             l.gap_limit = Some(gap);
             l.last_error = None;
         });
-        tracing::info!(target: "bitcoin", "opened {} on {}", meta.group, network.name());
+        tracing::info!(target: "bitcoin", "opened a {} wallet on {}", grant.family.name(), network.name());
         Ok(result)
     }
 
@@ -722,9 +755,9 @@ impl Engine {
             }
             if t.is_finished() {
                 let _ = t.join();
-                tracing::info!(target: "bitcoin", "{}: the sync stopped in {} ms", w.group, started.elapsed().as_millis());
+                tracing::info!(target: "bitcoin", "the sync stopped in {} ms", started.elapsed().as_millis());
             } else {
-                tracing::warn!(target: "bitcoin", "{}: the sync is still stopping after {} ms; it writes nothing more", w.group, started.elapsed().as_millis());
+                tracing::warn!(target: "bitcoin", "the sync is still stopping after {} ms; it writes nothing more", started.elapsed().as_millis());
             }
         }
         {
@@ -1008,10 +1041,10 @@ impl Engine {
             cell.persist()
         });
         if let Err(e) = &stored {
-            tracing::warn!(target: "bitcoin", "{txid} went out; its record stays broadcasting: {e}");
+            tracing::warn!(target: "bitcoin", "a transaction went out; its record stays broadcasting: {e}");
         }
         self.wake();
-        tracing::info!(target: "bitcoin", "broadcast {txid}: {} via {via}", out.as_str());
+        tracing::info!(target: "bitcoin", "broadcast: {} via {via}", out.as_str());
         Ok(json!({"txid": txid.to_string(), "broadcast": out.as_str(), "via": via}))
     }
 
@@ -1170,7 +1203,7 @@ impl Engine {
     fn status_inner(&self, wait_wallet: bool) -> Value {
         let l = self.light.lock().clone();
         let mut v = json!({
-            "ok": true, "state": l.state.as_str(), "network": l.network.map(|n| n.name()), "group": l.group,
+            "ok": true, "state": l.state.as_str(), "network": l.network.map(|n| n.name()), "group": l.group, "seed": l.seed,
             "family": l.family, "openHandle": l.open_handle, "approvalHandle": l.approval_handle,
             "needsBirthday": l.needs_birthday, "birthday": l.birthday, "birthdaySource": l.birthday_source,
             "gapLimit": l.gap_limit, "lastError": l.last_error, "synced": false, "busy": false,
@@ -1376,9 +1409,36 @@ impl Engine {
         }
     }
 
+    /// The wallets of unlocked seeds; a locked one is only counted.
     pub fn list_wallets(&self, network: &str) -> Value {
         let Some(n) = BNetwork::parse(network) else { return json!({"ok": false, "error": "unknown network"}) };
-        json!({"ok": true, "wallets": walletdir::list(&self.root, n)})
+        let files = self.files.lock();
+        let (wallets, locked) = walletdir::list(&self.root, n, &|seed, g| files.get(&(seed.to_string(), g)).cloned());
+        json!({"ok": true, "wallets": wallets, "locked": locked})
+    }
+
+    /// Asks again for every seed's keys to its wallet files, after the person unlocked or locked
+    /// wallets in the Signer app. An open wallet whose seed is locked now closes. Not from the
+    /// dispatch thread: each ask waits on the signer manager.
+    pub fn wallets_changed(&self) {
+        let mut keys = HashMap::new();
+        for (seed, generations) in walletdir::seeds(&self.root) {
+            for g in generations {
+                if let Ok(k) = manager::data_key(&*self.manager, &seed, manager::WALLETS_SCOPE, Some(g)) {
+                    keys.insert((seed.clone(), g), k);
+                }
+            }
+        }
+        let locked = walletdir::seeds(&self.root).keys().filter(|s| !keys.keys().any(|(k, _)| k == *s)).count();
+        *self.files.lock() = keys;
+        let open = self.open.lock().as_ref().map(|w| w.seed.clone());
+        if let Some(seed) = open {
+            if manager::data_key(&*self.manager, &seed, manager::WALLETS_SCOPE, None).is_err() {
+                tracing::info!(target: "bitcoin", "its wallet was locked: closing");
+                self.close(false);
+            }
+        }
+        self.emit(Event::WalletsChanged { locked });
     }
 
     pub fn clear_suspect(&self, source: &str) -> Value {
@@ -1555,7 +1615,7 @@ mod tests {
     fn a_gap_limit_is_kept_and_a_raise_scans_again() {
         crate::network::configure_regtest(Default::default());
         let root = tempfile::tempdir().unwrap();
-        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), None);
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging::fixed()), None);
         let opened = finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin", "gapLimit": 30}));
         assert_eq!((opened["gapLimit"].clone(), e.status()["gapLimit"].clone()), (json!(30), json!(30)));
         let bday = e.status()["birthday"].clone();
@@ -1590,12 +1650,35 @@ mod tests {
         assert!(refuse_birthday(&Birthday::Height(u32::MAX), None, now).is_ok(), "nothing known: any height");
     }
 
-    /// Opens a native segwit wallet with the BIP84 test vector's account key, under a database
-    /// key that changes on every open, as a device account's forgotten data password does.
+    /// The core's key for a scope and generation as these stand-ins give it: `salt` stands for a
+    /// seed added again.
+    fn test_key(p: &str, current: u32, salt: impl Fn(&str) -> u32) -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        let v: Value = serde_json::from_str(p).unwrap();
+        let scope = v["scope"].as_str().unwrap();
+        let g = v["generation"].as_u64().map_or(current, |g| g as u32);
+        assert!(g <= current, "no key of a generation still to come");
+        let key = sha256::Hash::hash(format!("{scope}/{g}/{}", salt(scope)).as_bytes()).to_string();
+        json!({"ok": true, "key": key, "generation": g, "seed": "s_test"}).to_string()
+    }
+
+    /// Opens a native segwit wallet with the BIP84 test vector's account key, as signer manager
+    /// cfe858e does: consent and descriptors, then the core's own keys from `data_key`.
+    #[derive(Default)]
     struct KeyChanging {
         opens: std::sync::atomic::AtomicU8,
-        /// The same key on every open instead.
-        fixed: bool,
+        /// The seed's keys move to a new generation at every open, as after Change keys.
+        moving: bool,
+        /// The database key is another at every open, as for a seed added again.
+        lost: bool,
+        /// The person locked the seed.
+        locked: AtomicBool,
+    }
+
+    impl KeyChanging {
+        fn fixed() -> Self {
+            Self::default()
+        }
     }
 
     impl manager::SignerManager for KeyChanging {
@@ -1611,10 +1694,9 @@ mod tests {
         }
         fn fetch_result(&self, _h: &str, _r: &str) -> Result<String, String> {
             let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
-            let key = if self.fixed { "07".repeat(32) } else { format!("{:02x}", self.opens.load(Ordering::SeqCst)).repeat(32) };
             Ok(json!({"ok": true, "result": {"group": "g_reset", "family": "bitcoin", "chain": "test", "network": "regtest",
                 "external": format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), "internal": format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"),
-                "fingerprint": "73c5da0a", "databaseKey": key, "origin": "restored", "birthday": null, "unlocked": null}}).to_string())
+                "fingerprint": "73c5da0a", "seed": "s_test", "origin": "restored", "birthday": null}}).to_string())
         }
         fn ack_result(&self, _h: &str, _r: &str) -> Result<bool, String> {
             Ok(true)
@@ -1624,6 +1706,14 @@ mod tests {
         }
         fn close_account(&self, _p: &str) -> Result<String, String> {
             Ok(json!({"ok": true, "closed": true}).to_string())
+        }
+        fn data_key(&self, p: &str) -> Result<String, String> {
+            if self.locked.load(Ordering::SeqCst) {
+                return Ok(json!({"ok": false, "code": "locked", "error": "unlock this wallet in the Signer app"}).to_string());
+            }
+            let opens = self.opens.load(Ordering::SeqCst) as u32;
+            let lost = self.lost;
+            Ok(test_key(p, if self.moving { opens } else { 0 }, |scope| if lost && scope != manager::WALLETS_SCOPE { opens } else { 0 }))
         }
     }
 
@@ -1641,11 +1731,18 @@ mod tests {
         }
     }
 
+    /// The one wallet directory under `wallets/regtest`.
+    fn only_dir(root: &std::path::Path) -> std::path::PathBuf {
+        let dirs: Vec<_> = std::fs::read_dir(root.join("wallets/regtest")).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs[0].clone()
+    }
+
     #[test]
-    fn a_new_database_key_sets_the_old_database_aside_and_starts_fresh() {
+    fn a_database_no_key_of_its_seed_opens_is_set_aside_and_starts_fresh() {
         crate::network::configure_regtest(Default::default());
         let root = tempfile::tempdir().unwrap();
-        let mgr = Arc::new(KeyChanging { opens: Default::default(), fixed: false });
+        let mgr = Arc::new(KeyChanging { lost: true, ..Default::default() });
         let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), mgr, None);
         let first = finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
         assert_eq!((first["created"].clone(), first["reset"].clone()), (json!(true), json!(false)));
@@ -1656,14 +1753,67 @@ mod tests {
         assert_eq!(again["reset"], true, "{again}");
         assert_eq!(e.next_address()["index"], 0, "the wallet starts fresh");
         assert_eq!(e.status()["birthdaySource"], "activation");
-        let dir = root.path().join("wallets/regtest/g_reset");
-        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().contains("unreadable")).collect();
+        let aside: Vec<_> = std::fs::read_dir(only_dir(root.path())).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().contains("unreadable")).collect();
         assert!(!aside.is_empty(), "the old database is kept aside");
         e.shutdown();
     }
 
-    /// Grants an open of `group` as signer manager 3ef020c does for a device account: origin
-    /// `restored`, no birthday, nothing unlocked. Keeps what the core asked for.
+    #[test]
+    fn a_wallet_moves_to_its_seeds_new_keys_and_keeps_everything() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(KeyChanging { moving: true, ..Default::default() });
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), mgr, None);
+        finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+        assert_eq!(e.next_address()["index"], 0);
+        assert_eq!(e.next_address()["index"], 1);
+        finish(&e, "close_wallet", json!({}));
+        let dir = WalletDir { path: only_dir(root.path()) };
+        assert_eq!(dir.sealed().unwrap(), ("s_test".to_string(), 1));
+        for g in [2, 3] {
+            let again = finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset"}));
+            assert_eq!((again["created"].clone(), again["reset"].clone()), (json!(false), json!(false)), "{again}");
+            assert_eq!(dir.sealed().unwrap().1, g, "sealed again under the new generation");
+            finish(&e, "close_wallet", json!({}));
+        }
+        finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset"}));
+        assert_eq!(e.next_address()["index"], 2, "the same wallet");
+        let listed = e.list_wallets("regtest");
+        assert_eq!((listed["wallets"][0]["group"].clone(), listed["locked"].clone()), (json!("g_reset"), json!(0)), "{listed}");
+        e.shutdown();
+    }
+
+    #[test]
+    fn locking_its_seed_closes_the_open_wallet_and_lists_it_only_as_locked() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(KeyChanging::fixed());
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), mgr.clone(), None);
+        finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+        e.wallets_changed();
+        assert_eq!((e.status()["group"].clone(), e.status()["seed"].clone()), (json!("g_reset"), json!("s_test")), "still unlocked: still open");
+        assert_eq!(e.list_wallets("regtest")["wallets"].as_array().unwrap().len(), 1);
+        mgr.locked.store(true, Ordering::SeqCst);
+        e.wallets_changed();
+        assert!(e.status()["group"].is_null(), "{}", e.status());
+        let listed = e.list_wallets("regtest");
+        assert_eq!((listed["wallets"].as_array().unwrap().len(), listed["locked"].clone()), (0, json!(1)), "{listed}");
+        let j = e.start_job("open_wallet", r#"{"network":"regtest","group":"g_reset"}"#);
+        let (jid, r) = (j["jobId"].as_str().unwrap().to_string(), j["receipt"].as_str().unwrap().to_string());
+        let t0 = Instant::now();
+        while e.jobs().status(&jid, &r)["state"] != "failed" {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{}", e.jobs().status(&jid, &r));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(e.jobs().status(&jid, &r)["error"].as_str().unwrap().contains("Signer app"), "{}", e.jobs().status(&jid, &r));
+        mgr.locked.store(false, Ordering::SeqCst);
+        e.wallets_changed();
+        assert_eq!(e.list_wallets("regtest")["wallets"][0]["group"], "g_reset", "listed again once unlocked");
+        e.shutdown();
+    }
+
+    /// Grants an open of `group` as signer manager cfe858e does for a device account: origin
+    /// `restored`, no birthday. Keeps what the core asked for.
     struct DeviceAccount {
         group: &'static str,
         asked: std::sync::Mutex<Vec<String>>,
@@ -1684,7 +1834,7 @@ mod tests {
             let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
             Ok(json!({"ok": true, "result": {"group": self.group, "family": "bitcoin", "chain": "test", "network": "regtest",
                 "external": format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), "internal": format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"),
-                "fingerprint": "73c5da0a", "databaseKey": "5a".repeat(32), "origin": "restored", "birthday": null, "unlocked": null}}).to_string())
+                "fingerprint": "73c5da0a", "seed": "s_test", "origin": "restored", "birthday": null}}).to_string())
         }
         fn ack_result(&self, _h: &str, _r: &str) -> Result<bool, String> {
             Ok(true)
@@ -1696,10 +1846,13 @@ mod tests {
             self.asked.lock().unwrap().push(format!("close {p}"));
             Ok(json!({"ok": true, "closed": true}).to_string())
         }
+        fn data_key(&self, p: &str) -> Result<String, String> {
+            Ok(test_key(p, 0, |_| 0))
+        }
     }
 
     #[test]
-    fn a_device_account_opens_under_its_own_id() {
+    fn a_device_account_opens_by_its_id_into_its_accounts_wallet() {
         crate::network::configure_regtest(Default::default());
         let root = tempfile::tempdir().unwrap();
         let id = "shell-f0150787-84-0-0";
@@ -1708,7 +1861,9 @@ mod tests {
         let opened = finish(&e, "open_wallet", json!({"network": "regtest", "group": id}));
         assert_eq!((opened["group"].clone(), opened["created"].clone(), opened["needsBirthday"].clone()), (json!(id), json!(true), json!(true)), "{opened}");
         assert_eq!(e.status()["group"], id);
-        assert!(root.path().join("wallets/regtest").join(id).join("wallet.db").exists());
+        let dir = only_dir(root.path());
+        assert!(dir.join("wallet.db").exists());
+        assert!(!dir.to_string_lossy().contains("shell"), "a random name: {}", dir.display());
         assert_eq!(e.list_wallets("regtest")["wallets"][0]["group"], id);
         finish(&e, "close_wallet", json!({}));
         let again = finish(&e, "open_wallet", json!({"network": "regtest", "group": id}));
@@ -1717,13 +1872,20 @@ mod tests {
         let asked = mgr.asked.lock().unwrap().clone();
         assert!(asked[0].starts_with("open ") && asked[0].contains(&format!(r#""group":"{id}""#)), "{asked:?}");
         assert!(asked.iter().any(|a| *a == format!(r#"close {{"group":"{id}"}}"#)), "{asked:?}");
-        // A path out of the wallets directory is refused before the manager is asked.
+        // An id no plain directory name could be is refused before the manager is asked.
         for escape in ["..", "../x", "a/b", ".hidden", "nul"] {
             let r = e.start_job("open_wallet", &json!({"network": "regtest", "group": escape}).to_string());
             assert_eq!((r["ok"].clone(), r["code"].clone()), (json!(false), json!("invalid")), "{escape}: {r}");
         }
         assert_eq!(mgr.asked.lock().unwrap().len(), asked.len());
         e.shutdown();
+
+        // The same account through another of its signers is the same wallet.
+        let other = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(DeviceAccount { group: "keycard-73c5da0a-84-1-0", asked: Default::default() }), None);
+        let opened = finish(&other, "open_wallet", json!({"network": "regtest", "group": "keycard-73c5da0a-84-1-0"}));
+        assert_eq!((opened["created"].clone(), opened["reset"].clone()), (json!(false), json!(false)), "{opened}");
+        assert_eq!(only_dir(root.path()), dir);
+        other.shutdown();
 
         // A manager naming such an id for a picked wallet is refused too, and nothing is written.
         let root = tempfile::tempdir().unwrap();
@@ -1738,31 +1900,13 @@ mod tests {
         assert!(e.jobs().status(&jid, &r)["error"].as_str().unwrap().contains("can't store"));
         assert!(!root.path().join("escape").exists() && !root.path().join("wallets").exists());
         e.shutdown();
-
-        // Another account's wallet in the directory (ids differing in case, on macOS or Windows)
-        // is left alone, not set aside under this account's key.
-        let root = tempfile::tempdir().unwrap();
-        let wallets = root.path().join("wallets");
-        let other = WalletDir::new(&wallets, BNetwork::Regtest, id);
-        drop(other.open(&wallets, &WalletDir::new_meta(&id.to_uppercase(), Family::Bitcoin, BNetwork::Regtest), &[9; 32]).unwrap());
-        let e = Engine::new(wallets.clone(), Arc::new(|_| {}), Arc::new(DeviceAccount { group: id, asked: Default::default() }), None);
-        let j = e.start_job("open_wallet", &json!({"network": "regtest", "group": id}).to_string());
-        let (jid, r) = (j["jobId"].as_str().unwrap().to_string(), j["receipt"].as_str().unwrap().to_string());
-        let t0 = Instant::now();
-        while e.jobs().status(&jid, &r)["state"] != "failed" {
-            assert!(t0.elapsed() < Duration::from_secs(10), "{}", e.jobs().status(&jid, &r));
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(e.jobs().status(&jid, &r)["error"].as_str().unwrap().contains("another account"));
-        assert!(other.exists(), "its database stays where it was");
-        e.shutdown();
     }
 
     #[test]
     fn a_birthday_set_on_an_open_wallet_stands_and_starts_the_scan_again() {
         crate::network::configure_regtest(Default::default());
         let root = tempfile::tempdir().unwrap();
-        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), None);
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging::fixed()), None);
         let j = e.start_job("set_birthday", r#"{"height":500}"#);
         let (id, r) = (j["jobId"].as_str().unwrap().to_string(), j["receipt"].as_str().unwrap().to_string());
         let t0 = Instant::now();
@@ -1798,7 +1942,7 @@ mod tests {
     fn regtest_takes_regtest_json_at_once_when_the_node_module_does_not_answer() {
         crate::network::configure_regtest(Default::default());
         let root = tempfile::tempdir().unwrap();
-        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), Some(Arc::new(Silent(Duration::from_secs(30)))));
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging::fixed()), Some(Arc::new(Silent(Duration::from_secs(30)))));
         let t0 = Instant::now();
         finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
         assert!(t0.elapsed() < sync::REGTEST_ROUTES_WAIT + Duration::from_secs(2), "opened in {:?}, not the IPC budget", t0.elapsed());
@@ -1806,7 +1950,7 @@ mod tests {
         assert_eq!(routes, Routes::for_regtest(None, regtest_config()), "regtest.json's routes");
         e.shutdown();
         // Elsewhere a silent node module still fails closed: no routes, and the error says why.
-        let other = Engine::new(root.path().join("other"), Arc::new(|_| {}), Arc::new(KeyChanging { opens: Default::default(), fixed: true }), Some(Arc::new(Silent(Duration::from_millis(200)))));
+        let other = Engine::new(root.path().join("other"), Arc::new(|_| {}), Arc::new(KeyChanging::fixed()), Some(Arc::new(Silent(Duration::from_millis(200)))));
         let (r, err) = other.routes_for(BNetwork::Signet);
         assert_eq!((r, err.as_deref()), (Routes::default(), Some("route_table: no answer")));
         other.shutdown();
@@ -1823,7 +1967,7 @@ mod tests {
                 s2.lock().unwrap().push(v);
             }
         });
-        let e = Engine::new(root.path().join("wallets"), sink, Arc::new(KeyChanging { opens: Default::default(), fixed: true }), None);
+        let e = Engine::new(root.path().join("wallets"), sink, Arc::new(KeyChanging::fixed()), None);
         finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
         let r = sync::Reorg { height: 108, depth: 1, moved: vec!["ab".into()], at: 1_791_590_400 };
         e.with_open(|w| Ok(w.progress.lock().last_reorg = Some(r.clone()))).unwrap();

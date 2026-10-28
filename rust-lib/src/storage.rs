@@ -56,6 +56,14 @@ pub fn restrict(path: &Path) {
     }
 }
 
+/// Encrypts the database under another key, in place: its seed's keys changed.
+pub fn rekey(conn: &Connection, key: &[u8; 32]) -> Result<(), StorageError> {
+    let mut pragma = format!("PRAGMA rekey = \"x'{}'\";", hex::encode(key));
+    let rekeyed = conn.execute_batch(&pragma);
+    zeroize::Zeroize::zeroize(&mut pragma);
+    Ok(rekeyed?)
+}
+
 pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, StorageError> {
     Ok(conn.query_row("SELECT value FROM core_meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
 }
@@ -65,8 +73,8 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), Storage
     Ok(())
 }
 
-/// Logs to `core.log` in the persistence directory, restarting it past 10 MB. Never logs secrets:
-/// callers pass heights, counts, txids, source ids and errors.
+/// Logs to `core.log` in the persistence directory, restarting it past 10 MB. Never logs secrets,
+/// account ids, txids or addresses: callers pass heights, counts, source ids and errors.
 pub fn init_log(dir: &Path) {
     let path = dir.join("core.log");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {
@@ -99,6 +107,11 @@ mod tests {
         let raw = std::fs::read(&path).unwrap();
         assert!(!raw.windows(15).any(|w| w == b"SQLite format 3"));
         assert!(!raw.windows(6).any(|w| w == b"481824"));
+        let conn = open_encrypted(&path, &[7; 32]).unwrap();
+        rekey(&conn, &[9; 32]).unwrap();
+        drop(conn);
+        assert!(matches!(open_encrypted(&path, &[7; 32]), Err(StorageError::WrongKey)), "the old key no longer opens it");
+        assert_eq!(meta_get(&open_encrypted(&path, &[9; 32]).unwrap(), "birthday").unwrap().as_deref(), Some("481824"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
