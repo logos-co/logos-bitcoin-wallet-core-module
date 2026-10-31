@@ -226,11 +226,31 @@ impl BNetwork {
             _ => &[],
         }
     }
+
+    /// About where the chain's tip is at `now`: the newest checkpoint plus a block per ten minutes
+    /// since. For a progress share only, as Kyoto's peers don't announce their tips. None on regtest.
+    pub fn estimated_tip(self, now: u64) -> Option<u32> {
+        if self == BNetwork::Regtest {
+            return None;
+        }
+        let cp = self.checkpoint();
+        let blocks = now.saturating_sub(u64::from(cp.header.time)) / 600;
+        Some(cp.height.saturating_add(u32::try_from(blocks).unwrap_or(u32::MAX)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_estimated_tip_counts_ten_minute_blocks_from_the_newest_checkpoint() {
+        let cp = BNetwork::Mainnet.checkpoint();
+        let t = u64::from(cp.header.time);
+        assert_eq!(BNetwork::Mainnet.estimated_tip(t + 6_000), Some(cp.height + 10));
+        assert_eq!(BNetwork::Mainnet.estimated_tip(t - 1), Some(cp.height), "a clock behind the checkpoint");
+        assert_eq!(BNetwork::Regtest.estimated_tip(t), None, "regtest's blocks come when mined");
+    }
 
     #[test]
     fn checkpoints_hash_to_cores_blocks() {

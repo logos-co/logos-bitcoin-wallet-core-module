@@ -112,7 +112,9 @@ failed or was cut short keeps what came before it. A server sending its chain ha
 agrees with it, so `asked` turns true and `peers` counts it from its first answer; `target` is the
 highest tip announced by a server on the chain, kept between refreshes until the chain reaches
 it. The node's headers show the same way, its tip the target; Kyoto's, while it syncs headers
-before its scan, as its own best header with `target` null: its peers' tips aren't known.
+before its scan, and on a first start from its first connected peer until the chain has a tip, as
+its own best header with `target` null: its peers' tips aren't known. `status.kyoto.estimatedTip`
+estimates it for a share: the newest checkpoint plus a block per ten minutes (null on regtest).
 
 A refresh asks each server for its tip, whose header comes with the answer. A tip whose parent is
 on the chain (one new block, or a server left on a replaced one) is tried as it is, and nothing
@@ -253,7 +255,7 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches ea
   peer, and once its node is dropped those tasks spin on a closed channel for up to the two-hour
   connection limit (135% CPU after one rebuild, before this).
 - `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, quorum, onePeerDecides,
-  headers, progress, connected, dialled, skipped, restarts, rebuilds, rescans, window, lastWarning,
+  headers, progress, estimatedTip, connected, dialled, skipped, restarts, rebuilds, rescans, window, lastWarning,
   lastStop, lastConflict, gossiped, learned }`. `progress` weighs filter headers a quarter and
   filters the rest, from the heights Kyoto reports since its start: filter headers by finished
   batches, filters one by one, so a catch-up within one batch reads `syncing` until its filter
