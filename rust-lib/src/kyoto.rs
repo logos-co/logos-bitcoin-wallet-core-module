@@ -31,8 +31,9 @@ pub const FAILS_TO_SKIP: u32 = 3;
 pub const SKIP_SECS: u64 = 24 * 3600;
 /// bdk_wallet's lookahead: bdk_kyoto watches the revealed addresses plus this many, fixed at build.
 pub const LOOKAHEAD: u32 = 25;
-/// A first sync hands over what it found every this many filters, so a lost peer set resumes there.
-pub const CHECKPOINT_FILTERS: u32 = 2_016;
+/// A first sync hands over what it found every this many filters (a day's blocks), so a lost peer
+/// set resumes there: over Tor that is half a minute's work, and peers rarely last a quarter hour.
+pub const CHECKPOINT_FILTERS: u32 = 144;
 /// Kyoto restarts this far below the last height it scanned, for a reorg since.
 pub const RESTART_DEPTH: u32 = 8;
 /// A node that stops ends the update stream too; within this its stop shows, and is reported as one.
