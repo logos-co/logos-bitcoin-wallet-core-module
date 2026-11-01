@@ -1555,6 +1555,9 @@ pub mod hooks {
     pub static SYNC_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     /// The running Kyoto client's update stream ends after its next update, its node running on.
     pub static END_KYOTO_UPDATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// The next scan a headers-only phase hands over is never asked of the node, as bip157 dropped
+    /// one before patch 6.
+    pub static DROP_KYOTO_RESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 }
 
 fn release_stale_locks(cell: &mut Cell) -> Result<(), String> {

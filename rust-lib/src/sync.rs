@@ -275,6 +275,8 @@ struct Loop {
     kyoto_rescan: Option<u32>,
     /// A rescan was asked for and its update hasn't come yet.
     kyoto_scanning: bool,
+    /// The height the client's filters are known checked to: its start, its last rescan or update.
+    kyoto_mark: Option<u32>,
     /// What the next client watches past each keychain's revealed index; wider after a rescan.
     kyoto_lookahead: u32,
     node: Option<Follower>,
@@ -938,6 +940,7 @@ impl Loop {
         c.stop();
         self.kyoto_rescan = None;
         self.kyoto_scanning = false;
+        self.kyoto_mark = None;
         self.kyoto_status.running = false;
         self.kyoto_status.connected = 0;
         self.ctx.netstate.lock().kyoto = None;
@@ -1047,6 +1050,7 @@ impl Loop {
                 self.kyoto_status.window = c.window;
                 if rescan_from.is_some() {
                     self.kyoto_status.scanned = None;
+                    self.kyoto_mark = rescan_from;
                 }
                 tracing::info!(target: "bitcoin", "kyoto: watching to {:?}{}", c.window, rescan_from.map(|h| format!(", scanning filters again after {h}")).unwrap_or_default());
                 true
@@ -1140,6 +1144,7 @@ impl Loop {
                         self.peer_reports.start();
                     }
                     self.kyoto_rescan = start.rescan_from;
+                    self.kyoto_mark = Some(start.from.0);
                     self.kyoto_status.window = c.window;
                     self.note_window(KYOTO_SCANNED, KYOTO_WINDOW, c.window);
                     self.ctx.netstate.lock().kyoto = Some(c.requester.clone());
@@ -1260,6 +1265,10 @@ impl Loop {
             Some(c) => (c.requester.clone(), c.start),
             None => return Ok((Change::default(), vec![])),
         };
+        let skipped = self.kyoto_rescan.is_none() && kyoto::finish_skipped(self.kyoto_mark, scanned, synced);
+        if !skipped && scanned.is_some() {
+            self.kyoto_mark = scanned;
+        }
         let Some(cp) = u.chain else { return Ok((Change::default(), vec![])) };
         let mut ids: Vec<(u32, BlockHash)> = cp.iter().map(|c| (c.height(), c.hash())).take_while(|(h, _)| *h > start.known_to).collect();
         ids.reverse();
@@ -1309,10 +1318,17 @@ impl Loop {
         if let Some(h) = self.kyoto_rescan {
             // The headers-only phase is done: scan filters from the birthday on.
             if self.authority.hash_at(h).is_some() {
-                let _ = requester.rescan_from(h);
+                #[cfg(any(test, feature = "test-hooks"))]
+                let dropped = crate::engine::hooks::DROP_KYOTO_RESCAN.swap(false, std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                let dropped = false;
+                if !dropped {
+                    let _ = requester.rescan_from(h);
+                }
                 tracing::info!(target: "bitcoin", "kyoto: headers synced; scanning filters after {h}");
                 self.kyoto_rescan = None;
                 self.kyoto_scanning = true;
+                self.kyoto_mark = Some(h);
             }
         } else {
             // Kyoto's blocks below the wallet's checkpoint are named by Kyoto itself.
@@ -1323,6 +1339,17 @@ impl Loop {
                         let _ = c.store_old(&[(a.block_id.height, a.block_id.hash)]);
                     }
                 }
+            }
+            if skipped {
+                // Its transactions count; the scan goes on from where filters were last checked.
+                let m = self.kyoto_mark.unwrap_or_default();
+                let why = format!("filters reported synced at {} with none checked after {m}; scanning again from there", scanned.unwrap_or_default());
+                tracing::warn!(target: "bitcoin", "kyoto: {why}");
+                self.kyoto_status.last_warning = Some(why);
+                let _ = requester.rescan_from(m);
+                self.kyoto_scanning = true;
+                found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: None, at_tip: false });
+                return Ok((change, found));
             }
             if at_tip {
                 self.kyoto_scanning = false;
@@ -2182,6 +2209,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             kyoto_status: KyotoStatus::default(),
             kyoto_rescan: None,
             kyoto_scanning: false,
+            kyoto_mark: None,
             kyoto_lookahead: n,
             node: None,
             node_lookahead: n,

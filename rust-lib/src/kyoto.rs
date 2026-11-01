@@ -296,6 +296,12 @@ pub fn header_progress(rescan: bool, connected: bool, height: Option<u32>, base:
     (rescan || (connected && height.is_none())).then(|| HeaderProgress { have: best.max(height.unwrap_or(base)), target: None })
 }
 
+/// Whether an update at the tip came more filters past `mark`, the last height known checked, than
+/// checkpoints allow: its scan never ran (a rescan the node dropped, or an update from before one).
+pub fn finish_skipped(mark: Option<u32>, scanned: Option<u32>, synced: bool) -> bool {
+    synced && matches!((mark, scanned), (Some(m), Some(s)) if s > m.saturating_add(2 * CHECKPOINT_FILTERS))
+}
+
 /// `headers` in status is Kyoto's best header, to compare with a peer's tip.
 pub fn phase(updated: bool, fraction: f32) -> &'static str {
     // Filter headers count a quarter of the work; past it, filters are downloading.
@@ -971,6 +977,19 @@ mod tests {
         assert_eq!(builtin_checkpoint(BNetwork::Mainnet, 800_000).0, 709_631);
         assert_eq!(builtin_checkpoint(BNetwork::Mainnet, 600_000).0, 481_823);
         assert_eq!(builtin_checkpoint(BNetwork::Signet, 300_000).0, 0);
+    }
+
+    #[test]
+    fn a_finish_far_past_the_last_checkpoint_is_skipped() {
+        let n = CHECKPOINT_FILTERS;
+        // 2026-11-01: a rescan from 659,007 reported synced at 974,059 eleven seconds later.
+        assert!(finish_skipped(Some(659_007), Some(974_059), true));
+        assert!(!finish_skipped(Some(659_007), Some(659_007 + n), false), "a checkpoint is never skipped");
+        assert!(!finish_skipped(Some(974_000), Some(974_000 + n), true), "within a checkpoint of the last");
+        assert!(!finish_skipped(Some(974_000), Some(974_000 + 2 * n), true), "a checkpoint's worth of slack");
+        assert!(finish_skipped(Some(974_000), Some(974_001 + 2 * n), true));
+        assert!(!finish_skipped(None, Some(974_059), true), "nothing to compare with");
+        assert!(!finish_skipped(Some(974_059), Some(974_000), true), "a reorg's lower tip");
     }
 
     #[test]

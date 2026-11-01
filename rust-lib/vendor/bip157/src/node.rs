@@ -669,29 +669,113 @@ impl Node {
         Some(MainThreadMessage::GetHeaders(next_headers))
     }
 
-    // Clear the filter hash cache and redownload the filters.
+    // Clear the filter hash cache and redownload the filters. Taken in every state: one dropped
+    // while headers synced left the old checks standing, and the next sync reported them as a scan.
     fn rescan(&mut self, height_opt: Option<u32>) -> Option<MainThreadMessage> {
-        match self.state {
-            NodeState::Behind => None,
-            NodeState::HeadersSynced => None,
-            _ => {
-                self.headers_only_sync = false;
-                self.chain.clear_filters();
-                if let Some(height) = height_opt {
-                    self.chain.header_chain.assume_checked_to(height);
-                }
-                if !self.chain.is_cf_headers_synced() {
-                    self.state = NodeState::HeadersSynced;
-                    Some(MainThreadMessage::GetFilterHeaders(
-                        self.chain.next_cf_header_message(),
-                    ))
-                } else {
-                    self.state = NodeState::FilterHeadersSynced;
-                    Some(MainThreadMessage::GetFilters(
-                        self.chain.next_filter_message(),
-                    ))
-                }
-            }
+        self.headers_only_sync = false;
+        self.chain.clear_filters();
+        if let Some(height) = height_opt {
+            self.chain.header_chain.assume_checked_to(height);
         }
+        // The header sync goes on, then asks for the filter headers from here.
+        if self.state == NodeState::Behind {
+            return None;
+        }
+        if !self.chain.is_cf_headers_synced() {
+            self.state = NodeState::HeadersSynced;
+            Some(MainThreadMessage::GetFilterHeaders(
+                self.chain.next_cf_header_message(),
+            ))
+        } else {
+            self.state = NodeState::FilterHeadersSynced;
+            Some(MainThreadMessage::GetFilters(
+                self.chain.next_filter_message(),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::File, str::FromStr};
+
+    use bitcoin::{block::Header, BlockHash, Network};
+    use bitcoind::serde_json;
+
+    use super::Node;
+    use crate::chain::checkpoints::HashCheckpoint;
+    use crate::chain::ChainState;
+    use crate::network::{LastBlockMonitor, MainThreadMessage};
+    use crate::{Config, NodeState};
+
+    #[derive(Debug, Clone)]
+    struct HexHeader(Header);
+    crate::impl_deserialize!(HexHeader, Header);
+
+    #[derive(serde::Deserialize)]
+    struct BlockData {
+        header: HexHeader,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Scenario {
+        most_work: Vec<BlockData>,
+    }
+
+    // 2497 to 2501 on 2496.
+    fn headers() -> Vec<Header> {
+        let file = File::open("./tests/data/chain_scenario_one.json").unwrap();
+        let scenario: Scenario = serde_json::from_reader(&file).unwrap();
+        scenario.most_work.into_iter().map(|b| b.header.0).collect()
+    }
+
+    // A headers-only sync to 2500, done: every filter there counts as checked.
+    fn after_headers_only(headers: &[Header]) -> Node {
+        let anchor = HashCheckpoint::new(
+            2496,
+            BlockHash::from_str("4b4f478800538b3301b681358f84d870da0f9c4cde63ebd85fa0f273dfb07c6a")
+                .unwrap(),
+        );
+        let config = Config {
+            chain_state: Some(ChainState::Checkpoint(anchor)),
+            headers_only_sync: true,
+            ..Default::default()
+        };
+        let (mut node, _client) = Node::new(Network::Regtest, config);
+        node.chain.sync_chain(headers[..4].to_vec()).unwrap();
+        node.state = NodeState::HeadersSynced;
+        node.advance_state(&mut LastBlockMonitor::new());
+        assert_eq!(node.state, NodeState::FiltersSynced);
+        assert!(node.chain.is_filters_synced());
+        node
+    }
+
+    #[tokio::test]
+    async fn a_rescan_while_headers_sync_is_kept() {
+        let headers = headers();
+        let mut node = after_headers_only(&headers);
+        // A peer announces 2501 before the rescan arrives.
+        node.handle_headers(0.into(), vec![headers[4]]).await;
+        assert_eq!(node.state, NodeState::Behind);
+        assert!(node.rescan(Some(2497)).is_none());
+        assert!(!node.chain.is_filters_synced());
+        match node.handle_headers(0.into(), vec![]).await {
+            Some(MainThreadMessage::GetFilterHeaders(m)) => assert_eq!(m.start_height, 2498),
+            other => panic!("the filter headers from 2498, not {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rescan_after_headers_synced_asks_from_its_height() {
+        let headers = headers();
+        let mut node = after_headers_only(&headers);
+        node.handle_headers(0.into(), vec![headers[4]]).await;
+        node.handle_headers(0.into(), vec![]).await;
+        assert_eq!(node.state, NodeState::HeadersSynced);
+        match node.rescan(Some(2497)) {
+            Some(MainThreadMessage::GetFilterHeaders(m)) => assert_eq!(m.start_height, 2498),
+            other => panic!("the filter headers from 2498, not {other:?}"),
+        }
+        assert!(!node.chain.is_filters_synced());
     }
 }

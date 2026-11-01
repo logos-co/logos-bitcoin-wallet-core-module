@@ -2,7 +2,7 @@
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
 bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_esplora` 0.22.3, `bdk_kyoto` 0.18.1
-and `bip157` 0.8.1 with five patches each, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
+with five patches and `bip157` 0.8.1 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
 
@@ -167,7 +167,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches each, below
+bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five and six patches, below
 (`kyoto.rs`, `peers.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
@@ -239,6 +239,12 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches ea
   among them shows in its update. While a scan from the birthday runs, a restart holds the headers
   from the block before the birthday and goes on scanning from where it stopped, so the scan can
   still start over in place.
+- A scan's end is checked against its last checkpoint: an update at the tip more than 288
+  filters (two checkpoints) past it, or past where the scan last started, checked none of them.
+  bip157 dropped a rescan that came while it synced headers (patch 6), and an update from before
+  a rescan still comes after it. Its transactions are taken, `status.kyoto.lastWarning` says so,
+  and the core asks for the scan again from there. On 2026-11-01 a mainnet scan over Tor stored
+  the tip 11 s after resuming at 659,007, and a payment above that was never seen.
 - A filter-header conflict between peers (bip157 can't tell which lies, and disconnects one): the
   peers connected then are reported (`conflict`) and left out of a fresh subset that starts at
   once; on `regtest.json`'s peers, skipped for 24 hours (`status.kyoto.lastConflict: { at, peers
@@ -270,7 +276,7 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches ea
 
 ### Kyoto patches
 
-`patches/bip157/` holds five patches on bip157 0.8.1 as published, in `git format-patch` form, each
+`patches/bip157/` holds six patches on bip157 0.8.1 as published, in `git format-patch` form, each
 with unit tests:
 
 1. no false conflict when the tip moves between two answers (`chain/chain.rs`): a conflict
@@ -292,9 +298,13 @@ with unit tests:
    `network/peer.rs`, `network/peer_map.rs`, `network/mod.rs`, `network/socks.rs`,
    `network/error.rs`). A failed TCP or SOCKS5 connect keeps its cause: a SOCKS5 reply speaks of
    the destination, a proxy that can't be reached of nothing. bip157's client gossip subscription
-   (#607) is for transactions only; nothing showed the addresses peers sent.
+   (#607) is for transactions only; nothing showed the addresses peers sent;
+6. a rescan is taken in every state (`node.rs`): one that came while the node was syncing headers
+   was dropped, with nothing said. After a headers-only sync every filter counts as checked, so
+   a block announced just then made the next sync check that block's filter alone and report
+   `FiltersSynced`, which read as the end of a scan that never ran.
 
-On 0.7.0 a sixth came first: distinct peers toward the filter-header quorum, and unsolicited
+On 0.7.0 another came first: distinct peers toward the filter-header quorum, and unsolicited
 `cfheaders` dropped. 0.8.0 counts each peer once ("Same peer cannot share the same CF headers", one
 of its fixes from the Loupe security review) and asks every peer for each batch, so it went; the
 tests behind it pass on the published 0.8.0.
@@ -614,7 +624,8 @@ REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 \
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test kyoto -- --ignored --exact kyoto_is_the_authority_on_regtest --nocapture
 # then, on the same chain, kyoto_with_a_history_server, kyoto_skips_a_matched_block_reorganized_away
-# and kyoto_restarts_a_client_whose_updates_ended the same way, one at a time
+# kyoto_restarts_a_client_whose_updates_ended and kyoto_asks_again_when_a_scan_never_ran the
+# same way, one at a time
 # a fresh chain each, then
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test node -- --ignored --nocapture
@@ -697,7 +708,12 @@ hook) while the node runs on: the core counts one restart, with `lastStop` `upda
 by a test hook` and one warning, and a payment confirms through the new client with no reopen. A
 close then stops the sync within 3 s (48 ms on macOS), and in the 10 s after no client dials and
 nothing reads as an end of the updates. Without the restart the client runs on with its peers,
-silent. `kyoto_first_sync_on_a_long_chain`
+silent. `kyoto_asks_again_when_a_scan_never_ran` sets the birthday at block 1; one hook ends the
+scan's updates at its first checkpoint, so the restart syncs headers first, and another keeps its
+rescan from the node. The next block's update claims the tip with nothing checked past the resume
+point, 136: the core warns once and asks again, and the scan reaches the tip, which it can only
+through its checkpoints, as a finish further on is refused again. Without the check the false
+finish is stored, as on mainnet. `kyoto_first_sync_on_a_long_chain`
 times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_a_live_network` restores the test phrase
 on signet or testnet4 (`LIVE_NETWORK`, signet by default) with a birthday (`LIVE_BIRTHDAY`) through
 Tor (`LIVE_PROXY`, a `socks5h://` port with IsolateDestAddr) from `LIVE_PEERS` (comma-separated

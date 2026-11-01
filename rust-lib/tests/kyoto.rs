@@ -1,7 +1,8 @@
 //! Kyoto as the chain authority on tools/regtest/chain.sh's chain: three filter-serving Core
 //! nodes behind proxies the test steers. Receive, send and confirm; a reorg; a restart after
 //! NoReachablePeers; a rebuild past the lookahead; and a peer forging filter headers. Then a
-//! matched block reorganized away before its fetch, and an update stream that ends.
+//! matched block reorganized away before its fetch, an update stream that ends, and a scan whose
+//! rescan never reached the node.
 //! Needs `--features test-hooks`; the run command is in the README.
 
 mod common;
@@ -15,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bitcoin_wallet_core::engine::hooks::{END_KYOTO_UPDATES, SYNC_THREADS};
+use bitcoin_wallet_core::engine::hooks::{DROP_KYOTO_RESCAN, END_KYOTO_UPDATES, SYNC_THREADS};
 use bitcoin_wallet_core::engine::Engine;
 use bitcoin_wallet_core::network::{configure_regtest, RegtestConfig};
 use common::{chain, collecting, MockManager, T};
@@ -573,5 +574,45 @@ fn kyoto_restarts_a_client_whose_updates_ended() {
         assert_eq!(l.count("the updates ended while the node ran"), 1, "the close read as an end of the updates");
     }
     println!("KYOTO closed in {} ms; nothing dialled in the 10 s after", stopped.as_millis());
+    t.engine.shutdown();
+}
+
+/// A scan from the birthday restarts mid-pass (a hook ends its updates at the first checkpoint),
+/// and the restart's rescan never reaches the node (another hook drops it, as bip157 did). The
+/// next block's update claims the tip with no filters checked past the resume point: the core
+/// takes it as no finish, warns, and asks again. A finish is then taken only within two
+/// checkpoints of the last, so one warning and a scan at the tip mean the scan ran. Run alone.
+#[test]
+#[ignore]
+fn kyoto_asks_again_when_a_scan_never_ran() {
+    let logs = Logs::capture();
+    if common::chain_env().is_none() {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    }
+    // Mined before the wallet opens: a burst like this keeps a client's peers from answering, and
+    // its failed starts would push the restart below to the longest backoff.
+    chain(&["mine", "600"]);
+    let (t, _proxies, _root) = kyoto_behind_proxies(1);
+    // Both before the birthday: the scan it starts reaches its first checkpoint within a second.
+    END_KYOTO_UPDATES.store(true, Ordering::SeqCst);
+    DROP_KYOTO_RESCAN.store(true, Ordering::SeqCst);
+    // Block 1: on a chain the earlier tests used, the test phrase has payments from block 102.
+    let from = t.job("set_birthday", json!({"height": 1}))["rescanFrom"].as_u64().unwrap();
+    // The first checkpoint is 144 filters after the block before the birthday; a restart resumes 8 below.
+    let first = from.saturating_sub(1) + 144;
+    t.wait("a restart's rescan dropped", 180, || !DROP_KYOTO_RESCAN.load(Ordering::SeqCst));
+    assert_eq!(kyoto(&t)["scanned"].as_u64(), Some(first), "{}", kyoto(&t));
+
+    t.mine(1);
+    let tip = t.tip();
+    t.wait("the claimed finish refused", 60, || kyoto(&t)["lastWarning"].as_str().is_some_and(|w| w.contains("filters reported synced")));
+    let warning = kyoto(&t)["lastWarning"].clone();
+    t.wait("the scan at the tip", 120, || kyoto(&t)["scanned"].as_u64() >= Some(tip));
+    t.synced();
+    if let Some(l) = &logs {
+        assert_eq!(l.count("filters reported synced"), 1, "the scan asked again was refused too");
+    }
+    println!("KYOTO {warning}; scanned again from {} to {tip}", first - 8);
     t.engine.shutdown();
 }
