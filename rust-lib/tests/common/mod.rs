@@ -168,7 +168,7 @@ impl SignerManager for MockManager {
         let (external, internal) = self.descriptors(family);
         self.log.lock().unwrap().push(format!("open {family} {group}"));
         Ok(self.issue("sma", json!({"group": group, "family": family, "chain": "test", "network": v["network"], "external": external,
-            "internal": internal, "fingerprint": "73c5da0a", "seed": "s_mock", "origin": "restored", "birthday": null}), "approved"))
+            "internal": internal, "fingerprint": "73c5da0a", "seed": "s_mock"}), "approved"))
     }
 
     fn request_approval(&self, intent: &str) -> Result<String, String> {

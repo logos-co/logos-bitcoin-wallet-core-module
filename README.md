@@ -37,15 +37,17 @@ app, and signs its sends in the signer app, both through `signer_manager_module`
   (`locked`). The core asks for its keys again on the manager's `wallets_changed` and
   `wallets_locked`; an open wallet whose seed was locked closes, and `walletsChanged(locked)` says
   the list changed.
-- **Birthday.** `open_wallet`'s optional `birthday` (a height or a `YYYY-MM-DD` day) wins; then a
-  birthday kept from an earlier open; then the grant's `birthday` day (managers with origins), mapped
-  to a height from the header chain minus 288 blocks; then the family's activation height (segwit
-  481,824 for `bitcoin`, taproot 709,632 for `bitcoin_taproot` on mainnet). Without a day,
-  `status.needsBirthday` is true unless the grant says the keys app created the wallet.
+- **Birthday.** The core is the only place an account's birthday is kept: the keystore and the
+  signer manager hold none. `open_wallet`'s optional `birthday` (a height, or a `YYYY-MM-DD` day
+  mapped to a height from the header chain minus 288 blocks) wins, unless it is later than a payment
+  the wallet already has; then the birthday kept from an earlier open or set since; then the family's
+  activation height (segwit 481,824 for `bitcoin`, taproot 709,632 for `bitcoin_taproot` on
+  mainnet), with `status.needsBirthday` true. It is sealed in the wallet's `wallet.json`, so a
+  database set aside keeps it; one kept in an older build's database is read from there.
 - **A birthday later.** `set_birthday` (backend only) gives an open wallet one, for a restore that
   had none: `{ date }` (`YYYY-MM-DD`, mapped as above) or `{ height }`, scanned from 288 blocks
   below it. It is refused when later than the wallet's first known transaction, or a day still to
-  come. It is stored (`birthdaySource: "set"`, kept across opens) and every authority scans again
+  come. It is kept (`birthdaySource: "set"`, across opens) and every authority scans again
   from it: Kyoto and the node from the new height, a history server with a full scan.
   `status.rescanFrom` holds the height until that scan reaches the tip.
 - **Gap limit.** `open_wallet`'s optional `gapLimit` (20 to 1000) sets how far the wallet's scans
@@ -573,12 +575,12 @@ there when the store holds that checkpoint.
 `<instance>/core.log`, `<instance>/headers/` ("Shared headers"), and `<instance>/wallets/` (0700),
 with per wallet a randomly named `<network>/w_<32 hex>/`, its `wallet.json` (0600: the format, the
 seed, and a box sealed under `data_key({ seed, scope: "wallets" })` holding the account id, its
-roster key, family, network and creation time) and
+roster key, family, network, creation time and birthday) and
 `wallet.db` (SQLCipher, 0600): BDK's tables plus `core_headers` (only while the shared store can't
 take the wallet's chain, or until a wallet from before it writes again), `core_old_hashes`, `core_held` (anchors above the tip,
 and unchecked ones below the chain's start), `core_exposure`, `core_suspects`, `core_reported`,
 `core_sends` (state `broadcasting`, `sent`, `replaced`, `confirmed`, `conflicted`, `abandoned` or
-`failed`) and `core_meta`, which keeps the birthday, the gap limit (`gap_limit`), the chain's checkpoint (`chain_base`) and its last stored tip (`chain_tip`), the last
+`failed`) and `core_meta`, which keeps the gap limit (`gap_limit`), the chain's checkpoint (`chain_base`) and its last stored tip (`chain_tip`), the last
 heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`), the indices a scan from the
 birthday watched (`kyoto_window`, `node_window`), a pruned node's gap (`node_gap`), Kyoto's peer
 failures on `regtest.json`'s peers (`kyoto_peers`) and whom each learned peer the wallet reported

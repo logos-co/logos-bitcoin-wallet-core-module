@@ -9812,17 +9812,17 @@
         "qr_signer_module": "qr_signer_module"
       },
       "locked": {
-        "lastModified": 1793220047,
-        "narHash": "sha256-kmRfrQPQquEdefALjbgcjlQGjAmueJqP7GSVS3mBCH8=",
+        "lastModified": 1793555727,
+        "narHash": "sha256-/NOSoC69IrILkuiBuxrgecF8JJ5clQq5OonWKKe6OJ0=",
         "owner": "logos-co",
         "repo": "logos-signer-manager-module",
-        "rev": "9be21c3aeaa68ba915d36bfb67b5ed563585b9b7",
+        "rev": "48c106c702446a99c529b1febfcdedf1261e7407",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-signer-manager-module",
-        "rev": "9be21c3aeaa68ba915d36bfb67b5ed563585b9b7",
+        "rev": "48c106c702446a99c529b1febfcdedf1261e7407",
         "type": "github"
       }
     }
