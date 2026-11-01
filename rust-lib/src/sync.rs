@@ -21,7 +21,7 @@ use bitcoin::{BlockHash, ScriptBuf, Txid};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderProgress, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
+use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
 use crate::checks::{self, ChainView, ProofVerdict};
 use crate::crosscheck::{self, Answer, Verdict};
 use crate::fees::{self, SourceEstimate};
@@ -123,6 +123,10 @@ pub struct KyotoStatus {
     /// Kyoto's best header, and the share of filter headers and filters its finished batches make.
     pub headers: u32,
     pub progress: f32,
+    /// About the chain's tip now (`BNetwork::estimated_tip`), for a share of a header download.
+    pub estimated_tip: Option<u32>,
+    /// The last block whose filters were checked against the wallet, as stored; null before any.
+    pub scanned: Option<u32>,
     pub connected: usize,
     pub dialled: usize,
     pub skipped: usize,
@@ -332,6 +336,7 @@ impl Loop {
     fn restart_scan(&mut self) {
         tracing::info!(target: "bitcoin", "scanning again from {}", self.birthday());
         self.stop_kyoto(None);
+        self.kyoto_status.scanned = None;
         self.kyoto_retry_at = Instant::now();
         self.node = None;
         let want = self.ctx.net.checkpoint_below(self.birthday().saturating_sub(1));
@@ -375,6 +380,7 @@ impl Loop {
             kyoto::wider_lookahead(&kyoto::reachable_used(cell.wallet.spk_index(), gap), gap)
         };
         tracing::info!(target: "bitcoin", "gap limit {gap}: scanning again from {}", self.birthday());
+        self.kyoto_status.scanned = None;
         self.kyoto_lookahead = self.kyoto_lookahead.max(n);
         if self.kyoto.is_some() {
             self.kyoto_status.rescans += 1;
@@ -426,11 +432,14 @@ impl Loop {
             .collect()
     }
 
-    /// The authority's figures for `status`; while Kyoto syncs headers only, its own best header.
+    /// The authority's figures for `status`; while Kyoto takes in headers, its own best header.
     fn summary(&self) -> authority::Summary {
         let mut s = self.authority.summary(now_secs());
-        if self.feeder == Feeder::Kyoto && self.kyoto_rescan.is_some() {
-            s.headers = Some(HeaderProgress { have: self.kyoto_status.headers.max(s.height.unwrap_or(0)), target: None });
+        if self.feeder == Feeder::Kyoto {
+            let connected = self.kyoto.as_ref().is_some_and(|c| c.connected() > 0);
+            if let Some(h) = kyoto::header_progress(self.kyoto_rescan.is_some(), connected, s.height, s.base, self.kyoto_status.headers) {
+                s.headers = Some(h);
+            }
         }
         s
     }
@@ -1036,6 +1045,9 @@ impl Loop {
         match c.widen(&cell.wallet, lookahead, rescan_from) {
             Ok(()) => {
                 self.kyoto_status.window = c.window;
+                if rescan_from.is_some() {
+                    self.kyoto_status.scanned = None;
+                }
                 tracing::info!(target: "bitcoin", "kyoto: watching to {:?}{}", c.window, rescan_from.map(|h| format!(", scanning filters again after {h}")).unwrap_or_default());
                 true
             }
@@ -1136,6 +1148,7 @@ impl Loop {
                     self.kyoto_status.phase = "syncing";
                     self.kyoto_status.progress = 0.0;
                     self.kyoto_status.headers = start.known_to;
+                    self.kyoto_status.scanned = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned).map(|(h, _)| h);
                     self.kyoto = Some(c);
                 }
                 Err(e) => {
@@ -1222,6 +1235,7 @@ impl Loop {
         if let Some(c) = &self.kyoto {
             self.kyoto_status.connected = c.connected();
             self.kyoto_status.headers = self.kyoto_status.headers.max(c.best_header());
+            self.kyoto_status.estimated_tip = self.ctx.net.estimated_tip(now_secs());
             let scanned = c.synced && self.kyoto_rescan.is_none() && !self.kyoto_scanning;
             self.kyoto_status.phase = kyoto::phase(scanned, self.kyoto_status.progress);
             self.authority.set_peers(c.connected() as u32);
@@ -1493,6 +1507,9 @@ impl Loop {
         cell.settle_sends()?;
         if let Some((key, (h, hash))) = f.scanned {
             meta_set(&cell.conn, key, &format!("{h}:{hash}")).map_err(|e| e.to_string())?;
+            if key == KYOTO_SCANNED {
+                self.kyoto_status.scanned = Some(h);
+            }
         }
         cell.persist()?;
         drop(guard);

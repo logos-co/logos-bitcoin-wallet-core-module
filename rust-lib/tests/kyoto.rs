@@ -66,6 +66,8 @@ fn kyoto_is_the_authority_on_regtest() {
     let st = t.engine.status();
     assert_eq!(st["authority"]["kind"], "kyoto", "{st}");
     assert_eq!(st["kyoto"]["phase"], "synced", "{st}");
+    let tip = t.tip();
+    t.wait("the filters' scan stored at the tip", 15, || kyoto(&t)["scanned"].as_u64() >= Some(tip));
     t.wait("a quorum of three peers", 15, || kyoto(&t)["connected"].as_u64().unwrap_or(0) >= 3);
     println!("KYOTO first sync to {} in {} ms", t.tip(), started.elapsed().as_millis());
     assert_eq!(t.engine.history(0)["total"], 0, "start from a fresh `chain.sh prepare`");
@@ -252,6 +254,9 @@ fn kyoto_first_sync_on_a_long_chain() {
     t.mine(1);
     t.synced();
     t.wait("the payment found", 600, || t.row(&paid)["state"] == "confirmed");
+    // Checkpoints every 144 filters on the way, the last one at the tip.
+    let tip = t.tip();
+    t.wait("the filters' scan stored at the tip", 30, || kyoto(&t)["scanned"].as_u64() >= Some(tip));
     println!("KYOTO first sync of {} blocks in {} ms", t.tip(), started.elapsed().as_millis());
     t.engine.shutdown();
 }

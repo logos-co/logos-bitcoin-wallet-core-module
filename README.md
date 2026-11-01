@@ -112,7 +112,9 @@ failed or was cut short keeps what came before it. A server sending its chain ha
 agrees with it, so `asked` turns true and `peers` counts it from its first answer; `target` is the
 highest tip announced by a server on the chain, kept between refreshes until the chain reaches
 it. The node's headers show the same way, its tip the target; Kyoto's, while it syncs headers
-before its scan, as its own best header with `target` null: its peers' tips aren't known.
+before its scan, and on a first start from its first connected peer until the chain has a tip, as
+its own best header with `target` null: its peers' tips aren't known. `status.kyoto.estimatedTip`
+estimates it for a share: the newest checkpoint plus a block per ten minutes (null on regtest).
 
 A refresh asks each server for its tip, whose header comes with the answer. A tip whose parent is
 on the chain (one new block, or a server left on a replaced one) is tried as it is, and nothing
@@ -224,8 +226,11 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches ea
   the public test phrase also has payments far beyond (testnet4 index 313 after 151), which a
   window happens to hold now and then, and which would otherwise widen it again and again.
 - A start begins 8 blocks below the last height whose filters were scanned. A first sync hands over
-  what it found every 2,016 filters (patch 2), and that height is stored, so a run that loses its
-  peers goes on from there. A first start begins at the block before the birthday when the header
+  what it found every 144 filters (patch 2), and that height is stored (`status.kyoto.scanned`), so
+  a run that loses its peers goes on from there. Each start fetches every filter header from its own
+  start to the tip before the first filter, which over Tor can take most of a run whose peers drop
+  within a quarter hour; 144 filters then take about half a minute, so such a run still keeps its
+  work, where at 2,016 many kept none. A first start begins at the block before the birthday when the header
   chain reaches it; otherwise Kyoto syncs headers from the chain's tip first, taken into the chain
   2,016 or more at a time as they come, so a restart starts from the stored chain, then scans
   filters from the birthday (`rescan_from`). The chain starts at or below the birthday, so Kyoto
@@ -253,8 +258,10 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five patches ea
   peer, and once its node is dropped those tasks spin on a closed channel for up to the two-hour
   connection limit (135% CPU after one rebuild, before this).
 - `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, quorum, onePeerDecides,
-  headers, progress, connected, dialled, skipped, restarts, rebuilds, rescans, window, lastWarning,
-  lastStop, lastConflict, gossiped, learned }`. `progress` weighs filter headers a quarter and
+  headers, progress, estimatedTip, scanned, connected, dialled, skipped, restarts, rebuilds, rescans, window,
+  lastWarning, lastStop, lastConflict, gossiped, learned }`. `scanned` is the last block whose filters
+  were checked against the wallet, as stored, null before the first and after a scan starts over: the
+  header chain (`walletTip` too) reaches the tip long before a scan from the birthday does. `progress` weighs filter headers a quarter and
   filters the rest, from the heights Kyoto reports since its start: filter headers by finished
   batches, filters one by one, so a catch-up within one batch reads `syncing` until its filter
   headers are in; `headers` is Kyoto's best header; `window` is the highest index the client

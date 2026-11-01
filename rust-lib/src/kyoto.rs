@@ -20,6 +20,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
+use crate::authority::HeaderProgress;
 use crate::network::BNetwork;
 use crate::routes::{KyotoRoute, Proxy, Route};
 
@@ -30,8 +31,9 @@ pub const FAILS_TO_SKIP: u32 = 3;
 pub const SKIP_SECS: u64 = 24 * 3600;
 /// bdk_wallet's lookahead: bdk_kyoto watches the revealed addresses plus this many, fixed at build.
 pub const LOOKAHEAD: u32 = 25;
-/// A first sync hands over what it found every this many filters, so a lost peer set resumes there.
-pub const CHECKPOINT_FILTERS: u32 = 2_016;
+/// A first sync hands over what it found every this many filters (a day's blocks), so a lost peer
+/// set resumes there: over Tor that is half a minute's work, and peers rarely last a quarter hour.
+pub const CHECKPOINT_FILTERS: u32 = 144;
 /// Kyoto restarts this far below the last height it scanned, for a reorg since.
 pub const RESTART_DEPTH: u32 = 8;
 /// A node that stops ends the update stream too; within this its stop shows, and is reported as one.
@@ -287,6 +289,13 @@ pub enum Feed {
 
 /// The phase a client is in, for status. Kyoto reports filter headers only as whole batches
 /// finish, so a catch-up within one batch reads `syncing` until its filter headers are in;
+/// Kyoto's header download as status shows it: in a rescan's headers-only phase, and on a first
+/// start whose connected peers send headers before its first update gives the chain a tip. `best`
+/// is Kyoto's best header; its peers' tips aren't known, so there is no target.
+pub fn header_progress(rescan: bool, connected: bool, height: Option<u32>, base: u32, best: u32) -> Option<HeaderProgress> {
+    (rescan || (connected && height.is_none())).then(|| HeaderProgress { have: best.max(height.unwrap_or(base)), target: None })
+}
+
 /// `headers` in status is Kyoto's best header, to compare with a peer's tip.
 pub fn phase(updated: bool, fraction: f32) -> &'static str {
     // Filter headers count a quarter of the work; past it, filters are downloading.
@@ -949,6 +958,13 @@ mod tests {
     fn phases_for_status() {
         assert_eq!(phase(false, 0.0), "syncing");
         assert_eq!(phase(false, 0.1), "filter_headers");
+        // A first start shows its headers from its first peer until the chain has a tip.
+        let at = |have| Some(HeaderProgress { have, target: None });
+        assert_eq!(header_progress(false, true, None, 481_823, 600_000), at(600_000));
+        assert_eq!(header_progress(false, true, None, 481_823, 0), at(481_823), "from the base before Kyoto reports");
+        assert_eq!(header_progress(false, false, None, 481_823, 0), None, "no peer yet: connecting, not reading");
+        assert_eq!(header_progress(false, true, Some(973_000), 481_823, 973_000), None, "a tip: syncing shows instead");
+        assert_eq!(header_progress(true, false, Some(935_424), 935_424, 940_000), at(940_000), "a rescan's headers-only phase");
         assert_eq!(phase(false, 0.25), "filters", "filter headers done, filters pending");
         assert_eq!(phase(false, 0.6), "filters");
         assert_eq!(phase(true, 0.6), "synced");
