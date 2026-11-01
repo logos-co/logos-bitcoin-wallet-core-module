@@ -19,7 +19,7 @@ allowed=(
   src/network/outbound.rs # 3: the version nonce
   src/messages.rs         # 5: Info::Dial, Info::Addresses, DialOutcome
   src/lib.rs              # 5: the report_peers setting; DialOutcome, AddrV2Message exported
-  src/node.rs             # 5: getaddr while reporting peers; handshakes in flight end first
+  src/node.rs             # 5: getaddr while reporting peers; handshakes in flight end first; 6: a rescan in every state
   src/network/peer_map.rs # 5: a failed connect reported; which peers are mid-handshake
   src/network/socks.rs    # 5: the SOCKS5 reply code kept
   src/network/error.rs    # 5: Socks5Error::Reply
