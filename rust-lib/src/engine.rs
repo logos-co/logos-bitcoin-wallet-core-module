@@ -2,7 +2,7 @@
 //! and reads that never wait on the wallet for more than 750 ms.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar};
@@ -120,6 +120,8 @@ struct OpenWallet {
     group: String,
     /// The signer manager's wallet it belongs to: locking that closes it.
     seed: String,
+    /// Its directory, whose `wallet.json` keeps the birthday.
+    dir: PathBuf,
     family: Family,
     network: BNetwork,
     cell: Arc<Mutex<Option<Cell>>>,
@@ -579,11 +581,21 @@ impl Engine {
                     authority.seed_from().map(|h| format!("; from {h} until a source vouches for them")).unwrap_or_default());
             }
         }
-        let stored = meta_get(&cell.conn, "birthday").map_err(|e| e.to_string())?.and_then(|s| s.parse::<u32>().ok());
-        let stored_src = meta_get(&cell.conn, "birthday_source").map_err(|e| e.to_string())?;
-        let (bday, source) = resolve_birthday(birthday, grant.birthday.as_deref(), stored.zip(stored_src), authority.chain(), network, grant.family);
-        meta_set(&cell.conn, "birthday", &bday.to_string()).map_err(|e| e.to_string())?;
-        meta_set(&cell.conn, "birthday_source", &source).map_err(|e| e.to_string())?;
+        let stored = match meta.birthday.clone() {
+            Some(b) => Some((b.height, b.source)),
+            // Older builds kept it in the database.
+            None => meta_get(&cell.conn, "birthday").map_err(|e| e.to_string())?.and_then(|s| s.parse::<u32>().ok())
+                .zip(meta_get(&cell.conn, "birthday_source").map_err(|e| e.to_string())?),
+        };
+        // An open's birthday after a payment the wallet already has is not taken, as set_birthday refuses it.
+        let first = first_known(&cell)?;
+        let birthday = birthday.filter(|b| refuse_birthday(b, first, now).map_err(|e| tracing::warn!(target: "bitcoin", "{e}; the kept one stays")).is_ok());
+        let (bday, source) = resolve_birthday(birthday, stored, authority.chain(), network, grant.family);
+        let start = Some(walletdir::Start { height: bday, source: source.clone() });
+        if meta.birthday != start {
+            meta.birthday = start;
+            dir.seal(&meta, &files).map_err(|e| e.to_string())?;
+        }
         // The chain starts at the checkpoint below where scans start, so it holds every block
         // they can find; a chain stored from a higher one starts again, and so do the scans.
         let want = network.checkpoint_below(bday.saturating_sub(1));
@@ -609,11 +621,7 @@ impl Engine {
             sync::forget_scans(&cell.conn)?;
         }
         meta_set(&cell.conn, wallet::GAP_LIMIT_KEY, &gap.to_string()).map_err(|e| e.to_string())?;
-        if let Some(o) = &grant.origin {
-            meta_set(&cell.conn, "origin", o).map_err(|e| e.to_string())?;
-        }
-        let origin = grant.origin.clone().or(meta_get(&cell.conn, "origin").map_err(|e| e.to_string())?);
-        let needs_birthday = source == "activation" && origin.as_deref() != Some("created");
+        let needs_birthday = source == "activation";
         release_stale_locks(&mut cell)?;
         restore_live_sends(&mut cell)?;
         cell.persist()?;
@@ -669,6 +677,7 @@ impl Engine {
         *self.open.lock() = Some(OpenWallet {
             group: grant.group.clone(),
             seed: grant.seed.clone(),
+            dir: dir.path.clone(),
             family: grant.family,
             network,
             cell,
@@ -838,20 +847,19 @@ impl Engine {
     /// less the margin. Refused past the wallet's first known transaction.
     fn set_birthday(&self, b: Birthday) -> Result<Value, String> {
         let (net, family, birthday, rescan, progress) = self.with_open(|w| Ok((w.network, w.family, w.birthday.clone(), w.rescan.clone(), w.progress.clone())))?;
+        let (dir, seed) = self.with_open(|w| Ok((w.dir.clone(), w.seed.clone())))?;
         let from = self.cell_job(Duration::from_secs(30), |cell| {
             refuse_birthday(&b, first_known(cell)?, now_secs())?;
-            let from = match &b {
+            Ok(match &b {
                 Birthday::Height(h) => h.saturating_sub(wallet::DATE_MARGIN_BLOCKS).max(net.activation_height(family)),
                 Birthday::Day(d) => {
                     let cp = net.checkpoint_at(cell.chain_base()).unwrap_or_else(|| net.checkpoint());
                     let chain = cell.stored_chain(cp, now_secs() as u32)?;
                     wallet::height_for_day(d, net, family, &chain).ok_or("invalid birthday: no height for that day")?
                 }
-            };
-            meta_set(&cell.conn, "birthday", &from.to_string()).map_err(|e| e.to_string())?;
-            meta_set(&cell.conn, "birthday_source", "set").map_err(|e| e.to_string())?;
-            Ok(from)
+            })
         })?;
+        self.keep_birthday(&dir, &seed, from)?;
         birthday.store(from, Ordering::SeqCst);
         progress.lock().rescan_from = Some(from);
         rescan.store(true, Ordering::SeqCst);
@@ -863,6 +871,20 @@ impl Engine {
         });
         tracing::info!(target: "bitcoin", "birthday set; rescanning from {from}");
         Ok(json!({"birthday": {"height": from, "source": "set"}, "rescanFrom": from}))
+    }
+
+    /// Seals a birthday the person set into the wallet's `wallet.json`, under the key it is sealed with now.
+    fn keep_birthday(&self, dir: &Path, seed: &str, height: u32) -> Result<(), String> {
+        let dir = WalletDir { path: dir.to_path_buf() };
+        let (_, g) = dir.sealed().map_err(|e| e.to_string())?;
+        let cached = self.files.lock().get(&(seed.to_string(), g)).cloned();
+        let key = match cached {
+            Some(k) => k,
+            None => manager::data_key(&*self.manager, seed, manager::WALLETS_SCOPE, Some(g))?,
+        };
+        let mut meta = dir.meta(&key).map_err(|e| e.to_string())?;
+        meta.birthday = Some(walletdir::Start { height, source: "set".into() });
+        dir.seal(&meta, &key).map_err(|e| e.to_string())
     }
 
     /// The wallet's gap limit, kept. Raised, the scans go again from the birthday, wider: Kyoto
@@ -1474,11 +1496,10 @@ impl Engine {
     }
 }
 
-/// Override, then a birthday kept from an earlier open, then the keystore's day, then the family's
-/// activation height.
+/// Override, then the birthday kept from an earlier open or set since, then the family's activation
+/// height.
 pub fn resolve_birthday(
     over: Option<Birthday>,
-    keystore_day: Option<&str>,
     stored: Option<(u32, String)>,
     chain: &crate::headers::HeaderChain,
     net: BNetwork,
@@ -1486,11 +1507,10 @@ pub fn resolve_birthday(
 ) -> (u32, String) {
     let floor = net.activation_height(family);
     let day = |d: &str| wallet::height_for_day(d, net, family, chain);
-    match (over, stored, keystore_day) {
-        (Some(Birthday::Height(h)), _, _) => (h.max(floor), "override".into()),
-        (Some(Birthday::Day(d)), _, _) if day(&d).is_some() => (day(&d).expect("checked"), "override".into()),
-        (_, Some((h, src)), _) if src != "activation" => (h, src),
-        (_, _, Some(d)) if day(d).is_some() => (day(d).expect("checked"), "keystore".into()),
+    match (over, stored) {
+        (Some(Birthday::Height(h)), _) => (h.max(floor), "override".into()),
+        (Some(Birthday::Day(d)), _) if day(&d).is_some() => (day(&d).expect("checked"), "override".into()),
+        (_, Some(kept)) => kept,
         _ => (floor, "activation".into()),
     }
 }
@@ -1696,7 +1716,7 @@ mod tests {
             let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
             Ok(json!({"ok": true, "result": {"group": "g_reset", "family": "bitcoin", "chain": "test", "network": "regtest",
                 "external": format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), "internal": format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"),
-                "fingerprint": "73c5da0a", "seed": "s_test", "origin": "restored", "birthday": null}}).to_string())
+                "fingerprint": "73c5da0a", "seed": "s_test"}}).to_string())
         }
         fn ack_result(&self, _h: &str, _r: &str) -> Result<bool, String> {
             Ok(true)
@@ -1755,6 +1775,22 @@ mod tests {
         assert_eq!(e.status()["birthdaySource"], "activation");
         let aside: Vec<_> = std::fs::read_dir(only_dir(root.path())).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().contains("unreadable")).collect();
         assert!(!aside.is_empty(), "the old database is kept aside");
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_birthday_stays_when_its_database_is_set_aside() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(KeyChanging { lost: true, ..Default::default() });
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), mgr, None);
+        finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+        assert_eq!(e.status()["needsBirthday"], true);
+        assert_eq!(finish(&e, "set_birthday", json!({"height": 1000}))["birthday"]["height"], 712);
+        finish(&e, "close_wallet", json!({}));
+        let again = finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset"}));
+        assert_eq!((again["reset"].clone(), again["birthday"].clone()), (json!(true), json!({"height": 712, "source": "set"})), "{again}");
+        assert_eq!(e.status()["needsBirthday"], false);
         e.shutdown();
     }
 
@@ -1834,7 +1870,7 @@ mod tests {
             let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
             Ok(json!({"ok": true, "result": {"group": self.group, "family": "bitcoin", "chain": "test", "network": "regtest",
                 "external": format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), "internal": format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"),
-                "fingerprint": "73c5da0a", "seed": "s_test", "origin": "restored", "birthday": null}}).to_string())
+                "fingerprint": "73c5da0a", "seed": "s_test"}}).to_string())
         }
         fn ack_result(&self, _h: &str, _r: &str) -> Result<bool, String> {
             Ok(true)
@@ -2006,15 +2042,12 @@ mod tests {
     fn birthdays_resolve_in_order() {
         let chain = HeaderChain::new(BNetwork::Mainnet);
         let (net, fam) = (BNetwork::Mainnet, Family::Bitcoin);
-        assert_eq!(resolve_birthday(None, None, None, &chain, net, fam), (481_824, "activation".to_string()));
-        assert_eq!(resolve_birthday(Some(Birthday::Height(100)), None, None, &chain, net, fam).0, 481_824, "never below activation");
-        let (h, src) = resolve_birthday(None, Some("2024-04-20"), None, &chain, net, fam);
-        assert!(h > 835_000 && h < 840_000 && src == "keystore", "{h} {src}");
-        // A day kept from an earlier open stands; an override replaces it.
-        assert_eq!(resolve_birthday(None, Some("2024-04-20"), Some((900_000, "keystore".into())), &chain, net, fam).0, 900_000);
-        assert_eq!(resolve_birthday(Some(Birthday::Height(910_000)), None, Some((900_000, "keystore".into())), &chain, net, fam).0, 910_000);
-        // An activation fallback kept earlier yields to a day the keystore now knows.
-        let (_, src) = resolve_birthday(None, Some("2024-04-20"), Some((481_824, "activation".into())), &chain, net, fam);
-        assert_eq!(src, "keystore");
+        assert_eq!(resolve_birthday(None, None, &chain, net, fam), (481_824, "activation".to_string()));
+        assert_eq!(resolve_birthday(Some(Birthday::Height(100)), None, &chain, net, fam).0, 481_824, "never below activation");
+        let (h, src) = resolve_birthday(Some(Birthday::Day("2024-04-20".into())), None, &chain, net, fam);
+        assert!(h > 835_000 && h < 840_000 && src == "override", "{h} {src}");
+        // A birthday kept from an earlier open stands; an override replaces it.
+        assert_eq!(resolve_birthday(None, Some((900_000, "set".into())), &chain, net, fam), (900_000, "set".to_string()));
+        assert_eq!(resolve_birthday(Some(Birthday::Height(910_000)), Some((900_000, "set".into())), &chain, net, fam).0, 910_000);
     }
 }

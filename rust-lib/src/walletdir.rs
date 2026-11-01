@@ -51,6 +51,16 @@ pub struct Meta {
     pub family: Family,
     pub network: BNetwork,
     pub created_at: u64,
+    /// Where its scans start, kept here so a database set aside keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday: Option<Start>,
+}
+
+/// A birthday as a height, and what gave it: `set`, `override`, `activation`, or an older build's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Start {
+    pub height: u32,
+    pub source: String,
 }
 
 /// The core's key for a seed's wallet files at a generation; `None` while the seed is locked.
@@ -178,7 +188,7 @@ impl WalletDir {
     }
 
     pub fn new_meta(group: &str, account: &str, seed: &str, family: Family, network: BNetwork) -> Meta {
-        Meta { format: FORMAT, group: group.into(), account: account.into(), seed: seed.into(), family, network, created_at: now_secs() }
+        Meta { format: FORMAT, group: group.into(), account: account.into(), seed: seed.into(), family, network, created_at: now_secs(), birthday: None }
     }
 }
 
@@ -310,13 +320,26 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let wallets = root.path().join("wallets");
         let w = WalletDir::create(&wallets, BNetwork::Signet);
-        let meta = WalletDir::new_meta("g_abc", "wallet/btc_1", "s_1", Family::Bitcoin, BNetwork::Signet);
+        let mut meta = WalletDir::new_meta("g_abc", "wallet/btc_1", "s_1", Family::Bitcoin, BNetwork::Signet);
+        meta.birthday = Some(Start { height: 200_000, source: "set".into() });
         drop(w.open(&wallets, &meta, &key(1, 0), &[1; 32]).unwrap());
         assert!(matches!(w.open(&wallets, &meta, &key(1, 0), &[2; 32]), Err(DirError::Storage(StorageError::WrongKey))));
         let aside = w.set_aside().unwrap();
         assert!(aside.exists() && !w.path.join("wallet.db").exists());
+        assert_eq!(w.meta(&key(1, 0)).unwrap().birthday.map(|b| b.height), Some(200_000), "the birthday stays");
         drop(w.open(&wallets, &meta, &key(1, 0), &[2; 32]).unwrap());
         assert!(w.exists(), "a fresh database under the new key");
+    }
+
+    #[test]
+    fn a_box_from_before_birthdays_were_kept_reads_without_one() {
+        let root = tempfile::tempdir().unwrap();
+        let w = WalletDir::create(&root.path().join("wallets"), BNetwork::Signet);
+        fs::create_dir_all(&w.path).unwrap();
+        let body = br#"{"format":2,"group":"g_abc","account":"wallet/btc_1","seed":"s_1","family":"bitcoin","network":"signet","createdAt":1}"#;
+        let about = wallets::seal(&key(1, 0), body, &w.aad()).unwrap();
+        fs::write(w.path.join(META), serde_json::to_vec(&Plain { format: FORMAT, seed: "s_1".into(), about }).unwrap()).unwrap();
+        assert_eq!(w.meta(&key(1, 0)).unwrap().birthday, None);
     }
 
     #[test]

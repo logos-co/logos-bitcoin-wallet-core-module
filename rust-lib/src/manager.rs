@@ -75,10 +75,6 @@ pub struct OpenGrant {
     pub fingerprint: String,
     /// The signer manager's wallet: what `data_key` names.
     pub seed: String,
-    /// `created` or `restored`, from managers that say.
-    pub origin: Option<String>,
-    /// The UTC day the wallet was made, or the day the person gave on restore.
-    pub birthday: Option<String>,
 }
 
 /// `Ok(None)` while the person hasn't decided.
@@ -103,8 +99,6 @@ pub fn open_grant(reply: &str, net: BNetwork) -> Result<Option<OpenGrant>, Strin
         internal: s("internal")?,
         fingerprint: s("fingerprint")?,
         seed,
-        origin: r["origin"].as_str().map(str::to_string),
-        birthday: r["birthday"].as_str().map(str::to_string),
     };
     let expect = if family == Family::Bitcoin { "wpkh(" } else { "tr(" };
     if !grant.external.starts_with(expect) || !grant.internal.starts_with(expect) {
@@ -247,9 +241,8 @@ mod tests {
         crate::network::configure_regtest(Default::default());
         let g = open_grant(&reply(json!({})), BNetwork::Regtest).unwrap().unwrap();
         assert_eq!((g.group.as_str(), g.family, g.seed.as_str()), ("g_1", Family::Bitcoin, "s_1"));
-        assert_eq!((g.origin, g.birthday), (None, None), "older managers say neither");
-        let g = open_grant(&reply(json!({"origin": "created", "birthday": "2026-10-01"})), BNetwork::Regtest).unwrap().unwrap();
-        assert_eq!((g.origin.as_deref(), g.birthday.as_deref()), (Some("created"), Some("2026-10-01")));
+        // An older manager's origin and birthday are not read: the core keeps the birthday.
+        assert!(open_grant(&reply(json!({"origin": "created", "birthday": "2026-10-01"})), BNetwork::Regtest).unwrap().is_some());
         // A wallet on the main chain does not open on regtest, and keys must be 32 bytes.
         assert!(open_grant(&reply(json!({"chain": "main"})), BNetwork::Regtest).is_err());
         assert!(open_grant(&reply(json!({"seed": null})), BNetwork::Regtest).err().unwrap().contains("Signer app"));
