@@ -24,6 +24,8 @@ use crate::authority::HeaderProgress;
 use crate::network::BNetwork;
 use crate::routes::{KyotoRoute, Proxy, Route};
 
+type Fetch = std::pin::Pin<Box<dyn std::future::Future<Output = Option<bitcoin::Block>> + Send>>;
+
 /// Peers dialled per start, taken at random from the list.
 pub const SUBSET: usize = 8;
 /// Starts in a row a peer may fail before it is skipped.
@@ -132,10 +134,28 @@ pub fn parse_peer(text: &str, default_port: u16) -> Result<Peer, String> {
     Err(format!("{t}: Kyoto would resolve {host} outside Tor; use an IP address or an onion name"))
 }
 
+/// The network's P2P port, for a peer listed without one.
+pub fn default_port(net: bitcoin::Network) -> u16 {
+    match net {
+        bitcoin::Network::Bitcoin => 8333,
+        bitcoin::Network::Testnet4 => 48333,
+        bitcoin::Network::Signet => 38333,
+        bitcoin::Network::Regtest => 18444,
+        _ => 18333,
+    }
+}
+
 impl Peer {
-    fn trusted(&self) -> TrustedPeer {
+    /// With the services the table lists: bip157 speaks BIP324 to a direct peer with bit 11.
+    fn trusted(&self, services: u64) -> TrustedPeer {
         match self {
-            Peer::Ip(sa) => TrustedPeer::from_socket_addr(*sa),
+            Peer::Ip(sa) => {
+                let addr = match sa.ip() {
+                    IpAddr::V4(ip) => AddrV2::Ipv4(ip),
+                    IpAddr::V6(ip) => AddrV2::Ipv6(ip),
+                };
+                TrustedPeer::new(addr, Some(sa.port()), ServiceFlags::from(services))
+            }
             Peer::Onion(key, port) => TrustedPeer::new(AddrV2::TorV3(*key), Some(*port), ServiceFlags::NONE),
             Peer::Lan(host, port) => TrustedPeer::from_hostname(host.clone(), *port),
         }
@@ -349,15 +369,9 @@ impl Client {
     /// keychain's revealed index plus `lookahead`. `snapshot` holds the headers from `start.from`
     /// to `start.known_to`. With `report`, it feeds each dial's outcome and the peers' gossip.
     #[allow(clippy::too_many_arguments)]
-    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, report: bool, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, report: bool, tor: &crate::errand::Status, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
         let net = wallet.network();
-        let default_port = match net {
-            bitcoin::Network::Bitcoin => 8333,
-            bitcoin::Network::Testnet4 => 48333,
-            bitcoin::Network::Signet => 38333,
-            bitcoin::Network::Regtest => 18444,
-            _ => 18333,
-        };
+        let default_port = default_port(net);
         let mut dial = vec![];
         for p in &peers {
             match parse_peer(p, default_port).and_then(|x| x.reachable(route.route).map(|_| x)) {
@@ -372,7 +386,7 @@ impl Client {
         // bip157 dials the peer added last first.
         let mut b = Builder::new(net)
             .whitelist_only()
-            .add_peers(dial.iter().rev().map(|(_, p)| p.trusted()))
+            .add_peers(dial.iter().rev().map(|(t, p)| p.trusted(route.services.get(t).copied().unwrap_or(0))))
             .required_peers(required)
             .handshake_timeout(t.handshake)
             .filter_batch_timeout(t.filter_batch);
@@ -382,6 +396,10 @@ impl Client {
         if matches!(route.route, Route::Tor | Route::Onion) {
             b = b.socks5_proxy(proxy_addr(proxy.ok_or("routed through Tor, and no proxy is set")?)?);
         }
+        let errands = match &route.errands {
+            Some(e) => Some(Arc::new(crate::errand::Errands::new(net, e, proxy.ok_or("matched blocks go through Tor, and no proxy is set")?, tor.clone())?)),
+            None => None,
+        };
         if start.headers_only {
             b = b.headers_only_sync();
         }
@@ -412,6 +430,10 @@ impl Client {
         });
         let (updated, woken) = (tx.clone(), wake.clone());
         updates.checkpoint_every(CHECKPOINT_FILTERS);
+        if let Some(e) = errands {
+            let r = requester.clone();
+            updates.fetch_blocks_with(Arc::new(move |height, hash| -> Fetch { Box::pin(e.clone().block(r.clone(), height, hash)) }));
+        }
         let widen = updates.widen_handle();
         // Why the stream ended, or none once the sync thread is gone.
         let stream = rt.spawn(async move {
@@ -448,8 +470,8 @@ impl Client {
         let (seen, connected, best_header) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)), Arc::new(Mutex::new(start.from.0)));
         let now = Arc::new(Mutex::new(vec![]));
         rt.spawn(watch_peers(requester.clone(), dial.clone(), Watched { seen: seen.clone(), now: now.clone(), connected: connected.clone(), best_header: best_header.clone() }));
-        tracing::info!(target: "bitcoin", "kyoto: started after {} holding headers to {} with {} peers, quorum {required}{}", start.from.0, start.known_to, dial.len(),
-            if start.headers_only { ", headers first" } else { "" });
+        tracing::info!(target: "bitcoin", "kyoto: started after {} holding headers to {} with {} peers, quorum {required}{}{}", start.from.0, start.known_to, dial.len(),
+            if start.headers_only { ", headers first" } else { "" }, if route.errands.is_some() { ", matched blocks over Tor" } else { "" });
         let lan = dial.iter().filter(|(_, p)| matches!(p, Peer::Lan(..))).map(|(t, _)| t.clone()).collect();
         Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, now, connected, best_header, revealed, window, widen, start, started: Instant::now(), updated: false, synced: false, ended: false })
     }

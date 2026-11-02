@@ -1,6 +1,6 @@
 //! A Bitcoin P2P proxy for the Kyoto tests: forwards a peer, or delays its answers, goes down,
 //! forges the filter header and filter of one block (sending the forged batch several times),
-//! adds to the peer's gossip, or hides some of its services.
+//! adds to the peer's gossip, or hides some of its services. It counts what each side sends.
 //! The tests use it in process; scripts run it with a mode file it rereads every 200 ms:
 //!   p2p_proxy <listen addr> <upstream addr> <mode file>
 //! Modes, as JSON: {"mode":"forward"} | {"mode":"down"} |
@@ -19,6 +19,7 @@ use bitcoin::bip158::FilterHash;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_filter::{CFHeaders, CFilter};
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::BlockHash;
@@ -77,14 +78,16 @@ pub struct Proxy {
     pub seen: Arc<Mutex<HashMap<String, usize>>>,
     /// Bytes of each command from upstream, headers included.
     pub bytes: Arc<Mutex<HashMap<String, usize>>>,
+    /// Commands the client sent; a `getdata` asking for a block also counts as `getdata-block`.
+    pub sent: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Proxy {
     pub fn start(listen: &str, upstream: SocketAddr, mode: Mode) -> Proxy {
         let listener = TcpListener::bind(listen).expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let p = Proxy { addr, mode: Arc::new(Mutex::new(mode)), live: Arc::default(), seen: Arc::default(), bytes: Arc::default() };
-        let (mode, live, seen, bytes) = (p.mode.clone(), p.live.clone(), p.seen.clone(), p.bytes.clone());
+        let p = Proxy { addr, mode: Arc::new(Mutex::new(mode)), live: Arc::default(), seen: Arc::default(), bytes: Arc::default(), sent: Arc::default() };
+        let (mode, live, seen, bytes, sent) = (p.mode.clone(), p.live.clone(), p.seen.clone(), p.bytes.clone(), p.sent.clone());
         std::thread::spawn(move || {
             for client in listener.incoming().flatten() {
                 if *mode.lock().unwrap() == Mode::Down {
@@ -97,9 +100,10 @@ impl Proxy {
                 };
                 live.lock().unwrap().extend([client.try_clone().unwrap(), up.try_clone().unwrap()]);
                 let (c2, u2) = (client.try_clone().unwrap(), up.try_clone().unwrap());
-                std::thread::spawn(move || pump(client, u2, None));
+                let sent = sent.clone();
+                std::thread::spawn(move || pump(client, u2, None, Some(sent)));
                 let (m, s, b) = (mode.clone(), seen.clone(), bytes.clone());
-                std::thread::spawn(move || pump(up, c2, Some((m, s, b))));
+                std::thread::spawn(move || pump(up, c2, Some((m, s, b)), None));
             }
         });
         p
@@ -117,6 +121,11 @@ impl Proxy {
 
     pub fn count(&self, command: &str) -> usize {
         self.seen.lock().unwrap().get(command).copied().unwrap_or(0)
+    }
+
+    /// How many `command` messages the client sent.
+    pub fn sent(&self, command: &str) -> usize {
+        self.sent.lock().unwrap().get(command).copied().unwrap_or(0)
     }
 
     /// Messages and bytes from upstream so far, by command.
@@ -161,10 +170,19 @@ fn reframe(header: &[u8; 24], payload: &[u8]) -> Vec<u8> {
 
 type Watch = (Arc<Mutex<Mode>>, Arc<Mutex<HashMap<String, usize>>>, Arc<Mutex<HashMap<String, usize>>>);
 
-/// Copies messages from `from` to `to`; upstream's, with `watch`, as the mode says.
-fn pump(mut from: TcpStream, mut to: TcpStream, watch: Option<Watch>) {
+/// Copies messages from `from` to `to`; upstream's, with `watch`, as the mode says; the client's
+/// counted in `sent`.
+fn pump(mut from: TcpStream, mut to: TcpStream, watch: Option<Watch>, sent: Option<Arc<Mutex<HashMap<String, usize>>>>) {
     loop {
         let Ok((header, payload)) = read_message(&mut from) else { break };
+        if let Some(sent) = &sent {
+            let cmd = command(&header);
+            let mut sent = sent.lock().unwrap();
+            if cmd == "getdata" && deserialize::<Vec<Inventory>>(&payload).is_ok_and(|i| i.iter().any(|i| matches!(i, Inventory::Block(_) | Inventory::WitnessBlock(_)))) {
+                *sent.entry("getdata-block".into()).or_default() += 1;
+            }
+            *sent.entry(cmd).or_default() += 1;
+        }
         let mut copies = 1;
         let mut bytes = None;
         let mut after = None;

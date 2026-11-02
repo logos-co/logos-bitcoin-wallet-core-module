@@ -5,6 +5,7 @@ pub mod authority;
 pub mod checks;
 pub mod crosscheck;
 pub mod engine;
+pub mod errand;
 pub mod fees;
 pub mod gate;
 pub mod headers;

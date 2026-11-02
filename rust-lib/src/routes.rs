@@ -2,6 +2,9 @@
 //! `regtest.json`. A source routed through Tor without a proxy is down, never reached directly.
 //! The local node and Kyoto are chain authorities; servers serve the other roles.
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::Value;
@@ -75,7 +78,43 @@ pub struct KyotoRoute {
     /// The same with where each came from and whether it connected before, when the node module
     /// keeps each peer's record and takes reports; `None` for plain `host:port` (regtest.json).
     pub listed: Option<Vec<Listed>>,
+    /// Each peer's services as the table gives them: BIP324 to those with bit 11.
+    pub services: BTreeMap<String, u64>,
+    /// In `identifying`: the peers above serve headers and filters only, directly, and matched
+    /// blocks and broadcasts go to these onion peers, one errand each.
+    pub errands: Option<ErrandRoute>,
     pub down: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrandRoute {
+    pub peers: Vec<String>,
+    /// The longest random wait before a block's errand.
+    pub max_delay: Duration,
+}
+
+/// The errands' wait at most: a direct peer and an onion peer seeing both sides can't easily
+/// match a scan past a block with its fetch.
+pub const ERRAND_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// What goes through Tor, as the node module's `set_tor_use` stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TorUse {
+    All,
+    Identifying,
+    None,
+}
+
+impl TorUse {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "all" => Some(TorUse::All),
+            "identifying" => Some(TorUse::Identifying),
+            "none" => Some(TorUse::None),
+            _ => None,
+        }
+    }
 }
 
 /// A chain authority that can take a broadcast, in the order the route table gives.
@@ -151,6 +190,8 @@ pub struct Routes {
     pub poll_secs: u64,
     /// Kyoto's quorum on a test chain; the network's own elsewhere.
     pub kyoto_required: Option<u8>,
+    /// As the table says; `none` drops the proxy, so nothing goes through Tor.
+    pub tor_use: Option<TorUse>,
 }
 
 pub fn host_of(url: &str) -> Option<&str> {
@@ -248,25 +289,53 @@ pub fn resolve_kyoto(id: &str, route: Route, peers: Vec<String>, proxy: Option<&
         _ if peers.is_empty() => Some("no peer to dial: the peer list is empty".to_string()),
         _ => None,
     };
-    KyotoRoute { id: id.to_string(), route, peers, listed: None, down }
+    KyotoRoute { id: id.to_string(), route, peers, listed: None, services: BTreeMap::new(), errands: None, down }
 }
 
-/// The table's `peers`: `host:port`, or `{ peer, source, ok }` from a node module that keeps
-/// each peer's record. A bad entry is skipped.
-fn parse_peers(v: Option<&Value>) -> (Vec<String>, Option<Vec<Listed>>) {
-    let Some(Value::Array(items)) = v else { return (vec![], None) };
+/// Kyoto split for `identifying`: its route for headers and filters, and errands through Tor,
+/// never direct, for the rest.
+pub fn with_errands(mut k: KyotoRoute, errands: ErrandRoute, proxy: Option<&Proxy>) -> KyotoRoute {
+    if k.down.is_none() {
+        k.down = match () {
+            _ if proxy.is_none() => Some("matched blocks go through Tor, and no proxy is set".to_string()),
+            _ if errands.peers.is_empty() => Some("no onion peer for matched blocks".to_string()),
+            _ => None,
+        };
+    }
+    k.errands = Some(errands);
+    k
+}
+
+/// Peers as dialled, with their records when the table has them, and their services.
+type Peers = (Vec<String>, Option<Vec<Listed>>, BTreeMap<String, u64>);
+
+/// The table's `peers`: `host:port`, or `{ peer, source, ok, services }` from a node module that
+/// keeps each peer's record; services a decimal string or a number. A bad entry is skipped.
+fn parse_peers(v: Option<&Value>) -> Peers {
+    let Some(Value::Array(items)) = v else { return (vec![], None, BTreeMap::new()) };
     let mut listed = Vec::with_capacity(items.len());
+    let mut services = BTreeMap::new();
     let mut records = false;
     for item in items {
         let entry = match item {
             Value::String(peer) => Some(Listed { peer: peer.clone(), source: PeerSource::List, ok: false, from: None }),
             Value::Object(o) => {
                 records = true;
-                o.get("peer").and_then(Value::as_str).map(|peer| Listed {
-                    peer: peer.to_string(),
-                    source: PeerSource::parse(o.get("source").and_then(Value::as_str).unwrap_or("list")),
-                    ok: o.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                    from: None,
+                o.get("peer").and_then(Value::as_str).map(|peer| {
+                    let bits = match o.get("services") {
+                        Some(Value::String(s)) => s.parse::<u64>().ok(),
+                        Some(n) => n.as_u64(),
+                        None => None,
+                    };
+                    if let Some(b) = bits {
+                        services.insert(peer.to_string(), b);
+                    }
+                    Listed {
+                        peer: peer.to_string(),
+                        source: PeerSource::parse(o.get("source").and_then(Value::as_str).unwrap_or("list")),
+                        ok: o.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                        from: None,
+                    }
                 })
             }
             _ => None,
@@ -276,7 +345,16 @@ fn parse_peers(v: Option<&Value>) -> (Vec<String>, Option<Vec<Listed>>) {
             None => tracing::warn!(target: "bitcoin", "route_table.peers: skipped {item}"),
         }
     }
-    (listed.iter().map(|l| l.peer.clone()).collect(), records.then_some(listed))
+    (listed.iter().map(|l| l.peer.clone()).collect(), records.then_some(listed), services)
+}
+
+/// `kyotoSplit`: `{ chain: { route, peers }, tor: { route: onion, peers } }`, beside the all-Tor
+/// entry an older core reads.
+fn parse_split(v: &Value) -> Option<(Route, Peers, Vec<String>)> {
+    let route: Route = serde_json::from_value(v["chain"]["route"].clone()).ok()?;
+    let chain = parse_peers(v["chain"].get("peers"));
+    let (tor, _, _) = parse_peers(v["tor"].get("peers"));
+    Some((route, chain, tor))
 }
 
 impl Routes {
@@ -286,7 +364,8 @@ impl Routes {
         if v.get("ok").is_some_and(|ok| ok == false) {
             return Err(v["error"].as_str().unwrap_or("route_table refused").to_string());
         }
-        let proxy = match v["proxy"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != "direct") {
+        let tor_use = v["torUse"].as_str().and_then(TorUse::parse);
+        let proxy = match v["proxy"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != "direct" && tor_use != Some(TorUse::None)) {
             Some(p) => Some(Proxy::parse(p)?),
             None => None,
         };
@@ -299,8 +378,15 @@ impl Routes {
         let servers = |name: &str| -> Result<Vec<Source>, String> { Ok(entries(name)?.iter().filter_map(|e| resolve(e, proxy.as_ref())).filter(|s| s.kind != Kind::Rpc).collect()) };
         let kind = |e: &Entry, k: &str| e.kind.as_deref() == Some(k);
         let chain = entries("chain")?;
-        let (peers, listed) = parse_peers(v.get("peers"));
-        let kyoto = chain.iter().find(|e| kind(e, "kyoto")).map(|e| KyotoRoute { listed: listed.clone(), ..resolve_kyoto(&e.id, e.route, peers.clone(), proxy.as_ref()) });
+        let (peers, listed, services) = parse_peers(v.get("peers"));
+        let split = v.get("kyotoSplit").filter(|_| tor_use != Some(TorUse::None)).and_then(parse_split);
+        let kyoto = chain.iter().find(|e| kind(e, "kyoto")).map(|e| match &split {
+            Some((route, (peers, listed, services), tor)) => {
+                let k = KyotoRoute { listed: listed.clone(), services: services.clone(), ..resolve_kyoto(&e.id, *route, peers.clone(), proxy.as_ref()) };
+                with_errands(k, ErrandRoute { peers: tor.clone(), max_delay: ERRAND_MAX_DELAY }, proxy.as_ref())
+            }
+            None => KyotoRoute { listed: listed.clone(), services: services.clone(), ..resolve_kyoto(&e.id, e.route, peers.clone(), proxy.as_ref()) },
+        });
         let local = chain.iter().find(|e| kind(e, "local")).map(|e| e.id.clone());
         let rpc = chain.iter().find(|e| kind(e, "rpc")).and_then(|e| resolve(e, proxy.as_ref()));
         let broadcast_by = entries("broadcast")?
@@ -328,6 +414,7 @@ impl Routes {
             cross_check: v["crossCheck"].as_bool().unwrap_or(false),
             poll_secs: 30,
             kyoto_required: None,
+            tor_use,
             proxy,
         })
     }
@@ -345,7 +432,15 @@ impl Routes {
             all.push(entry(format!("esplora-{i}"), url, format!("regtest-esplora-{i}")));
         }
         let sources: Vec<Source> = all.iter().filter_map(|e| resolve(e, None)).collect();
-        let kyoto = (!cfg.kyoto.is_empty()).then(|| resolve_kyoto("kyoto", Route::Direct, cfg.kyoto.clone(), None));
+        let tor_use = cfg.tor_use.as_deref().and_then(TorUse::parse);
+        let proxy = cfg.proxy.as_deref().filter(|_| tor_use != Some(TorUse::None)).and_then(|p| Proxy::parse(p).ok());
+        let kyoto = (!cfg.kyoto.is_empty()).then(|| {
+            let k = resolve_kyoto("kyoto", Route::Direct, cfg.kyoto.clone(), None);
+            match cfg.kyoto_tor.is_empty() || tor_use == Some(TorUse::None) {
+                true => k,
+                false => with_errands(k, ErrandRoute { peers: cfg.kyoto_tor.clone(), max_delay: Duration::from_millis(cfg.errand_delay_ms.unwrap_or(0)) }, proxy.as_ref()),
+            }
+        });
         let local = cfg.local.then(|| "local".to_string());
         let mut broadcast_by = vec![];
         if local.is_some() {
@@ -357,7 +452,8 @@ impl Routes {
         let authority = kyoto.is_some() || local.is_some();
         let syncing = if cfg.check_only { vec![] } else { sources.clone() };
         Routes {
-            proxy: None,
+            proxy,
+            tor_use,
             chain: if authority { vec![] } else { sources.iter().filter(|s| s.kind == Kind::Electrum).cloned().collect() },
             fees_local: local.is_some(),
             local,
@@ -454,6 +550,42 @@ mod tests {
         assert!(r.cross_check);
         assert_eq!(r.roles_of("a"), vec!["history", "broadcast"]);
         assert_eq!(r.every().len(), 5);
+    }
+
+    fn split(proxy: Option<&str>, tor_use: &str) -> Routes {
+        let mut t: Value = serde_json::from_str(&table(proxy)).unwrap();
+        t["torUse"] = json!(tor_use);
+        t["kyotoSplit"] = json!({
+            "chain": {"route": "direct", "peers": [{"peer": "203.0.113.7:8333", "source": "list", "ok": true, "services": "3145"},
+                                                   {"peer": "[2001:db8::7]:8333", "source": "seed", "ok": false, "services": 1097}]},
+            "tor": {"route": "onion", "peers": [{"peer": format!("{}:8333", onion()), "source": "list", "ok": true}]},
+        });
+        Routes::from_table(&t.to_string()).unwrap()
+    }
+
+    #[test]
+    fn identifying_splits_kyoto_and_none_drops_tor() {
+        let r = split(Some("socks5h://127.0.0.1:9050"), "identifying");
+        assert_eq!(r.tor_use, Some(TorUse::Identifying));
+        let k = r.kyoto.unwrap();
+        assert_eq!((k.route, k.peers.clone(), k.down), (Route::Direct, vec!["203.0.113.7:8333".to_string(), "[2001:db8::7]:8333".to_string()], None));
+        assert_eq!((k.services["203.0.113.7:8333"], k.services["[2001:db8::7]:8333"]), (3145, 1097), "services as a string or a number");
+        assert_eq!(k.listed.unwrap()[1].source, PeerSource::Seed);
+        assert_eq!(k.errands, Some(ErrandRoute { peers: vec![format!("{}:8333", onion())], max_delay: ERRAND_MAX_DELAY }));
+
+        // No proxy: the split waits for Tor, never dials only half of it.
+        let k = split(None, "identifying").kyoto.unwrap();
+        assert_eq!(k.down.as_deref(), Some("matched blocks go through Tor, and no proxy is set"));
+
+        // `none`: no proxy whatever the table says, and the all-Tor entry with it.
+        let r = split(Some("socks5h://127.0.0.1:9050"), "none");
+        assert_eq!((r.proxy.clone(), r.tor_use), (None, Some(TorUse::None)));
+        let k = r.kyoto.unwrap();
+        assert_eq!((k.route, k.errands, k.down.as_deref()), (Route::Onion, None, Some("routed through Tor, and no proxy is set")));
+
+        // A table without the keys, from an older node module: all-Tor as before.
+        let r = Routes::from_table(&table(Some("socks5h://127.0.0.1:9050"))).unwrap();
+        assert_eq!((r.tor_use, r.kyoto.unwrap().errands), (None, None));
     }
 
     #[test]

@@ -156,19 +156,24 @@ pub struct Learned {
     pub from: String,
 }
 
-/// A gossiped address the node module keeps: an onion v3 service (on regtest, an address on
-/// the user's network instead), with bits 0, 3 and 6, seen within 3 days, at most 10 minutes ahead.
-pub fn learned(net: BNetwork, from: &str, m: &AddrV2Message, now: u64) -> Option<Learned> {
+/// A gossiped address the node module keeps: an onion v3 service, or a public IP from a peer
+/// dialled directly (`clearnet`); on regtest, an address on the user's network instead. With bits
+/// 0, 3 and 6, seen within 3 days, at most 10 minutes ahead.
+pub fn learned(net: BNetwork, from: &str, m: &AddrV2Message, clearnet: bool, now: u64) -> Option<Learned> {
     let seen = u64::from(m.time);
     if m.port == 0 || m.services.to_u64() & REQUIRED_SERVICES != REQUIRED_SERVICES || seen + LEARNED_MAX_AGE < now || seen > now + 600 {
         return None;
     }
     let lan = |ip: std::net::IpAddr| crate::routes::is_loopback_or_lan(&ip.to_string());
+    // The node module checks the rest: reserved ranges, and 2 per /16 or /32.
+    let public = |ip: std::net::IpAddr| !lan(ip) && !ip.is_unspecified() && !ip.is_multicast();
     let regtest = net == BNetwork::Regtest;
     let addr = match &m.addr {
         AddrV2::TorV3(key) if !regtest => onion_name(key),
         AddrV2::Ipv4(ip) if regtest && lan((*ip).into()) => ip.to_string(),
         AddrV2::Ipv6(ip) if regtest && lan((*ip).into()) => ip.to_string(),
+        AddrV2::Ipv4(ip) if clearnet && !regtest && public((*ip).into()) => ip.to_string(),
+        AddrV2::Ipv6(ip) if clearnet && !regtest && public((*ip).into()) => ip.to_string(),
         _ => return None,
     };
     Some(Learned { addr, port: m.port, services: m.services.to_u64(), seen_at: seen, from: from.to_string() })
@@ -224,9 +229,9 @@ impl PeerReports {
         self.outcomes.extend(peers.iter().map(|p| Outcome { peer: p.clone(), ok: false, reason: Some("conflict") }));
     }
 
-    pub fn gossip(&mut self, net: BNetwork, from: &str, addrs: &[AddrV2Message], now: u64) {
+    pub fn gossip(&mut self, net: BNetwork, from: &str, addrs: &[AddrV2Message], clearnet: bool, now: u64) {
         self.gossiped += addrs.len() as u64;
-        for l in addrs.iter().filter_map(|m| learned(net, from, m, now)) {
+        for l in addrs.iter().filter_map(|m| learned(net, from, m, clearnet, now)) {
             self.kept += 1;
             let key = (l.addr.clone(), l.port);
             if self.reported.get(&key).is_some_and(|r| l.seen_at < r + LEARNED_REFRESH) {
@@ -407,9 +412,9 @@ mod tests {
         let now = 1_800_000_000;
         let key = [5u8; 32];
         let onion = AddrV2::TorV3(key);
-        let good = learned(BNetwork::Mainnet, "a.onion:8333", &gossip(onion.clone(), REQUIRED_SERVICES, now - 3600), now).unwrap();
+        let good = learned(BNetwork::Mainnet, "a.onion:8333", &gossip(onion.clone(), REQUIRED_SERVICES, now - 3600), false, now).unwrap();
         assert_eq!((good.addr, good.port, good.services, good.seen_at, good.from.as_str()), (onion_name(&key), 8333, REQUIRED_SERVICES, now - 3600, "a.onion:8333"));
-        let reject = |net, addr: AddrV2, services, time| learned(net, "x", &gossip(addr, services, time), now).is_none();
+        let reject = |net, addr: AddrV2, services, time| learned(net, "x", &gossip(addr, services, time), false, now).is_none();
         assert!(reject(BNetwork::Mainnet, onion.clone(), REQUIRED_SERVICES, now - LEARNED_MAX_AGE - 1), "older than 3 days");
         assert!(reject(BNetwork::Mainnet, onion.clone(), REQUIRED_SERVICES, now + 3600), "from the future");
         assert!(reject(BNetwork::Mainnet, onion.clone(), 1 | 1 << 6, now), "no witness");
@@ -421,8 +426,16 @@ mod tests {
         assert!(reject(BNetwork::Mainnet, AddrV2::I2p([1; 32]), REQUIRED_SERVICES, now));
         assert!(!reject(BNetwork::Regtest, AddrV2::Ipv4([127, 0, 0, 1].into()), REQUIRED_SERVICES, now), "loopback on regtest");
         assert!(!reject(BNetwork::Regtest, AddrV2::Ipv4([192, 168, 1, 20].into()), REQUIRED_SERVICES, now), "the LAN on regtest");
-        let v6 = learned(BNetwork::Regtest, "x", &gossip(AddrV2::Ipv6("fd00::2".parse().unwrap()), REQUIRED_SERVICES, now), now).unwrap();
+        let v6 = learned(BNetwork::Regtest, "x", &gossip(AddrV2::Ipv6("fd00::2".parse().unwrap()), REQUIRED_SERVICES, now), false, now).unwrap();
         assert_eq!((v6.addr.as_str(), peer_text(&v6.addr, v6.port)), ("fd00::2", "[fd00::2]:8333".to_string()));
+        // From a peer dialled directly: public IPs too, never loopback or the LAN.
+        let direct = |net, addr: AddrV2| learned(net, "198.51.100.1:8333", &gossip(addr, REQUIRED_SERVICES, now), true, now).map(|l| l.addr);
+        assert_eq!(direct(BNetwork::Mainnet, AddrV2::Ipv4([203, 0, 113, 7].into())).as_deref(), Some("203.0.113.7"));
+        assert_eq!(direct(BNetwork::Mainnet, AddrV2::Ipv6("2001:db8::7".parse().unwrap())).as_deref(), Some("2001:db8::7"));
+        assert_eq!(direct(BNetwork::Mainnet, onion.clone()), Some(onion_name(&key)), "onion peers still");
+        assert_eq!(direct(BNetwork::Mainnet, AddrV2::Ipv4([127, 0, 0, 1].into())), None);
+        assert_eq!(direct(BNetwork::Mainnet, AddrV2::Ipv4([10, 0, 0, 7].into())), None);
+        assert_eq!(direct(BNetwork::Regtest, AddrV2::Ipv4([203, 0, 113, 7].into())), None, "regtest keeps the LAN only");
     }
 
     #[test]
@@ -441,7 +454,7 @@ mod tests {
         r.dial("good:1", v(REQUIRED_SERVICES, 70016));
         r.dial("old:1", v(REQUIRED_SERVICES, 70001));
         let onions: Vec<AddrV2Message> = (0..600u32).map(|i| gossip(AddrV2::TorV3([(i % 256) as u8, (i / 256) as u8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]), REQUIRED_SERVICES, now - u64::from(i))).collect();
-        r.gossip(BNetwork::Mainnet, "good:1", &onions, now);
+        r.gossip(BNetwork::Mainnet, "good:1", &onions, false, now);
         // Before the start settles only the learned peers may go; once it ends, its outcomes go.
         let first = r.take(t0, false, false).unwrap();
         assert_eq!(first["outcomes"], json!([]));
@@ -472,13 +485,13 @@ mod tests {
         // A peer gossiped again keeps its first gossiper and its latest sighting; one reported
         // already goes again only when seen hours later.
         let fresh = AddrV2::TorV3([9; 32]);
-        r.gossip(BNetwork::Mainnet, "a:1", &[gossip(fresh.clone(), REQUIRED_SERVICES, now)], now);
-        r.gossip(BNetwork::Mainnet, "b:1", &[gossip(fresh.clone(), REQUIRED_SERVICES, now + 60)], now + 60);
-        r.gossip(BNetwork::Mainnet, "b:1", &onions[..1], now + 60);
+        r.gossip(BNetwork::Mainnet, "a:1", &[gossip(fresh.clone(), REQUIRED_SERVICES, now)], false, now);
+        r.gossip(BNetwork::Mainnet, "b:1", &[gossip(fresh.clone(), REQUIRED_SERVICES, now + 60)], false, now + 60);
+        r.gossip(BNetwork::Mainnet, "b:1", &onions[..1], false, now + 60);
         let again = r.take(t0 + LEARNED_EVERY * 3, false, false).unwrap();
         assert_eq!(again["learned"], json!([{"addr": onion_name(&[9; 32]), "port": 8333, "services": REQUIRED_SERVICES, "seenAt": now + 60, "from": "a:1"}]));
         let later = now + LEARNED_REFRESH;
-        r.gossip(BNetwork::Mainnet, "b:1", &[gossip(onions[0].addr.clone(), REQUIRED_SERVICES, later)], later);
+        r.gossip(BNetwork::Mainnet, "b:1", &[gossip(onions[0].addr.clone(), REQUIRED_SERVICES, later)], false, later);
         let refreshed = r.take(t0 + LEARNED_EVERY * 4, false, false).unwrap();
         assert_eq!((refreshed["learned"].as_array().unwrap().len(), &refreshed["learned"][0]["seenAt"]), (1, &json!(later)));
     }
@@ -501,15 +514,15 @@ mod tests {
         let mut r = PeerReports::default();
         let at = |i: u32, seen: u64| gossip(AddrV2::TorV3([(i % 256) as u8, (i / 256) as u8, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]), REQUIRED_SERVICES, seen);
         let first: Vec<AddrV2Message> = (0..600).map(|i| at(i, now)).collect();
-        r.gossip(BNetwork::Mainnet, "a:1", &first, now);
+        r.gossip(BNetwork::Mainnet, "a:1", &first, false, now);
         assert_eq!(r.take(t0, false, false).unwrap()["learned"].as_array().unwrap().len(), 500);
         // All 600 seen again much later: the 100 never reported go first.
         let later = now + LEARNED_REFRESH;
         let again: Vec<AddrV2Message> = (0..600).map(|i| at(i, later)).collect();
-        r.gossip(BNetwork::Mainnet, "a:1", &again, later);
+        r.gossip(BNetwork::Mainnet, "a:1", &again, false, later);
         let next = r.take(t0 + LEARNED_EVERY, false, false).unwrap();
         let reported: HashSet<String> = next["learned"].as_array().unwrap().iter().map(|l| l["addr"].as_str().unwrap().to_string()).collect();
-        let never: Vec<String> = (500..600).map(|i| learned(BNetwork::Mainnet, "a:1", &at(i, now), now).unwrap().addr).collect();
+        let never: Vec<String> = (500..600).map(|i| learned(BNetwork::Mainnet, "a:1", &at(i, now), false, now).unwrap().addr).collect();
         let missing: Vec<&String> = never.iter().filter(|a| !reported.contains(*a)).collect();
         assert_eq!(reported.len(), 500);
         assert!(missing.is_empty(), "{} never reported were left behind", missing.len());

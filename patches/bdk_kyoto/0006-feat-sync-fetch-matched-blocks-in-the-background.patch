@@ -1,0 +1,224 @@
+From 97af455e90d2365db5a0999a675254a94cc335ea Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Mon, 2 Nov 2026 15:14:40 -0300
+Subject: [PATCH 6/6] feat(sync): fetch matched blocks in the background
+
+UpdateSubscriber::fetch_blocks_with takes a function that fetches a
+matched block by other means than the node's peers (a Tor errand, in the
+wallet core). Each block's fetch starts as its filter matches, while the
+scan goes on, so a slow fetch never holds the filters back in the
+unbounded event channel.
+
+Fetched blocks are applied oldest first, up to the first still under
+way. scanned() stays below that block, so a restart checks its filter
+again, and synced() is false while any fetch is pending. At the tip,
+each fetch that lets blocks apply makes an update. The fetcher answers
+None for a block no longer in the chain, which is skipped.
+---
+ src/lib.rs | 115 ++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 109 insertions(+), 6 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 11606ce..c31b62d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -35,6 +35,8 @@
+ #![warn(missing_docs)]
+ use std::collections::BTreeMap;
+ use std::collections::HashSet;
++use std::future::Future;
++use std::pin::Pin;
+ use std::sync::{Arc, Mutex};
+ 
+ use bdk_wallet::chain::BlockId;
+@@ -51,6 +53,7 @@ pub extern crate bip157;
+ use bip157::chain::BlockHeaderChanges;
+ use bip157::error::FetchBlockError;
+ use bip157::tokio;
++use bip157::Block;
+ use bip157::IndexedBlock;
+ use bip157::ScriptBuf;
+ #[doc(inline)]
+@@ -247,6 +250,19 @@ pub trait Wallets: sealed::Sealed {}
+ impl Wallets for wallets::Single {}
+ impl Wallets for wallets::Multiple {}
+ 
++/// Fetches a matched block some other way than from the node's peers, retrying as it sees fit:
++/// the block to apply, or none to skip it as no longer in the chain.
++pub type FetchBlock =
++    Arc<dyn Fn(u32, BlockHash) -> Pin<Box<dyn Future<Output = Option<Block>> + Send>> + Send + Sync>;
++
++struct Fetcher(FetchBlock);
++
++impl std::fmt::Debug for Fetcher {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("Fetcher")
++    }
++}
++
+ /// Interpret events from a node that is running to apply
+ /// updates to an underlying wallet.
+ #[derive(Debug)]
+@@ -267,6 +283,12 @@ pub struct UpdateSubscriber<W: Wallets> {
+     checkpoint_every: Option<u32>,
+     // the last index to watch per keychain, asked for while running, taken before the next event
+     widen: Arc<Mutex<BTreeMap<KeychainKind, u32>>>,
++    // with a fetcher: matched blocks by height, fetched or under way, and their tasks; at_tip
++    // from filters synced until the next event
++    fetch: Option<Fetcher>,
++    fetched: BTreeMap<(u32, BlockHash), Option<Option<Block>>>,
++    fetching: tokio::task::JoinSet<((u32, BlockHash), Option<Block>)>,
++    at_tip: bool,
+     // processes events for the wallet.
+     single_update_builder: Option<UpdateBuilder>,
+     // process events for multiple wallets.
+@@ -297,6 +319,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             filters_since: 0,
+             checkpoint_every: None,
+             widen: Arc::default(),
++            fetch: None,
++            fetched: BTreeMap::new(),
++            fetching: tokio::task::JoinSet::new(),
++            at_tip: false,
+             _marker: core::marker::PhantomData,
+         }
+     }
+@@ -333,18 +359,43 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             filters_since: 0,
+             checkpoint_every: None,
+             widen: Arc::default(),
++            fetch: None,
++            fetched: BTreeMap::new(),
++            fetching: tokio::task::JoinSet::new(),
++            at_tip: false,
+             _marker: core::marker::PhantomData,
+         }
+     }
+ 
+     async fn sync(&mut self) -> Result<(), UpdateError> {
+-        while let Some(message) = self.receiver.recv().await {
++        loop {
++            let message = if self.fetching.is_empty() {
++                self.receiver.recv().await
++            } else {
++                tokio::select! {
++                    biased;
++                    done = self.fetching.join_next() => {
++                        let Some(Ok((key, block))) = done else {
++                            return Err(UpdateError::NodeStopped);
++                        };
++                        self.fetched.insert(key, Some(block));
++                        if self.apply_fetched() && self.at_tip {
++                            self.extend_spk_cache();
++                            return Ok(());
++                        }
++                        continue;
++                    }
++                    message = self.receiver.recv() => message,
++                }
++            };
++            let Some(message) = message else { break };
+             self.apply_widen();
++            self.at_tip = false;
+             match message {
+                 Event::IndexedFilter(filter) => {
+                     let block_hash = filter.block_hash();
+                     if filter.contains_any(self.spk_cache.iter()) {
+-                        self.queued_blocks.push((filter.height(), block_hash));
++                        self.queue_block(filter.height(), block_hash);
+                     }
+                     self.scanned = Some(filter.height());
+                     self.filters_since += 1;
+@@ -375,6 +426,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
+                     self.filters_since = 0;
+                     self.scanned = Some(tip.height);
+                     self.synced = true;
++                    self.at_tip = true;
+                     return Ok(());
+                 }
+             }
+@@ -390,9 +442,55 @@ impl<W: Wallets> UpdateSubscriber<W> {
+         self.checkpoint_every = Some(filters.max(1));
+     }
+ 
+-    /// The height of the last filter checked against the wallet's scripts, as of the last update.
++    /// The height of the last filter checked against the wallet's scripts, as of the last update;
++    /// with a fetcher, below the first block still being fetched, so a restart checks it again.
+     pub fn scanned(&self) -> Option<u32> {
+-        self.scanned
++        match self.fetched.keys().next() {
++            Some((height, _)) => self.scanned.map(|s| s.min(height.saturating_sub(1))),
++            None => self.scanned,
++        }
++    }
++
++    /// Fetches matched blocks with `fetch` in the background instead of from the node's peers,
++    /// each as its filter matches, while the scan goes on. They are applied oldest first, up to
++    /// the first still being fetched; at the tip, each one applied makes an update.
++    pub fn fetch_blocks_with(&mut self, fetch: FetchBlock) {
++        self.fetch = Some(Fetcher(fetch));
++    }
++
++    fn queue_block(&mut self, height: u32, hash: BlockHash) {
++        let Some(Fetcher(fetch)) = &self.fetch else {
++            self.queued_blocks.push((height, hash));
++            return;
++        };
++        if self.fetched.contains_key(&(height, hash)) {
++            return;
++        }
++        self.fetched.insert((height, hash), None);
++        let block = fetch(height, hash);
++        self.fetching.spawn(async move { ((height, hash), block.await) });
++    }
++
++    // Oldest first, up to the first block still being fetched; whether any was applied or skipped.
++    fn apply_fetched(&mut self) -> bool {
++        let mut any = false;
++        while matches!(self.fetched.first_key_value(), Some((_, Some(_)))) {
++            let Some(((height, _), Some(block))) = self.fetched.pop_first() else {
++                break;
++            };
++            any = true;
++            let Some(block) = block else { continue };
++            let block = IndexedBlock { height, block };
++            if let Some(single) = self.single_update_builder.as_mut() {
++                single.apply_block_event(&block);
++            }
++            if let Some(multiple) = self.multiple_updates_builder.as_mut() {
++                for builder in multiple.values_mut() {
++                    builder.apply_block_event(&block);
++                }
++            }
++        }
++        any
+     }
+ 
+     /// A handle to widen the scripts filters are checked against while the node runs: insert
+@@ -421,9 +519,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+         }
+     }
+ 
+-    /// Whether the last update came with filters synced to the tip, not at a checkpoint.
++    /// Whether the last update came with filters synced to the tip, not at a checkpoint, and
++    /// with a fetcher, no matched block still being fetched.
+     pub fn synced(&self) -> bool {
+-        self.synced
++        self.synced && self.fetched.is_empty()
+     }
+ 
+     fn extend_spk_cache(&mut self) {
+@@ -440,6 +539,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+     // Oldest first: a spend is relevant to the graph only once the output it spends is indexed,
+     // so a block applied before the block that funds it would lose the spend.
+     async fn apply_queued_blocks(&mut self) -> Result<(), UpdateError> {
++        if self.fetch.is_some() {
++            self.apply_fetched();
++            return Ok(());
++        }
+         self.queued_blocks.sort_by_key(|(height, _)| *height);
+         while let Some(&(_, hash)) = self.queued_blocks.first() {
+             let block = match self.requester.get_block(hash).await {
+-- 
+2.54.0 (Apple Git-157)
+

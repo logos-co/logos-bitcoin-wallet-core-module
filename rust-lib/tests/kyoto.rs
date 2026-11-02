@@ -2,13 +2,17 @@
 //! nodes behind proxies the test steers. Receive, send and confirm; a reorg; a restart after
 //! NoReachablePeers; a rebuild past the lookahead; and a peer forging filter headers. Then a
 //! matched block reorganized away before its fetch, an update stream that ends, and a scan whose
-//! rescan never reached the node.
+//! rescan never reached the node. Last, `identifying`'s split behind a test SOCKS5 server: matched
+//! blocks and the send over Tor errands, a scan that holds while Tor is down, and `none`.
 //! Needs `--features test-hooks`; the run command is in the README.
 
 mod common;
 #[path = "../examples/p2p_proxy.rs"]
 #[allow(dead_code)]
 mod p2p_proxy;
+#[path = "../examples/socks_proxy.rs"]
+#[allow(dead_code)]
+mod socks_proxy;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,6 +26,7 @@ use bitcoin_wallet_core::network::{configure_regtest, RegtestConfig};
 use common::{chain, collecting, MockManager, T};
 use p2p_proxy::{Mode, Proxy};
 use serde_json::{json, Value};
+use socks_proxy::Socks;
 
 fn kyoto(t: &T) -> Value {
     t.engine.status()["kyoto"].clone()
@@ -614,5 +619,160 @@ fn kyoto_asks_again_when_a_scan_never_ran() {
         assert_eq!(l.count("filters reported synced"), 1, "the scan asked again was refused too");
     }
     println!("KYOTO {warning}; scanned again from {} to {tip}", first - 8);
+    t.engine.shutdown();
+}
+
+/// `identifying`'s split on regtest: Kyoto's headers and filters from proxies in front of the main
+/// node and the follower, matched blocks and broadcasts through a test SOCKS5 server to two onion
+/// names it maps to proxies in front of the same nodes. With `tor_up` false, Tor is down at open.
+fn kyoto_split(tor_use: &str, tor_up: bool) -> (T, Vec<Proxy>, Vec<Proxy>, Socks, tempfile::TempDir) {
+    let Some((rpc, cookie)) = common::chain_env() else { panic!("REGTEST_RPC is not set (see tools/regtest/chain.sh)") };
+    let nodes: Vec<SocketAddr> = chain(&["peers"]).trim().split(',').map(|s| s.parse().unwrap()).collect();
+    let direct: Vec<Proxy> = [nodes[0], nodes[2]].iter().map(|n| Proxy::start("127.0.0.1:0", *n, Mode::Forward)).collect();
+    let tor: Vec<Proxy> = [nodes[0], nodes[2]].iter().map(|n| Proxy::start("127.0.0.1:0", *n, Mode::Forward)).collect();
+    let names: Vec<String> = (1..=2u8).map(|i| bitcoin_wallet_core::kyoto::onion_name(&[i; 32])).collect();
+    let socks = Socks::start("127.0.0.1:0", names.iter().cloned().zip(tor.iter().map(|p| p.addr)).collect(), tor_up);
+    configure_regtest(RegtestConfig {
+        kyoto: direct.iter().map(|p| p.addr.to_string()).collect(),
+        kyoto_tor: names.iter().map(|n| format!("{n}:18444")).collect(),
+        proxy: Some(format!("socks5h://{}", socks.addr)),
+        errand_delay_ms: Some(300),
+        tor_use: Some(tor_use.to_string()),
+        poll_secs: Some(1),
+        kyoto_required: Some(2),
+        ..Default::default()
+    });
+    let (sink, events) = collecting();
+    let manager = Arc::new(MockManager::new(Duration::from_millis(100)));
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::new(root.path().join("wallets"), sink, manager.clone(), None);
+    let t = T { engine, rpc, cookie, events, manager };
+    t.job("open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+    if tor_up {
+        t.synced();
+        t.wait("the scan from the birthday done", 180, || t.engine.status()["rescanFrom"].is_null());
+        t.synced();
+    }
+    assert_eq!(t.engine.status()["authority"]["kind"], "kyoto");
+    (t, direct, tor, socks, root)
+}
+
+fn sent(proxies: &[Proxy], command: &str) -> usize {
+    proxies.iter().map(|p| p.sent(command)).sum()
+}
+
+/// Receive and send in `identifying`: the direct peers see headers and filters only, never a
+/// block request, an `inv` or a transaction; the onion side sees the blocks and the send, never
+/// a filter request; every errand comes with credentials of its own. Run alone.
+#[test]
+#[ignore]
+fn kyoto_identifying_fetches_matched_blocks_over_tor() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+    if common::chain_env().is_none() {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    }
+    let (t, direct, tor, socks, _root) = kyoto_split("identifying", true);
+    assert!(kyoto(&t)["tor"].is_object(), "{}", kyoto(&t));
+
+    let paid = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.21).to_string();
+    t.mine(1);
+    t.synced();
+    t.wait("the payment confirmed", 90, || t.row(&paid)["state"] == "confirmed");
+
+    let theirs = t.wallet_rpc("getnewaddress", json!(["payee"])).as_str().unwrap().to_string();
+    let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "5000000"}], "feeRate": 2.0}));
+    let sent_tx = t.sign(p["previewId"].as_str().unwrap());
+    let txid = sent_tx["txid"].as_str().unwrap().to_string();
+    assert_eq!((sent_tx["via"].clone(), sent_tx["broadcast"].clone()), (json!("kyoto"), json!("requested")), "{sent_tx}");
+    t.wait("the send in the node's mempool", 30, || t.in_mempool(&txid));
+    t.mine(1);
+    t.synced();
+    t.wait("the send confirmed", 90, || t.row(&txid)["state"] == "confirmed");
+    t.wait("every matched block fetched", 60, || kyoto(&t)["tor"]["pending"] == 0);
+
+    let k = kyoto(&t);
+    assert!(k["tor"]["fetched"].as_u64() >= Some(2) && k["tor"]["broadcasts"] == 1 && k["tor"]["waiting"] == false, "{k}");
+    for c in ["getdata-block", "inv", "tx"] {
+        assert_eq!(sent(&direct, c), 0, "a direct peer was sent {c}");
+    }
+    assert!(sent(&direct, "getcfilters") > 0, "the filters come directly");
+    for c in ["getcfilters", "getcfheaders", "getheaders"] {
+        assert_eq!(sent(&tor, c), 0, "an onion peer was sent {c}");
+    }
+    assert!(sent(&tor, "getdata-block") >= 2 && sent(&tor, "tx") >= 1, "blocks {} txs {}", sent(&tor, "getdata-block"), sent(&tor, "tx"));
+    let asked = socks.asked();
+    let circuits: std::collections::HashSet<(String, String)> = asked.iter().map(|a| (a.user.clone(), a.pass.clone())).collect();
+    assert!(asked.len() >= 3 && circuits.len() == asked.len(), "{} errands on {} circuits", asked.len(), circuits.len());
+    assert!(asked.iter().all(|a| a.target.contains(".onion:") && !a.user.is_empty()), "{asked:?}");
+    println!("KYOTO identifying: {} errands on as many circuits; direct peers sent no block request, inv or tx", asked.len());
+    t.engine.shutdown();
+}
+
+/// Tor goes down: a matched block waits, `scanned` holds below it, status says Tor is waited for,
+/// and nothing goes direct. Tor comes back and the payment arrives. Run alone.
+#[test]
+#[ignore]
+fn kyoto_identifying_waits_for_tor() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+    if common::chain_env().is_none() {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    }
+    let (t, direct, tor, socks, _root) = kyoto_split("identifying", true);
+    socks.set_up(false);
+    let (asked, versions) = (socks.asked().len(), sent(&tor, "version"));
+    let paid = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.22).to_string();
+    t.mine(1);
+    let h = t.tip();
+    t.wait("Kyoto past the paying block's filter, waiting for Tor", 60, || {
+        let k = kyoto(&t);
+        k["headers"].as_u64() >= Some(h) && k["tor"]["waiting"] == true && k["tor"]["pending"].as_u64() >= Some(1)
+    });
+    std::thread::sleep(Duration::from_secs(10));
+    let k = kyoto(&t);
+    assert_eq!(k["scanned"].as_u64(), Some(h - 1), "{k}");
+    assert!(k["tor"]["lastError"].as_str().is_some_and(|e| e.starts_with("Tor can't be reached")), "{k}");
+    assert_eq!(t.row(&paid), Value::Null, "the payment came some other way");
+    assert_eq!(sent(&direct, "getdata-block"), 0, "a block was asked for directly");
+    assert_eq!((socks.asked().len(), sent(&tor, "version")), (asked, versions));
+
+    socks.set_up(true);
+    t.synced();
+    t.wait("the payment through Tor once it is back", 120, || t.row(&paid)["state"] == "confirmed");
+    t.wait("the scan at the tip", 30, || kyoto(&t)["scanned"].as_u64() >= Some(h));
+    let k = kyoto(&t);
+    assert!(k["tor"]["waiting"] == false && k["tor"]["pending"] == 0 && k["tor"]["retries"].as_u64() >= Some(1), "{k}");
+    assert_eq!(sent(&direct, "getdata-block"), 0);
+    println!("KYOTO held at {} while Tor was down, {} retries; the payment came once it was back", h - 1, k["tor"]["retries"]);
+    t.engine.shutdown();
+}
+
+/// `none`: nothing touches the SOCKS port, though one is configured; blocks and the send go to
+/// Kyoto's direct peers, and status has no Tor errands. Run alone.
+#[test]
+#[ignore]
+fn kyoto_none_makes_no_socks_connection() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+    if common::chain_env().is_none() {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    }
+    let (t, direct, tor, socks, _root) = kyoto_split("none", true);
+    assert!(kyoto(&t)["tor"].is_null(), "{}", kyoto(&t));
+    let paid = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.23).to_string();
+    t.mine(1);
+    t.synced();
+    t.wait("the payment confirmed", 90, || t.row(&paid)["state"] == "confirmed");
+    let theirs = t.wallet_rpc("getnewaddress", json!(["payee"])).as_str().unwrap().to_string();
+    let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "5000000"}], "feeRate": 2.0}));
+    let sent_tx = t.sign(p["previewId"].as_str().unwrap());
+    assert_eq!(sent_tx["via"], "kyoto", "{sent_tx}");
+    let txid = sent_tx["txid"].as_str().unwrap().to_string();
+    t.wait("the send in the node's mempool", 30, || t.in_mempool(&txid));
+    assert_eq!(socks.accepted(), 0, "a connection to the SOCKS port");
+    assert_eq!(sent(&tor, "version"), 0);
+    assert!(sent(&direct, "getdata-block") > 0 && sent(&direct, "tx") > 0, "blocks and the send directly");
+    println!("KYOTO none: no SOCKS connection; {} block requests direct", sent(&direct, "getdata-block"));
     t.engine.shutdown();
 }

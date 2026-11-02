@@ -635,7 +635,7 @@ impl Engine {
             ledger.suspect(&s, &why);
         }
         let (routes, routes_err) = self.routes_for(network);
-        let netstate = Arc::new(Mutex::new(NetState { routes, ledger, iso: HashMap::new(), chain_by: crate::authority::ELECTRUM_HEADERS, kyoto: None, node_rpc: None, node_id: String::new() }));
+        let netstate = Arc::new(Mutex::new(NetState { routes, ledger, iso: HashMap::new(), chain_by: crate::authority::ELECTRUM_HEADERS, kyoto: None, kyoto_tor: Default::default(), node_rpc: None, node_id: String::new() }));
         let progress = Arc::new(Mutex::new(Progress { full_scan_done, authority: authority.summary(now), last_error: routes_err.clone(), ..Default::default() }));
         let cell = Arc::new(Mutex::new(Some(cell)));
         let (stop, wake, reload) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(routes_err.is_some())));
@@ -1094,6 +1094,11 @@ impl Engine {
             let list: Vec<Source> = ns.routes.broadcast.iter().filter(|s| s.down.is_none() && ns.ledger.health.get(&s.id).is_none_or(|h| h.suspect.is_none())).cloned().collect();
             Ok((list, ns.routes.broadcast_by.clone(), ns.chain_by, ns.kyoto.clone(), ns.routes.proxy.clone(), w.netstate.clone()))
         })?;
+        let (errands, tor) = {
+            let ns = netstate.lock();
+            (ns.routes.kyoto.as_ref().and_then(|k| k.errands.clone()), ns.kyoto_tor.clone())
+        };
+        let net = self.light.lock().network.map(|n| n.bitcoin());
         let txid = tx.compute_txid();
         let mut maybe_left: Option<String> = None;
         let mut tried = 0;
@@ -1103,6 +1108,22 @@ impl Engine {
                     Some(rpc) => crate::node::broadcast(&NodeClient::new(rpc.clone()), tx).map(|_| Outcome::Seen),
                     None => continue,
                 },
+                // In the split, through Tor errands only, never Kyoto's direct peers; one that
+                // fails sent nothing.
+                routes::Authority::Kyoto if errands.is_some() => {
+                    tried += 1;
+                    let sent = match (&errands, &proxy, net) {
+                        (Some(e), Some(p), Some(n)) => crate::errand::broadcast(n, e, p, &tor, tx, KYOTO_BROADCAST_WAIT),
+                        _ => Err("broadcasts go through Tor, and no proxy is set".into()),
+                    };
+                    match sent {
+                        Ok(()) => return Ok((Outcome::Requested, KYOTO.to_string())),
+                        Err(e) => {
+                            tracing::info!(target: "bitcoin", "broadcast via Tor errands: {e}");
+                            continue;
+                        }
+                    }
+                }
                 routes::Authority::Kyoto => match &kyoto {
                     Some(r) => crate::kyoto::broadcast(&self.rt_handle, r, tx, KYOTO_BROADCAST_WAIT).map(|_| Outcome::Requested),
                     None => continue,
