@@ -451,6 +451,12 @@ impl<W: Wallets> UpdateSubscriber<W> {
         }
     }
 
+    /// The height of the last filter checked, as of the last update, whether or not a block
+    /// before it is still being fetched.
+    pub fn checked(&self) -> Option<u32> {
+        self.scanned
+    }
+
     /// Fetches matched blocks with `fetch` in the background instead of from the node's peers,
     /// each as its filter matches, while the scan goes on. They are applied oldest first, up to
     /// the first still being fetched; at the tip, each one applied makes an update.

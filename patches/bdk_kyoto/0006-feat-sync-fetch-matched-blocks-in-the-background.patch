@@ -1,4 +1,4 @@
-From 97af455e90d2365db5a0999a675254a94cc335ea Mon Sep 17 00:00:00 2001
+From 9fd91d12616e19b5832c1f2d49de2a05bea5d667 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Mon, 2 Nov 2026 15:14:40 -0300
 Subject: [PATCH 6/6] feat(sync): fetch matched blocks in the background
@@ -13,13 +13,14 @@ Fetched blocks are applied oldest first, up to the first still under
 way. scanned() stays below that block, so a restart checks its filter
 again, and synced() is false while any fetch is pending. At the tip,
 each fetch that lets blocks apply makes an update. The fetcher answers
-None for a block no longer in the chain, which is skipped.
+None for a block no longer in the chain, which is skipped. checked() is
+the last filter checked, whether or not a fetch holds scanned() back.
 ---
- src/lib.rs | 115 ++++++++++++++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 109 insertions(+), 6 deletions(-)
+ src/lib.rs | 119 ++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 114 insertions(+), 5 deletions(-)
 
 diff --git a/src/lib.rs b/src/lib.rs
-index 11606ce..c31b62d 100644
+index 11606ce..4f7e38e 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -35,6 +35,8 @@
@@ -137,7 +138,7 @@ index 11606ce..c31b62d 100644
                      return Ok(());
                  }
              }
-@@ -390,9 +442,55 @@ impl<W: Wallets> UpdateSubscriber<W> {
+@@ -390,11 +442,63 @@ impl<W: Wallets> UpdateSubscriber<W> {
          self.checkpoint_every = Some(filters.max(1));
      }
  
@@ -145,13 +146,18 @@ index 11606ce..c31b62d 100644
 +    /// The height of the last filter checked against the wallet's scripts, as of the last update;
 +    /// with a fetcher, below the first block still being fetched, so a restart checks it again.
      pub fn scanned(&self) -> Option<u32> {
--        self.scanned
 +        match self.fetched.keys().next() {
 +            Some((height, _)) => self.scanned.map(|s| s.min(height.saturating_sub(1))),
 +            None => self.scanned,
 +        }
 +    }
 +
++    /// The height of the last filter checked, as of the last update, whether or not a block
++    /// before it is still being fetched.
++    pub fn checked(&self) -> Option<u32> {
+         self.scanned
+     }
+ 
 +    /// Fetches matched blocks with `fetch` in the background instead of from the node's peers,
 +    /// each as its filter matches, while the scan goes on. They are applied oldest first, up to
 +    /// the first still being fetched; at the tip, each one applied makes an update.
@@ -192,10 +198,12 @@ index 11606ce..c31b62d 100644
 +            }
 +        }
 +        any
-     }
- 
++    }
++
      /// A handle to widen the scripts filters are checked against while the node runs: insert
-@@ -421,9 +519,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+     /// the last index to watch per keychain, such as one the wallet revealed since the node was
+     /// built, then rescan if earlier blocks matter (`Requester::rescan_from`). It is taken
+@@ -421,9 +525,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
          }
      }
  
@@ -208,7 +216,7 @@ index 11606ce..c31b62d 100644
      }
  
      fn extend_spk_cache(&mut self) {
-@@ -440,6 +539,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
+@@ -440,6 +545,10 @@ impl<W: Wallets> UpdateSubscriber<W> {
      // Oldest first: a spend is relevant to the graph only once the output it spends is indexed,
      // so a block applied before the block that funds it would lose the spend.
      async fn apply_queued_blocks(&mut self) -> Result<(), UpdateError> {

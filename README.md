@@ -268,7 +268,8 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches eac
   filters (two checkpoints) past it, or past where the scan last started, checked none of them.
   bip157 dropped a rescan that came while it synced headers (patch 6), and an update from before
   a rescan still comes after it. Its transactions are taken, `status.kyoto.lastWarning` says so,
-  and the core asks for the scan again from there. On 2026-11-01 a mainnet scan over Tor stored
+  and the core asks for the scan again from there. The check reads the last filter checked
+  (`checked()`), not `scanned()`, which a block still being fetched over Tor holds back. On 2026-11-01 a mainnet scan over Tor stored
   the tip 11 s after resuming at 659,007, and a payment above that was never seen.
 - A filter-header conflict between peers (bip157 can't tell which lies, and disconnects one): the
   peers connected then are reported (`conflict`) and left out of a fresh subset that starts at
@@ -374,7 +375,8 @@ allows (`src/lib.rs`, `src/builder.rs`, and for patch 5 the manifest and the exa
    caller (the Tor errands of `identifying`), each as its filter matches, while the scan goes on.
    They are applied oldest first up to the first still being fetched; `scanned()` stays below it,
    so a restart checks its filter again, and `synced()` is false while any is pending. At the tip,
-   each fetch that lets blocks apply makes an update. Blocking the subscriber on a Tor fetch
+   each fetch that lets blocks apply makes an update. `checked()` is the last filter checked,
+   held back or not. Blocking the subscriber on a Tor fetch
    instead would queue the direct filters in bip157's unbounded channel, about 20 kB each.
 
 0.18.1 indexes every script the filters are checked against (`extend_index_to_policy`), which our

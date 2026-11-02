@@ -289,9 +289,9 @@ pub struct Start {
 
 /// What a running client reports to the sync thread.
 pub enum Feed {
-    /// The wallet's transactions since the last update and Kyoto's chain, with the height of the
-    /// last filter checked, and whether that is the tip or a checkpoint on the way there.
-    Update { update: Box<Update>, scanned: Option<u32>, synced: bool },
+    /// The wallet's transactions since the last update and Kyoto's chain, with the height a
+    /// restart scans from, the last filter checked, and whether that is the tip or a checkpoint.
+    Update { update: Box<Update>, scanned: Option<u32>, checked: Option<u32>, synced: bool },
     /// The share of filter headers and filters done, and Kyoto's header height.
     Progress { fraction: f32, height: u32 },
     Warning(String),
@@ -440,7 +440,7 @@ impl Client {
             loop {
                 match updates.update().await {
                     Ok(u) => {
-                        if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), synced: updates.synced() }).is_err() {
+                        if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), checked: updates.checked(), synced: updates.synced() }).is_err() {
                             return None;
                         }
                         woken.store(true, std::sync::atomic::Ordering::SeqCst);
