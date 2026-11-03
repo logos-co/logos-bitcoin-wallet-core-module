@@ -6,7 +6,7 @@
 pub mod history;
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::Command;
 use std::str::FromStr;
@@ -539,88 +539,4 @@ pub fn electrum_proxy(upstream: SocketAddr, rewrite: LineRewrite) -> SocketAddr 
         }
     });
     addr
-}
-
-/// What `http_front` does with a request for a path: without a body yet, an answer of its own or
-/// none to ask upstream; with upstream's body, an answer in its place or none to pass it on.
-pub type HttpRewrite = Arc<dyn Fn(&str, Option<&[u8]>) -> Option<(u16, Vec<u8>)> + Send + Sync>;
-
-/// An HTTP front on loopback, one request a connection, forwarded with `Connection: close`.
-pub fn http_front(upstream: u16, rewrite: HttpRewrite) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for client in listener.incoming().flatten() {
-            let rewrite = rewrite.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(client.try_clone().unwrap());
-                let (mut head, mut line, mut length) = (String::new(), String::new(), 0usize);
-                while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                    if line == "\r\n" {
-                        break;
-                    }
-                    let lower = line.to_ascii_lowercase();
-                    if let Some(v) = lower.strip_prefix("content-length:") {
-                        length = v.trim().parse().unwrap_or(0);
-                    }
-                    // Plain bodies, one request a connection.
-                    if !lower.starts_with("connection:") && !lower.starts_with("accept-encoding:") {
-                        head.push_str(&line);
-                    }
-                    line.clear();
-                }
-                let mut body = vec![0u8; length];
-                if reader.read_exact(&mut body).is_err() {
-                    return;
-                }
-                let mut out = client;
-                let path = head.split_whitespace().nth(1).unwrap_or_default().to_string();
-                if let Some((status, b)) = rewrite(&path, None) {
-                    answer(&mut out, status, &b);
-                    return;
-                }
-                let Ok(mut up) = TcpStream::connect(("127.0.0.1", upstream)) else { return };
-                let mut request = head.into_bytes();
-                request.extend_from_slice(b"Connection: close\r\n\r\n");
-                request.extend_from_slice(&body);
-                let mut reply = vec![];
-                if up.write_all(&request).is_err() || up.read_to_end(&mut reply).is_err() {
-                    return;
-                }
-                match body_of(&reply).and_then(|b| rewrite(&path, Some(&b))) {
-                    Some((status, b)) => answer(&mut out, status, &b),
-                    None => {
-                        let _ = out.write_all(&reply);
-                    }
-                }
-            });
-        }
-    });
-    port
-}
-
-fn answer(out: &mut TcpStream, status: u16, body: &[u8]) {
-    let reason = if status == 200 { "OK" } else { "Not Found" };
-    let _ = out.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
-    let _ = out.write_all(body);
-}
-
-/// An HTTP reply's body, chunked or not.
-pub fn body_of(reply: &[u8]) -> Option<Vec<u8>> {
-    let at = reply.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let (head, mut rest) = (String::from_utf8_lossy(&reply[..at]).to_ascii_lowercase(), &reply[at + 4..]);
-    if !head.contains("transfer-encoding: chunked") {
-        return Some(rest.to_vec());
-    }
-    let mut body = vec![];
-    loop {
-        let end = rest.windows(2).position(|w| w == b"\r\n")?;
-        let size = usize::from_str_radix(String::from_utf8_lossy(&rest[..end]).split(';').next()?.trim(), 16).ok()?;
-        rest = &rest[end + 2..];
-        if size == 0 {
-            return Some(body);
-        }
-        body.extend_from_slice(rest.get(..size)?);
-        rest = rest.get(size + 2..)?;
-    }
 }

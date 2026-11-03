@@ -188,15 +188,6 @@ pub fn electrum_branch(branch: &[[u8; 32]]) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// The tree depth for `tx_count` transactions: every leaf of Bitcoin's tree sits this deep.
-pub fn tree_depth(tx_count: u64) -> usize {
-    let mut depth = 0;
-    while (1u64 << depth) < tx_count {
-        depth += 1;
-    }
-    depth
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofVerdict {
     Valid,
@@ -417,8 +408,8 @@ mod tests {
         let leaves: Vec<Txid> = (1..=5u8).map(|i| tx(i).compute_txid()).collect();
         let (levels, root) = tree(&leaves);
         let header = header_with_root(root);
-        let depth = tree_depth(5);
-        assert_eq!(depth, 3);
+        // Five leaves sit three deep.
+        let depth = 3;
         for (pos, t) in leaves.iter().enumerate() {
             assert_eq!(check_proof(*t, pos, &branch(&levels, pos), &header, depth), ProofVerdict::Valid);
         }
@@ -430,7 +421,6 @@ mod tests {
         assert_eq!(check_proof(leaves[1], 1, &long, &header, depth), ProofVerdict::WrongDepth);
         assert_eq!(check_proof(leaves[1], 1, &branch(&levels, 1)[1..], &header, depth), ProofVerdict::WrongDepth);
         assert_eq!(check_proof(leaves[1], 9, &branch(&levels, 1), &header, depth), ProofVerdict::WrongDepth);
-        assert_eq!((tree_depth(1), tree_depth(2), tree_depth(3), tree_depth(4096), tree_depth(4097)), (0, 1, 2, 12, 13));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Full engine integration over HTTP Core RPC, with credentials and no Electrum/Esplora.
+//! Full engine integration over HTTP Core RPC, with credentials and no Electrum server.
 mod common;
 use bitcoin_wallet_core::{
     engine::Engine,

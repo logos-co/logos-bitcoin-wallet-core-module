@@ -1160,17 +1160,6 @@ impl Engine {
                     Ok(_) => Ok(if c.transaction_get(&txid).is_ok() { Outcome::Seen } else { Outcome::Requested }),
                     Err(e) => Err(e.to_string()),
                 }),
-                Kind::Esplora => {
-                    let creds = match (&self.routes_src, s.credentials) {
-                        (Some(r), true) => r.source_credentials(&self.light.lock().network.map(|n| n.name()).unwrap_or_default(), &s.id)?.map(Zeroizing::new),
-                        _ => None,
-                    };
-                    let c = crate::net::esplora(&s, proxy.as_ref(), &iso, creds.as_deref())?;
-                    match self.rt_handle.block_on(c.broadcast(tx)) {
-                        Ok(()) => Ok(if self.rt_handle.block_on(c.get_tx(&txid)).ok().flatten().is_some() { Outcome::Seen } else { Outcome::Requested }),
-                        Err(e) => Err(e.to_string()),
-                    }
-                }
             };
             netstate.lock().ledger.expose(&s, "broadcast", now_secs());
             match sent {
@@ -1424,7 +1413,7 @@ impl Engine {
         match self.with_open(|w| {
             let ns = w.netstate.lock();
             let kyoto = ns.routes.kyoto.as_ref().map(|k| json!({"id": k.id, "route": k.route, "peers": k.peers.len(), "down": k.down}));
-            Ok(json!({"ok": true, "proxy": ns.routes.proxy.as_ref().map(|p| p.addr()), "crossCheck": ns.routes.cross_check,
+            Ok(json!({"ok": true, "proxy": ns.routes.proxy.as_ref().map(|p| p.addr()),
                       "chainBy": ns.chain_by, "local": ns.routes.local, "kyoto": kyoto, "sources": ns.ledger.status(&ns.routes)}))
         }) {
             Ok(v) => v,

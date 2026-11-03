@@ -50,12 +50,13 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     fn history(&self, page: i64) -> String;
     /// `{ ok, fast, normal, slow, minimum, sources, estimated, basis }` in sat/vB, once every level
     /// has an estimate; until then `{ ok: false, error: "no fee estimate yet" }`. `basis` is
-    /// `mempool` when the sources read the levels off their mempools, else `estimate`.
+    /// `mempool` when the sources read the levels off their mempools, `floor` for signet's relay floor
+    /// where nothing estimates, else `estimate`.
     fn fee_rates(&self) -> String;
     /// An address or BIP21 URI on a network: `{ ok, valid, address, type, dustSat, amountSat? }`; `dustSat`
     /// is the least it can receive, below which build_send fails with code `dust`.
     fn address_valid(&self, text: String, network: String) -> String;
-    /// `{ ok, proxy, crossCheck, sources: [{ id, roles, state, suspect, lastSync, error, ... }] }`.
+    /// `{ ok, proxy, chainBy, local, kyoto, sources: [{ id, roles, state, suspect, lastSync, error, ... }] }`.
     fn sources_status(&self) -> String;
     /// `{ ok, servers: [{ source, url, operator, role, since, last }] }`.
     fn exposure(&self) -> String;
@@ -79,7 +80,7 @@ pub trait BitcoinWalletCoreModuleEvents {
     /// status()'s shape, when what it says changes.
     fn walletStateChanged(&self, payload: String);
     fn jobFinished(&self, job_id: String, state: String);
-    /// `{ source, kind: suspect|stale|authority_behind|anchor_mismatch|authority_suspect, detail, at }`.
+    /// `{ source, kind: suspect|authority_behind|anchor_mismatch|authority_suspect|unchecked_anchor, detail, at }`.
     fn sourceAlert(&self, payload: String);
     /// `list_wallets` shows other wallets: one was unlocked or locked in the Signer app. `locked`
     /// counts the seeds whose wallets it can't list.
@@ -131,7 +132,7 @@ impl BitcoinWalletCoreModuleImpl {
 impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
     fn version(&self) -> String {
         json!({"ok": true, "version": env!("CARGO_PKG_VERSION"),
-               "crates": {"bdk_wallet": "3.2.0", "bdk_electrum": "0.24.1", "bdk_esplora": "0.22.3", "bdk_kyoto": "0.18.1",
+               "crates": {"bdk_wallet": "3.2.0", "bdk_electrum": "0.24.1", "bdk_kyoto": "0.18.1",
                           "bip157": "0.8.1+logos.5", "bdk_bitcoind_rpc": "0.22.1"}})
         .to_string()
     }

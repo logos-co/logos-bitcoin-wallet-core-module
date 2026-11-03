@@ -1,11 +1,11 @@
 //! A server's confirmation counts once proved against the chain's headers: a real block's hash for
 //! a transaction not in it never confirms, above the chain's tip or below its start, from a lying
-//! Esplora front or Electrum proxy; honest payments confirm. Needs `--features test-hooks`, a fresh
-//! chain and `ESPLORA`; README, "Regtest", has the command.
+//! Electrum proxy; honest payments confirm. Needs `--features test-hooks` and a fresh chain; README,
+//! "Regtest", has the command.
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use bitcoin_wallet_core::engine::Engine;
 use bitcoin_wallet_core::network::{configure_regtest, RegtestCheckpoint, RegtestConfig};
 use bitcoin_wallet_core::routes::Routes;
 use common::history::{restore, TPRV};
-use common::{body_of, chain, collecting, electrum_proxy, http_front, MockManager, T};
+use common::{collecting, electrum_proxy, MockManager, T};
 use serde_json::{json, Value};
 
 /// A confirmation a server makes up: `txid` in a block it isn't in.
@@ -25,20 +25,14 @@ use serde_json::{json, Value};
 struct Lie {
     txid: String,
     height: u64,
-    hash: String,
-    time: u64,
 }
 
-/// The chain from `chain`'s headers only; history, pending payments, fees and broadcast from
-/// `history`, an Esplora URL or a second Electrum server.
+/// The chain from `chain`'s headers only; history, pending payments, fees and broadcast from a
+/// second Electrum server, `history`.
 fn routes(chain: &str, history: &str) -> Routes {
-    let esplora = history.starts_with("http");
-    let (electrum, esploras) = if esplora { (vec![chain.into()], vec![history.into()]) } else { (vec![chain.into(), history.into()], vec![]) };
-    let mut r = Routes::regtest(&RegtestConfig { electrum, esplora: esploras, poll_secs: Some(1), ..Default::default() });
-    let id = if esplora { "esplora-0" } else { "electrum-1" };
-    let (c, h) = (r.chain[0].clone(), r.history.iter().find(|s| s.id == id).cloned().unwrap());
-    (r.chain, r.history, r.pending, r.fees, r.broadcast) = (vec![c], vec![h.clone()], vec![h.clone()], vec![h.clone()], vec![h]);
-    (r.check, r.cross_check) = (vec![], false);
+    let mut r = Routes::regtest(&RegtestConfig { electrum: vec![chain.into(), history.into()], poll_secs: Some(1), ..Default::default() });
+    let (c, h) = (r.chain[0].clone(), r.history[1].clone());
+    (r.chain, r.history, r.pending, r.fees, r.broadcast, r.check) = (vec![c], vec![h.clone()], vec![h.clone()], vec![h.clone()], vec![h], vec![]);
     r
 }
 
@@ -58,12 +52,11 @@ fn payment(t: &T, to: &str, btc: f64) -> (String, String) {
     (tx.compute_txid().to_string(), signed)
 }
 
-/// A block with nothing from the mempool in it: its height, hash and time.
-fn empty_block(t: &T) -> (u64, String, u64) {
+/// A block with nothing from the mempool in it: its height.
+fn empty_block(t: &T) -> u64 {
     let to = t.wallet_rpc("getnewaddress", json!(["empty"]));
     let hash = t.rpc("generateblock", json!([to, []]))["hash"].as_str().unwrap().to_string();
-    let header = t.rpc("getblockheader", json!([hash]));
-    (header["height"].as_u64().unwrap(), hash, header["time"].as_u64().unwrap())
+    t.rpc("getblockheader", json!([hash]))["height"].as_u64().unwrap()
 }
 
 /// Where Core's wallet confirmed a payment it made.
@@ -71,16 +64,8 @@ fn height_of(t: &T, txid: &str) -> u64 {
     t.wallet_rpc("gettransaction", json!([txid]))["blockheight"].as_u64().unwrap()
 }
 
-/// Waits until Esplora and electrs both index the node's tip, so a wallet's first scan sees it.
-fn indexed(t: &T, esplora_port: u16, electrs: SocketAddr) {
-    let esplora = || -> Option<u64> {
-        let mut s = TcpStream::connect(("127.0.0.1", esplora_port)).ok()?;
-        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        s.write_all(b"GET /blocks/tip/height HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").ok()?;
-        let mut reply = vec![];
-        s.read_to_end(&mut reply).ok()?;
-        String::from_utf8(body_of(&reply)?).ok()?.trim().parse().ok()
-    };
+/// Waits until electrs indexes the node's tip, so a wallet's first scan sees it.
+fn indexed(t: &T, electrs: SocketAddr) {
     let electrum = || -> Option<u64> {
         let mut s = TcpStream::connect(electrs).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -90,7 +75,7 @@ fn indexed(t: &T, esplora_port: u16, electrs: SocketAddr) {
         serde_json::from_str::<Value>(&line).ok()?["result"]["height"].as_u64()
     };
     let tip = t.tip();
-    t.wait("Esplora and electrs at the node's tip", 60, || esplora() == Some(tip) && electrum() == Some(tip));
+    t.wait("electrs at the node's tip", 60, || electrum() == Some(tip));
 }
 
 /// Waits for `what`, failing the moment `txid` shows confirmed.
@@ -107,28 +92,6 @@ fn still_not_confirmed(r: &T, txid: &str) {
     never_confirmed(r, txid, "more syncs", 10, || Instant::now() >= until);
 }
 
-fn suspect(r: &T, id: &str) -> bool {
-    r.engine.sources_status()["sources"].as_array().unwrap().iter().any(|s| s["id"] == id && s["suspect"] == true)
-}
-
-/// Gives `txid` the lie's status wherever an Esplora answer lists it.
-fn restate(v: &mut Value, txid: &str, status: &Value) -> bool {
-    match v {
-        Value::Array(a) => {
-            let mut hit = false;
-            for x in a {
-                hit |= restate(x, txid, status);
-            }
-            hit
-        }
-        Value::Object(o) if o.get("txid").and_then(Value::as_str) == Some(txid) && o.contains_key("status") => {
-            o.insert("status".into(), status.clone());
-            true
-        }
-        _ => false,
-    }
-}
-
 #[test]
 #[ignore]
 fn confirmations_count_once_proved() {
@@ -137,12 +100,6 @@ fn confirmations_count_once_proved() {
         eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
         return;
     };
-    if std::env::var("ESPLORA").is_err() {
-        eprintln!("skipped: ESPLORA is not set");
-        return;
-    }
-    let esplora_port: u16 = std::env::var("ESPLORA_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3002);
-    chain(&["esplora"]);
     let electrs: SocketAddr = std::env::var("REGTEST_ELECTRUM").expect("REGTEST_ELECTRUM").split(',').next().unwrap().trim().trim_start_matches("tcp://").parse().unwrap();
     let manager = Arc::new(MockManager::new(Duration::from_millis(300)));
     let (sink, events) = collecting();
@@ -186,28 +143,10 @@ fn confirmations_count_once_proved() {
     };
     let release = || *held.lock().unwrap() = None;
 
-    // Both kinds of server tell the same lie: confirmed in an empty block, with the empty branch of
-    // its coinbase for a proof, which gives back the txid and no merkle root.
+    // The history server lies: confirmed in an empty block, with the empty branch of its coinbase
+    // for a proof, which gives back the txid and no merkle root.
     let lie: Arc<Mutex<Option<Lie>>> = Arc::default();
-    let (front_lies, electrum_lies) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let (l, n) = (lie.clone(), front_lies.clone());
-    let front = http_front(esplora_port, Arc::new(move |path, body| {
-        let lie = l.lock().unwrap().clone()?;
-        let status = json!({"confirmed": true, "block_height": lie.height, "block_hash": lie.hash, "block_time": lie.time});
-        let tx = format!("/tx/{}", lie.txid);
-        match body {
-            None if path == format!("{tx}/merkle-proof") => {
-                n.fetch_add(1, Ordering::SeqCst);
-                Some((200, json!({"block_height": lie.height, "merkle": [], "pos": 0}).to_string().into_bytes()))
-            }
-            Some(_) if path == format!("{tx}/status") => Some((200, status.to_string().into_bytes())),
-            Some(b) if path.starts_with("/scripthash/") || path == tx => {
-                let mut v: Value = serde_json::from_slice(b).ok()?;
-                restate(&mut v, &lie.txid, &status).then(|| (200, v.to_string().into_bytes()))
-            }
-            _ => None,
-        }
-    }));
+    let electrum_lies = Arc::new(AtomicUsize::new(0));
     let (l, n) = (lie.clone(), electrum_lies.clone());
     let history_at = electrum_proxy(electrs, Arc::new(move |m, p, mut v| {
         let Some(lie) = l.lock().unwrap().clone() else { return Some(v) };
@@ -230,85 +169,58 @@ fn confirmations_count_once_proved() {
         }
         Some(v)
     }));
-    let (chain_url, esplora, electrum) = (format!("tcp://{chain_at}"), format!("http://127.0.0.1:{front}"), format!("tcp://{history_at}"));
+    let (chain_url, electrum) = (format!("tcp://{chain_at}"), format!("tcp://{history_at}"));
 
     // Above the chain's tip, the chain held a block behind: an honest payment waits, then confirms
-    // on its proof against the chain's header once the chain reaches it. One made up in an empty
-    // block waits too from Esplora, and is refused there; Electrum's client drops it at once. These
-    // wallets' chains start at genesis.
-    indexed(&t, esplora_port, electrs);
-    let (e1, _d1) = restore(&t, routes(&chain_url, &esplora), 1, None);
-    let (e3, _d3) = restore(&t, routes(&chain_url, &electrum), 1, None);
-    for r in [&e1, &e3] {
-        r.engine.reveal_for_test(10).unwrap();
-        r.synced();
-        r.wait("the early payments", 60, || r.sats("confirmed") == 110_000_000);
-    }
+    // on its proof against the chain's header once the chain reaches it. Electrum's client drops one
+    // made up in an empty block at once. This wallet's chain starts at genesis.
+    indexed(&t, electrs);
+    let (e1, _d1) = restore(&t, routes(&chain_url, &electrum), 1, None);
+    e1.engine.reveal_for_test(10).unwrap();
+    e1.synced();
+    e1.wait("the early payments", 60, || e1.sats("confirmed") == 110_000_000);
     hold();
     let paid = t.fund(&address(&t, 1), 0.4).to_string();
     t.mine(1);
-    for r in [&e1, &e3] {
-        r.wait("the payment held above the chain's tip", 60, || r.sats("waiting") == 40_000_000);
-    }
+    e1.wait("the payment held above the chain's tip", 60, || e1.sats("waiting") == 40_000_000);
     let (lied, signed) = payment(&t, &address(&t, 2), 0.3);
-    let (height, hash, time) = empty_block(&t);
-    *lie.lock().unwrap() = Some(Lie { txid: lied.clone(), height, hash, time });
+    let height = empty_block(&t);
+    *lie.lock().unwrap() = Some(Lie { txid: lied.clone(), height });
     t.rpc("sendrawtransaction", json!([signed]));
-    e1.wait("the made-up confirmation held as well", 60, || e1.sats("waiting") == 70_000_000);
-    e3.wait("Electrum's made-up proof asked for", 60, || electrum_lies.load(Ordering::SeqCst) > 0);
-    let before = e1.alerts("anchor_mismatch", "esplora-0");
+    e1.wait("Electrum's made-up proof asked for", 60, || electrum_lies.load(Ordering::SeqCst) > 0);
     release();
-    for r in [&e1, &e3] {
-        never_confirmed(r, &lied, "the honest payment confirmed on its proof", 60, || r.row(&paid)["state"] == "confirmed");
-    }
-    never_confirmed(&e1, &lied, "Esplora's made-up proof refused", 60, || e1.alerts("anchor_mismatch", "esplora-0") > before);
-    for r in [&e1, &e3] {
-        still_not_confirmed(r, &lied);
-        assert_eq!((r.sats("confirmed"), r.sats("waiting")), (150_000_000, 0), "only the honest payments, nothing held");
-    }
-    assert!(front_lies.load(Ordering::SeqCst) > 0 && suspect(&e1, "esplora-0"));
-    assert_eq!(e3.row(&lied), Value::Null, "Electrum's client never took the made-up confirmation");
-    println!("ANCHORS above the tip: {paid} confirmed on its proof; {lied} in empty block {height} refused (Esplora) and dropped (Electrum)");
+    never_confirmed(&e1, &lied, "the honest payment confirmed on its proof", 60, || e1.row(&paid)["state"] == "confirmed");
+    still_not_confirmed(&e1, &lied);
+    assert_eq!((e1.sats("confirmed"), e1.sats("waiting")), (150_000_000, 0), "only the honest payments, nothing held");
+    assert_eq!(e1.row(&lied), Value::Null, "Electrum's client never took the made-up confirmation");
+    println!("ANCHORS above the tip: {paid} confirmed on its proof; {lied} in empty block {height} dropped");
     // The made-up payment, mined for real, confirms in its own block.
     *lie.lock().unwrap() = None;
-    e1.engine.clear_suspect("esplora-0");
     t.mine(1);
-    for r in [&e1, &e3] {
-        r.wait("the payment confirmed in its own block", 60, || r.row(&lied)["state"] == "confirmed" && r.row(&lied)["height"].as_u64() == Some(t.tip()));
-        r.engine.shutdown();
-    }
+    e1.wait("the payment confirmed in its own block", 60, || e1.row(&lied)["state"] == "confirmed" && e1.row(&lied)["height"].as_u64() == Some(t.tip()));
+    e1.engine.shutdown();
 
-    // Below the chain's start, wallets with a birthday above the checkpoint: the early payments
+    // Below the chain's start, a wallet with a birthday above the checkpoint: the early payments
     // link to it and confirm on their proofs against the linked headers. One made up in the empty
-    // block below it shows unchecked from Esplora and never comes from Electrum.
-    let (height, hash, time) = empty;
+    // block below it never comes from Electrum.
+    let height = empty;
     let (lied, signed) = payment(&t, &address(&t, 3), 0.2);
-    *lie.lock().unwrap() = Some(Lie { txid: lied.clone(), height, hash, time });
+    *lie.lock().unwrap() = Some(Lie { txid: lied.clone(), height });
     t.rpc("sendrawtransaction", json!([signed]));
-    indexed(&t, esplora_port, electrs);
-    let below = |r: &T, name: &str| {
-        r.engine.reveal_for_test(10).unwrap();
-        r.synced();
-        assert_eq!(r.engine.status()["authority"]["base"], checkpoint);
-        for (txid, h) in &early {
-            never_confirmed(r, &lied, &format!("{name}: {txid} confirmed at {h}"), 60, || r.row(txid)["state"] == "confirmed" && r.row(txid)["height"].as_u64() == Some(*h));
-        }
-    };
-    let (e2, _d2) = restore(&t, routes(&chain_url, &esplora), checkpoint + 1, None);
-    below(&e2, "esplora");
-    never_confirmed(&e2, &lied, "Esplora's made-up confirmation unchecked", 60, || e2.row(&lied)["state"] == "unchecked");
-    still_not_confirmed(&e2, &lied);
-    assert_eq!(e2.row(&lied)["reportedBy"], "esplora-0");
-    assert!(e2.alerts("anchor_mismatch", "esplora-0") >= 1 && suspect(&e2, "esplora-0"), "the lie marks the server");
-    e2.engine.shutdown();
+    indexed(&t, electrs);
     let asked = electrum_lies.load(Ordering::SeqCst);
-    let (e4, _d4) = restore(&t, routes(&chain_url, &electrum), checkpoint + 1, None);
-    below(&e4, "electrum");
-    never_confirmed(&e4, &lied, "Electrum's made-up proof asked for", 60, || electrum_lies.load(Ordering::SeqCst) > asked);
-    still_not_confirmed(&e4, &lied);
-    assert_eq!(e4.row(&lied), Value::Null, "Electrum's client never took the made-up confirmation");
-    e4.engine.shutdown();
+    let (e2, _d2) = restore(&t, routes(&chain_url, &electrum), checkpoint + 1, None);
+    e2.engine.reveal_for_test(10).unwrap();
+    e2.synced();
+    assert_eq!(e2.engine.status()["authority"]["base"], checkpoint);
+    for (txid, h) in &early {
+        never_confirmed(&e2, &lied, &format!("{txid} confirmed at {h}"), 60, || e2.row(txid)["state"] == "confirmed" && e2.row(txid)["height"].as_u64() == Some(*h));
+    }
+    never_confirmed(&e2, &lied, "Electrum's made-up proof asked for", 60, || electrum_lies.load(Ordering::SeqCst) > asked);
+    still_not_confirmed(&e2, &lied);
+    assert_eq!(e2.row(&lied), Value::Null, "Electrum's client never took the made-up confirmation");
+    e2.engine.shutdown();
     *lie.lock().unwrap() = None;
-    println!("ANCHORS below the start at {checkpoint}: {} payments linked and proved; {lied} in empty block {height} unchecked (Esplora) and dropped (Electrum); whole run {} s",
+    println!("ANCHORS below the start at {checkpoint}: {} payments linked and proved; {lied} in empty block {height} dropped; whole run {} s",
         early.len(), started.elapsed().as_secs());
 }

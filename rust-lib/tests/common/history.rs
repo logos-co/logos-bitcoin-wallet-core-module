@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bitcoin_wallet_core::engine::Engine;
-use bitcoin_wallet_core::network::RegtestConfig;
-use bitcoin_wallet_core::routes::{Kind, Routes};
+use bitcoin_wallet_core::routes::Routes;
 use serde_json::{json, Value};
 
 use super::{collecting, ModuleRpc, T};
@@ -170,10 +169,4 @@ pub fn matches(name: &str, r: &T, h: &History, base: u32, started: Instant) {
     assert_eq!(s["authority"]["base"], base, "{name}: the chain starts at the checkpoint below the birthday");
 }
 
-pub fn esplora_routes(electrum: &str, esplora: &str) -> Routes {
-    let mut r = Routes::regtest(&RegtestConfig { electrum: vec![electrum.into()], esplora: vec![esplora.into()], poll_secs: Some(1), ..Default::default() });
-    let e = r.history.iter().find(|s| s.kind == Kind::Esplora).cloned().expect("the Esplora source");
-    (r.history, r.pending, r.fees, r.broadcast, r.check) = (vec![e.clone()], vec![e.clone()], vec![e.clone()], vec![e.clone()], vec![e]);
-    r
-}
 

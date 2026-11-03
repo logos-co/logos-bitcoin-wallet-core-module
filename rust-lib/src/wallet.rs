@@ -817,14 +817,14 @@ mod tests {
         w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
         crate::storage::meta_set(&conn, crate::sync::CHAIN_BASE, "5").unwrap();
         let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
-        let held = [Held { txid: funding.compute_txid(), anchor: ConfirmationBlockTime { block_id: b2, confirmation_time: 2 }, source: "esplora-0".into() }];
+        let held = [Held { txid: funding.compute_txid(), anchor: ConfirmationBlockTime { block_id: b2, confirmation_time: 2 }, source: "electrum-0".into() }];
         let row = |held: &[Held]| {
             let h = cell.history(0, 50, held).unwrap();
             h["rows"].as_array().unwrap().iter().find(|r| r["txid"] == funding.compute_txid().to_string()).cloned().unwrap()
         };
         let r = row(&held);
         assert_eq!((r["state"].as_str(), r["height"].as_u64(), r["confirmedVia"].as_str()), (Some("unchecked"), Some(2), Some(spend.compute_txid().to_string().as_str())), "{r}");
-        assert_eq!(r["reportedBy"], "esplora-0", "the source that reported it");
+        assert_eq!(r["reportedBy"], "electrum-0", "the source that reported it");
         let r = row(&[]);
         assert_eq!((r["state"].as_str(), r["height"].as_u64(), r["blockHash"].as_str()), (Some("confirmed"), None, None), "never the spender's height: {r}");
         assert_eq!(r["confirmedVia"], spend.compute_txid().to_string());

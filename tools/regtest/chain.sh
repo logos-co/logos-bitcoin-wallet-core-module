@@ -11,17 +11,15 @@
 #   chain.sh pruned              start a pruned node (-prune=550 -fastprune, a filter index) that
 #                                dials the main node only; it waits until the node has caught up
 #   chain.sh prune <height>      prune that node's blocks below <height>; prints its pruneheight
-#   chain.sh esplora             start Blockstream's electrs (the esplora flavour, $ESPLORA) on the
-#                                main node, its REST API on 127.0.0.1:$ESPLORA_PORT
 #   chain.sh rpc <method> [json-params] | peer-rpc | pruned-rpc (the follower's, the pruned node's)
 #   chain.sh electrum | peers | stop
 # Env: BITCOIND, ELECTRS (binaries; default: on PATH), CHAIN_DIR (state, default ./chain),
 # RPC_PORT, P2P_PORT, FORK_RPC_PORT, FORK_P2P_PORT, PEER_RPC_PORT, PEER_P2P_PORT, PRUNED_RPC_PORT,
-# PRUNED_P2P_PORT, ELECTRUM_PORTS (two, comma-separated), ESPLORA (binary), ESPLORA_PORT (3002;
-# it also takes the next two). Ports avoid the regtest defaults, so another regtest node is left
-# alone. LISTEN (127.0.0.1) is where the P2P and Electrum ports listen, 0.0.0.0 for a wallet on
-# another machine of the LAN; HOST is the address `peers` and `electrum` print; WHITELIST adds
-# peers (a subnet) the nodes give download,noban, as loopback has. RPC stays on loopback.
+# PRUNED_P2P_PORT, ELECTRUM_PORTS (two, comma-separated). Ports avoid the regtest defaults, so
+# another regtest node is left alone. LISTEN (127.0.0.1) is where the P2P and Electrum ports
+# listen, 0.0.0.0 for a wallet on another machine of the LAN; HOST is the address `peers` and
+# `electrum` print; WHITELIST adds peers (a subnet) the nodes give download,noban, as loopback
+# has. RPC stays on loopback.
 set -u
 C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
 BITCOIND="${BITCOIND:-bitcoind}"; ELECTRS="${ELECTRS:-electrs}"
@@ -29,7 +27,6 @@ RPC_PORT="${RPC_PORT:-18543}"; P2P_PORT="${P2P_PORT:-18544}"
 FORK_RPC_PORT="${FORK_RPC_PORT:-18553}"; FORK_P2P_PORT="${FORK_P2P_PORT:-18554}"
 PEER_RPC_PORT="${PEER_RPC_PORT:-18563}"; PEER_P2P_PORT="${PEER_P2P_PORT:-18564}"
 PRUNED_RPC_PORT="${PRUNED_RPC_PORT:-18573}"; PRUNED_P2P_PORT="${PRUNED_P2P_PORT:-18574}"
-ESPLORA="${ESPLORA:-esplora-electrs}"; ESPLORA_PORT="${ESPLORA_PORT:-3002}"
 IFS=, read -r -a EPORTS <<< "${ELECTRUM_PORTS:-60601,60611}"
 LISTEN="${LISTEN:-127.0.0.1}"; HOST="${HOST:-127.0.0.1}"
 WL=(-whitelist=download,noban@127.0.0.1)
@@ -202,25 +199,9 @@ prune)
   rrpc getblockchaininfo | json_num pruneheight;;
 pruned-rpc) rrpc "$2" "${3:-[]}";;
 peer-rpc) prpc "$2" "${3:-[]}";;
-esplora)
-  stop_pid esplora
-  mkdir -p "$C/esplora"
-  # Blocks over JSON-RPC: it would otherwise read Core's block files, which Core now obfuscates.
-  "${DETACH[@]}" "$ESPLORA" -v --network regtest --daemon-dir "$DATA" --daemon-rpc-addr "127.0.0.1:$RPC_PORT" \
-    --cookie "$(cat "$COOKIE")" --jsonrpc-import --db-dir "$C/esplora" --http-addr "127.0.0.1:$ESPLORA_PORT" \
-    --electrum-rpc-addr "127.0.0.1:$(( ESPLORA_PORT + 1 ))" --monitoring-addr "127.0.0.1:$(( ESPLORA_PORT + 2 ))" \
-    < /dev/null >> "$C/esplora.log" 2>&1 &
-  echo $! > "$C/esplora.pid"
-  for _ in $(seq 1 600); do
-    [ "$(curl -s --max-time 2 "http://127.0.0.1:$ESPLORA_PORT/blocks/tip/height")" = "$(height)" ] && break
-    kill -0 "$(cat "$C/esplora.pid")" 2>/dev/null || { echo "esplora exited; see $C/esplora.log"; exit 1; }
-    sleep 0.2
-  done
-  [ "$(curl -s --max-time 2 "http://127.0.0.1:$ESPLORA_PORT/blocks/tip/height")" = "$(height)" ] || { echo "esplora did not catch up"; exit 1; }
-  echo "esplora: http://127.0.0.1:$ESPLORA_PORT";;
 rpc) rpc "$2" "${3:-[]}" "${4:-}";;
 electrum) echo "electrum: tcp://$HOST:${EPORTS[0]},tcp://$HOST:${EPORTS[1]}";;
 peers) echo "$HOST:$P2P_PORT,$HOST:$FORK_P2P_PORT,$HOST:$PEER_P2P_PORT";;
-stop) stop_pid esplora; stop_pid electrs0; stop_pid electrs1; stop_pid pruned; stop_pid peer; stop_pid fork; stop_pid bitcoind;;
+stop) stop_pid electrs0; stop_pid electrs1; stop_pid pruned; stop_pid peer; stop_pid fork; stop_pid bitcoind;;
 *) sed -n '2,15p' "$0"; exit 2;;
 esac
