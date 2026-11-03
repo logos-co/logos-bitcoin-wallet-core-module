@@ -83,7 +83,7 @@ fn the_core_reports_the_peers_it_tried_and_the_peers_they_gossiped() {
     // still dialling when the others are spent is cut off with the start, and not reported.
     let peers: Vec<Value> = [&good, &gossip, &no_filters, &refusing, &silent].iter().map(|p| json!({"peer": p, "source": "list", "ok": *p == &silent})).collect();
     let table = json!({"ok": true, "proxy": null, "chain": [kyoto], "broadcast": [kyoto], "history": [], "pending": [], "fees": [],
-        "check": [], "crossCheck": false, "peers": peers});
+        "check": [], "peers": peers});
     let stub = Arc::new(Stub { table: table.to_string(), reports: Mutex::default() });
     // A quorum of four that three peers can't meet: each start dials all five, then stops.
     configure_regtest(RegtestConfig { kyoto_required: Some(4), poll_secs: Some(1), ..Default::default() });

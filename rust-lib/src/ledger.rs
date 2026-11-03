@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::crosscheck::{Track, Verdict};
 use crate::routes::{Routes, Source};
 
 /// Consecutive failures before history moves to the next server.
@@ -22,13 +21,7 @@ pub struct Health {
     pub last_sync: Option<u64>,
     pub suspect: Option<String>,
     pub tip: Option<u32>,
-    pub track: Track,
-}
-
-impl Health {
-    pub fn stale(&self) -> bool {
-        self.track.verdict == Some(Verdict::Stale)
-    }
+    pub watch: crate::tipwatch::Watch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -57,7 +50,7 @@ impl Ledger {
 
     pub fn usable(&self, s: &Source) -> bool {
         let h = self.health.get(&s.id);
-        s.down.is_none() && h.is_none_or(|h| h.suspect.is_none() && !h.stale() && h.failures < FAILOVER_AFTER)
+        s.down.is_none() && h.is_none_or(|h| h.suspect.is_none() && !h.watch.lagging && h.failures < FAILOVER_AFTER)
     }
 
     /// The first history server in order that is healthy: an earlier one that recovered comes back,
@@ -98,14 +91,7 @@ impl Ledger {
     }
 
     pub fn clear_suspect(&mut self, id: &str) -> bool {
-        match self.health.get_mut(id) {
-            Some(h) => {
-                let had = h.suspect.take().is_some();
-                h.track = Track::default();
-                had
-            }
-            None => false,
-        }
+        self.health.get_mut(id).is_some_and(|h| h.suspect.take().is_some())
     }
 
     /// Records that `s` learned the wallet's addresses (history) or a transaction (broadcast).
@@ -140,7 +126,7 @@ impl Ledger {
                     "down"
                 } else if h.suspect.is_some() {
                     "suspect"
-                } else if h.stale() {
+                } else if h.watch.lagging {
                     "stale"
                 } else if h.failures >= FAILOVER_AFTER {
                     "failing"
@@ -154,7 +140,7 @@ impl Ledger {
                     "roles": routes.roles_of(&s.id), "state": state, "suspect": h.suspect.is_some(),
                     "suspectReason": h.suspect, "lastSync": h.last_sync, "lastOk": h.last_ok,
                     "error": s.down.clone().or(h.last_error.clone()), "tip": h.tip, "encrypted": s.encrypted,
-                    "verdict": h.track.verdict, "history": history.as_deref() == Some(s.id.as_str()),
+                    "history": history.as_deref() == Some(s.id.as_str()),
                 })
             })
             .collect();
@@ -206,10 +192,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_server_is_not_used_for_history() {
+    fn a_lagging_server_is_not_used_for_history() {
         let r = routes();
         let mut l = Ledger::default();
-        l.health_mut("electrum-0").track.verdict = Some(Verdict::Stale);
+        l.health_mut("electrum-0").watch.lagging = true;
         assert_eq!(l.history(&r).unwrap().id, "electrum-1");
         let s = l.status(&r);
         assert_eq!(s[0]["state"], "stale");

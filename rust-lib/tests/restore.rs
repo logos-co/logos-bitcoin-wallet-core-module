@@ -1,6 +1,6 @@
 //! Restores of a history built first by a Core wallet holding the test phrase's keys, each matched
-//! against that wallet: under Kyoto, the node's filters, Electrum, and Esplora (with `ESPLORA`);
-//! then Esplora above a checkpoint, linking what lies below it through its headers, else unchecked.
+//! against that wallet: under Kyoto, the node's filters and Electrum; then Electrum above a
+//! checkpoint, linking what lies below it through its headers, else unchecked.
 //! Needs `--features test-hooks` and a fresh chain; README, "Regtest", has the run command.
 
 mod common;
@@ -12,7 +12,7 @@ use bitcoin_wallet_core::engine::Engine;
 use bitcoin_wallet_core::network::{configure_regtest, RegtestCheckpoint, RegtestConfig};
 use bitcoin_wallet_core::routes::Routes;
 use common::history::*;
-use common::{chain, collecting, http_front, MockManager, ModuleRpc, T};
+use common::{chain, collecting, electrum_proxy, MockManager, ModuleRpc, T};
 use serde_json::json;
 
 #[test]
@@ -65,34 +65,29 @@ fn restores_match_cores_wallet() {
     matches("electrum", &e, &h, 0, started);
     e.engine.shutdown();
 
-    if std::env::var("ESPLORA").is_err() {
-        println!("RESTORE esplora: skipped, ESPLORA is not set");
-        return;
-    }
-    let esplora_port: u16 = std::env::var("ESPLORA_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3002);
-    chain(&["esplora"]);
-    let esplora = format!("http://127.0.0.1:{esplora_port}");
-
-    // Esplora alone for history, the chain from Electrum's headers.
-    let started = Instant::now();
-    let (s, _dir) = restore(&t, esplora_routes(&electrum, &esplora), h.birthday, None);
-    matches("esplora", &s, &h, 0, started);
-    s.engine.shutdown();
-
-    // A birthday above the checkpoint: the chain starts there, and what Esplora reports below it
-    // links to it header by header from Esplora's header endpoint, then shows confirmed.
-    let (l, _dir) = restore(&t, esplora_routes(&electrum, &esplora), checkpoint + 1, None);
+    // A birthday above the checkpoint: the chain starts there, and what Electrum reports below it
+    // links to it through its headers, then shows confirmed.
+    let one = |url: String| Routes::regtest(&RegtestConfig { electrum: vec![url], poll_secs: Some(1), ..Default::default() });
+    let (l, _dir) = restore(&t, one(electrum.clone()), checkpoint + 1, None);
     above_the_checkpoint(&l, &h, checkpoint, "confirmed");
-    assert_eq!(l.alerts("unchecked_anchor", "esplora-0"), 0, "every old anchor linked");
+    assert_eq!(l.alerts("unchecked_anchor", "electrum-0"), 0, "every old anchor linked");
     assert_eq!((l.engine.balance()["unchecked"].as_str(), l.sats("confirmed")), (Some("0"), h.confirmed));
     l.engine.shutdown();
 
-    // Through a front that serves no headers nothing links them: unchecked, at their own height,
-    // named by the server that reported them, and an alert says so.
-    let front = http_front(esplora_port, Arc::new(|path, body| (body.is_none() && path.starts_with("/block/") && path.ends_with("/header")).then(|| (404, vec![]))));
-    let (u, _dir) = restore(&t, esplora_routes(&electrum, &format!("http://127.0.0.1:{front}")), checkpoint + 1, None);
+    // Through a proxy that serves no header ranges below the checkpoint nothing links them:
+    // unchecked, at their own height, named by the server that reported them, and an alert says so.
+    let electrs = electrum.trim_start_matches("tcp://").parse().unwrap();
+    let proxy = electrum_proxy(electrs, Arc::new(move |m, p, mut v| {
+        if m == "blockchain.block.headers" && p[0].as_u64().is_some_and(|start| start < checkpoint as u64) {
+            let o = v.as_object_mut()?;
+            o.remove("result");
+            o.insert("error".into(), json!({"code": 1, "message": "no headers below the checkpoint"}));
+        }
+        Some(v)
+    }));
+    let (u, _dir) = restore(&t, one(format!("tcp://{proxy}")), checkpoint + 1, None);
     above_the_checkpoint(&u, &h, checkpoint, "unchecked");
-    assert!(u.alerts("unchecked_anchor", "esplora-0") >= 1, "an alert names the unchecked transactions");
+    assert!(u.alerts("unchecked_anchor", "electrum-0") >= 1, "an alert names the unchecked transactions");
     assert!(u.engine.balance()["unchecked"].as_str().unwrap() != "0");
     // The checkpoint names the block below it, but only that block's header proves a transaction
     // in it: when the chain moves on, that row stays unchecked too.
@@ -116,8 +111,8 @@ fn above_the_checkpoint(r: &T, h: &History, checkpoint: u32, below: &str) {
         let want = if *height < checkpoint as u64 { below } else { "confirmed" };
         assert_eq!((row["state"].as_str(), row["height"].as_u64()), (Some(want), Some(*height)), "{txid}: {row}");
         if want == "unchecked" {
-            assert_eq!(row["reportedBy"], "esplora-0", "the server that reported it: {row}");
+            assert_eq!(row["reportedBy"], "electrum-0", "the server that reported it: {row}");
         }
     }
-    println!("RESTORE esplora above the checkpoint: {} {below} below {checkpoint}", got.values().filter(|r| r["height"].as_u64().is_some_and(|x| x < checkpoint as u64)).count());
+    println!("RESTORE electrum above the checkpoint: {} {below} below {checkpoint}", got.values().filter(|r| r["height"].as_u64().is_some_and(|x| x < checkpoint as u64)).count());
 }

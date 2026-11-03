@@ -3,7 +3,6 @@
 pub mod address;
 pub mod authority;
 pub mod checks;
-pub mod crosscheck;
 pub mod engine;
 pub mod errand;
 pub mod fees;
@@ -24,6 +23,7 @@ pub mod routes;
 pub mod send;
 pub mod storage;
 pub mod sync;
+pub mod tipwatch;
 pub mod wallet;
 pub mod walletdir;
 

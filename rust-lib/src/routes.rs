@@ -24,7 +24,6 @@ pub enum Route {
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Electrum,
-    Esplora,
     Rpc,
 }
 
@@ -37,7 +36,7 @@ pub struct Entry {
     #[serde(default)]
     pub operator: String,
     pub route: Route,
-    /// kyoto, electrum, esplora or local; read from the URL when absent.
+    /// kyoto, electrum, rpc or local; read from the URL when absent.
     #[serde(default)]
     pub kind: Option<String>,
     /// The source needs credentials, fetched with the node module's source_credentials.
@@ -184,8 +183,6 @@ pub struct Routes {
     pub broadcast_by: Vec<Authority>,
     pub broadcast: Vec<Source>,
     pub check: Vec<Source>,
-    /// A second operator is enabled.
-    pub cross_check: bool,
     /// Seconds between chain polls.
     pub poll_secs: u64,
     /// Kyoto's quorum on a test chain; the network's own elsewhere.
@@ -225,14 +222,13 @@ pub(crate) fn is_loopback_or_lan(host: &str) -> bool {
 fn kind_of(url: &str) -> Option<Kind> {
     match url.split_once("://")?.0 {
         "tcp" | "ssl" => Some(Kind::Electrum),
-        "http" | "https" => Some(Kind::Esplora),
         _ => None,
     }
 }
 
-/// TLS servers take a pin: `ssl://` Electrum, `https://` Esplora.
+/// TLS servers take a pin: `ssl://` Electrum, `https://` RPC.
 fn pinnable(kind: Kind, url: &str) -> bool {
-    matches!((kind, url.split_once("://").map(|(s, _)| s)), (Kind::Electrum, Some("ssl")) | (Kind::Esplora | Kind::Rpc, Some("https")))
+    matches!((kind, url.split_once("://").map(|(s, _)| s)), (Kind::Electrum, Some("ssl")) | (Kind::Rpc, Some("https")))
 }
 
 fn plaintext(url: &str) -> bool {
@@ -252,9 +248,8 @@ pub fn parse_pin(text: &str) -> Result<[u8; 32], String> {
 pub fn resolve(e: &Entry, proxy: Option<&Proxy>) -> Option<Source> {
     let kind = match e.kind.as_deref() {
         Some("electrum") => Kind::Electrum,
-        Some("esplora") => Kind::Esplora,
         Some("rpc") => Kind::Rpc,
-        // Kyoto and the local node are authorities, read apart.
+        // Kyoto and the local node are authorities, read apart; an older node module's Esplora is gone.
         Some(_) => return None,
         None => kind_of(&e.url)?,
     };
@@ -273,7 +268,7 @@ pub fn resolve(e: &Entry, proxy: Option<&Proxy>) -> Option<Source> {
         _ if host.is_empty() => Some("no host in the URL".to_string()),
         _ => match &pin {
             Some(Err(why)) => Some(why.clone()),
-            Some(Ok(_)) if !pinnable(kind, &e.url) => Some("a pinned certificate is for an ssl:// Electrum or https:// Esplora server".to_string()),
+            Some(Ok(_)) if !pinnable(kind, &e.url) => Some("a pinned certificate is for an ssl:// Electrum or https:// RPC server".to_string()),
             _ => None,
         },
     };
@@ -411,7 +406,6 @@ impl Routes {
             broadcast_by,
             broadcast: servers("broadcast")?,
             check: servers("check")?,
-            cross_check: v["crossCheck"].as_bool().unwrap_or(false),
             poll_secs: 30,
             kyoto_required: None,
             tor_use,
@@ -427,9 +421,6 @@ impl Routes {
         let entry = |id: String, url: &str, operator: String| Entry { id, url: url.to_string(), operator, route: Route::Direct, kind: None, credentials: false, cert_sha256: None, user_added: true };
         for (i, url) in cfg.electrum.iter().enumerate() {
             all.push(entry(format!("electrum-{i}"), url, format!("regtest-{i}")));
-        }
-        for (i, url) in cfg.esplora.iter().enumerate() {
-            all.push(entry(format!("esplora-{i}"), url, format!("regtest-esplora-{i}")));
         }
         let sources: Vec<Source> = all.iter().filter_map(|e| resolve(e, None)).collect();
         let tor_use = cfg.tor_use.as_deref().and_then(TorUse::parse);
@@ -465,7 +456,6 @@ impl Routes {
             broadcast_by,
             broadcast: syncing,
             check: sources.clone(),
-            cross_check: sources.len() > 1 || (authority && !sources.is_empty()),
             poll_secs: cfg.poll_secs.unwrap_or(1),
             kyoto_required: cfg.kyoto_required,
         }
@@ -528,11 +518,10 @@ mod tests {
             "chain": [e("a", "ssl://electrum.example:50002".into(), "tor"), {"id": "kyoto", "kind": "kyoto", "url": "", "operator": "kyoto", "route": "onion"}],
             "peers": [format!("{}:8333", onion())],
             "history": [e("a", "ssl://electrum.example:50002".into(), "tor"), e("o", format!("tcp://{}:50001", onion()), "onion")],
-            "fees": [e("f", "https://esplora.example/api".into(), "tor")],
+            "fees": [e("f", "ssl://fees.example:50002".into(), "tor")],
             "broadcast": [e("a", "ssl://electrum.example:50002".into(), "tor")],
             "check": [{"id": "l", "url": "tcp://192.168.1.20:50001", "operator": "op", "route": "direct", "userAdded": true},
                       e("d", "tcp://192.168.1.21:50001".into(), "direct")],
-            "crossCheck": true,
         })
         .to_string()
     }
@@ -546,8 +535,7 @@ mod tests {
         assert_eq!((k.route, k.peers.len(), k.down), (Route::Onion, 1, None));
         assert!(r.history.iter().all(|s| s.down.is_none()));
         assert_eq!(r.history[1].kind, Kind::Electrum);
-        assert_eq!(r.fees[0].kind, Kind::Esplora);
-        assert!(r.cross_check);
+        assert_eq!(r.fees[0].kind, Kind::Electrum);
         assert_eq!(r.roles_of("a"), vec!["history", "broadcast"]);
         assert_eq!(r.every().len(), 5);
     }
@@ -605,7 +593,7 @@ mod tests {
         assert!(resolve(&e("tcp://electrum.example:50001", Route::Tor), Some(&p)).unwrap().down.is_some());
         assert!(resolve(&e("tcp://electrum.example:50001", Route::Direct), None).unwrap().down.is_some());
         assert!(resolve(&e("tcp://127.0.0.1:60401", Route::Direct), None).unwrap().down.is_none());
-        assert!(resolve(&e("http://nas.local:3002", Route::Direct), None).unwrap().down.is_none());
+        assert!(resolve(&Entry { kind: Some("rpc".into()), ..e("http://nas.local:8332", Route::Direct) }, None).unwrap().down.is_none());
         assert!(resolve(&e("ssl://electrum.example:50002", Route::Direct), None).unwrap().down.is_none(), "the user's choice, with TLS");
         let o = format!("tcp://{}:50001", onion());
         assert!(resolve(&e(&o, Route::Direct), None).unwrap().down.is_some());
@@ -613,23 +601,24 @@ mod tests {
         assert!(resolve(&e("ssl://electrum.example:50002", Route::Onion), Some(&p)).unwrap().down.is_some());
         assert!(resolve(&e("ftp://x", Route::Direct), None).is_none());
         assert_eq!(host_of("ssl://[fd00::2]:50002"), Some("fd00::2"));
-        assert_eq!(host_of("https://esplora.example/api"), Some("esplora.example"));
+        assert_eq!(host_of("https://rpc.example/api"), Some("rpc.example"));
     }
 
     #[test]
     fn the_node_modules_table_reads_whole() {
-        // bitcoin_node_module's route_table: kinds named, credentials flagged, Kyoto in the chain.
+        // bitcoin_node_module's route_table: kinds named, Kyoto in the chain, an older module's Esplora left out.
         let reply = json!({"ok": true, "network": "signet", "proxy": "socks5h://127.0.0.1:9050",
             "chain": [{"id": "kyoto", "kind": "kyoto", "url": "", "operator": "kyoto", "route": "onion"}],
-            "history": [{"id": "x", "kind": "esplora", "url": "https://esplora.example/api", "operator": "esplora.example", "route": "tor", "credentials": true}],
+            "history": [{"id": "x", "kind": "esplora", "url": "https://esplora.example/api", "operator": "esplora.example", "route": "tor", "credentials": true},
+                        {"id": "e1", "kind": "electrum", "url": "ssl://electrum.example.com:50002", "operator": "example.com", "route": "tor"}],
             "pending": [], "fees": [{"id": "e1", "kind": "electrum", "url": "ssl://electrum.example.com:50002", "operator": "example.com", "route": "tor"}],
-            "broadcast": [], "check": [], "peers": ["a.onion:38333"], "crossCheck": false, "unrouted": []})
+            "broadcast": [], "check": [], "peers": ["a.onion:38333"], "unrouted": []})
         .to_string();
         let r = Routes::from_table(&reply).unwrap();
         assert!(r.chain.is_empty() && r.local.is_none());
         assert_eq!(r.kyoto.as_ref().map(|k| k.peers.clone()), Some(vec!["a.onion:38333".to_string()]));
         assert_eq!(r.kyoto.as_ref().unwrap().listed, None, "plain host:port: the core keeps the old rules");
-        assert!(r.history[0].credentials && r.history[0].kind == Kind::Esplora && r.history[0].down.is_none());
+        assert_eq!(r.history.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["e1"]);
         assert_eq!(r.fees[0].kind, Kind::Electrum);
     }
 
@@ -672,7 +661,7 @@ mod tests {
         let added = resolve(&e("tcp://192.168.1.5:50001", true), None).unwrap();
         assert_eq!((added.down, added.encrypted), (None, false), "the app marks it not encrypted");
         assert!(resolve(&e("tcp://192.168.1.5:50001", false), None).unwrap().down.unwrap().contains("you added"));
-        assert!(resolve(&e("http://nas.local:3002", false), None).unwrap().down.is_some(), "not a default nor a listed one");
+        assert!(resolve(&Entry { kind: Some("rpc".into()), ..e("http://nas.local:8332", false) }, None).unwrap().down.is_some(), "not a default nor a listed one");
         assert!(resolve(&e("ssl://192.168.1.5:50002", false), None).unwrap().encrypted);
         let p = Proxy::parse("socks5h://127.0.0.1:9050").unwrap();
         let onion = Entry { route: Route::Onion, ..e(&format!("tcp://{}:50001", onion()), false) };
@@ -687,9 +676,11 @@ mod tests {
         let ok = resolve(&e("ssl://192.168.1.5:50002", &pin), None).unwrap();
         assert_eq!((ok.pin, ok.down), (Some([0xab; 32]), None));
         assert!(resolve(&e("tcp://192.168.1.5:50001", &pin), None).unwrap().down.unwrap().contains("ssl://"));
-        let esplora = resolve(&e("https://192.168.1.5/api", &pin), None).unwrap();
-        assert_eq!((esplora.pin, esplora.down), (Some([0xab; 32]), None), "an https:// Esplora server takes a pin");
-        assert!(resolve(&e("http://192.168.1.5/api", &pin), None).unwrap().down.unwrap().contains("https://"), "not plain http");
+        let rpc = |url: &str| Entry { kind: Some("rpc".into()), ..e(url, &pin) };
+        let ok = resolve(&rpc("https://192.168.1.5/api"), None).unwrap();
+        assert_eq!((ok.pin, ok.down), (Some([0xab; 32]), None), "an https:// RPC server takes a pin");
+        assert!(resolve(&rpc("http://192.168.1.5/api"), None).unwrap().down.unwrap().contains("https://"), "not plain http");
+        assert!(resolve(&e("https://192.168.1.5/api", &pin), None).is_none(), "https:// alone was Esplora's");
         assert!(resolve(&e("ssl://192.168.1.5:50002", "abcd"), None).unwrap().down.unwrap().contains("hex"));
         assert_eq!(resolve(&e("ssl://192.168.1.5:50002", ""), None).unwrap().pin, None, "an empty pin is none");
     }
@@ -712,7 +703,6 @@ mod tests {
         let r = Routes::regtest(&RegtestConfig { electrum: vec!["tcp://127.0.0.1:60401".into(), "tcp://127.0.0.1:60411".into()], ..Default::default() });
         assert_eq!((r.chain.len(), r.history.len(), r.broadcast.len()), (2, 2, 2));
         assert!(r.history.iter().all(|s| s.route == Route::Direct && s.down.is_none()));
-        assert!(r.cross_check);
         assert_eq!(r.poll_secs, 1);
         assert_ne!(Isolation::fresh(), Isolation::fresh());
     }
@@ -722,7 +712,7 @@ mod tests {
 mod rpc_tests {
     use super::*;
     #[test]
-    fn rpc_never_becomes_an_esplora_address_query() {
+    fn rpc_is_never_asked_for_addresses() {
         let e=serde_json::json!({"id":"rpc","kind":"rpc","url":"https://rpc.example","route":"direct"});
         let r=Routes::from_table(&serde_json::json!({"chain":[e],"history":[e],"pending":[e],"fees":[e],"broadcast":[e],"check":[e]}).to_string()).unwrap();
         assert_eq!(r.rpc.as_ref().unwrap().kind,Kind::Rpc);

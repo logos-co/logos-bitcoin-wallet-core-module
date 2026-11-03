@@ -89,8 +89,6 @@ const TESTNET4_CHECKPOINT: (u32, &str) = (
 pub struct RegtestConfig {
     #[serde(default)]
     pub electrum: Vec<String>,
-    #[serde(default)]
-    pub esplora: Vec<String>,
     /// Kyoto's peers, `host:port`, dialled directly: Kyoto is the authority.
     #[serde(default)]
     pub kyoto: Vec<String>,
@@ -103,7 +101,7 @@ pub struct RegtestConfig {
     /// Kyoto's quorum; 2 by default.
     #[serde(default)]
     pub kyoto_required: Option<u8>,
-    /// The servers only cross-check and estimate fees: nothing syncs history from them.
+    /// The servers only have their tips watched and estimate fees: nothing syncs history from them.
     #[serde(default)]
     pub check_only: bool,
     /// A checkpoint above genesis, as mainnet's are: `{ height, header }`, the header in hex.

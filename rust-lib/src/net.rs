@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bdk_electrum::electrum_client;
-use bdk_esplora::esplora_client;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::{Script, Transaction, Txid};
 use electrum_client::{
@@ -303,47 +302,6 @@ impl ElectrumApi for Conn {
     }
 }
 
-/// An Esplora client on the source's route, with a generic user agent and, where the source
-/// needs them, the credentials the node module holds.
-pub fn esplora(src: &Source, proxy: Option<&Proxy>, iso: &Isolation, credentials: Option<&(String, String)>) -> Result<esplora_client::AsyncClient, String> {
-    if let Some(d) = &src.down {
-        return Err(format!("{}: {d}", src.id));
-    }
-    let mut b = esplora_client::Builder::new(src.url.trim_end_matches('/')).timeout(timeout_for(src).as_secs());
-    if let Some((user, pass)) = credentials {
-        use base64::Engine;
-        let token = zeroize::Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
-        b = b.header("Authorization", &format!("Basic {}", token.as_str()));
-    }
-    let mut socks = None;
-    if matches!(src.route, Route::Tor | Route::Onion) {
-        let p = proxy.ok_or_else(|| format!("{}: routed through Tor, and no proxy is set", src.id))?;
-        socks = Some(format!("socks5h://{}:{}@{}", iso.user, iso.pass, p.addr()));
-    }
-    let Some(pin) = src.pin else {
-        if let Some(s) = &socks {
-            b = b.proxy(s);
-        }
-        return b.header("User-Agent", "bitcoin-wallet").build_async().map_err(|e| format!("{}: {e}", src.id));
-    };
-    // Pinned: esplora-client over a reqwest client of ours, whose TLS accepts only the pin.
-    let fail = |e: String| format!("{}: {e}", src.id);
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::USER_AGENT, reqwest::header::HeaderValue::from_static("bitcoin-wallet"));
-    for (k, v) in &b.headers {
-        let name = reqwest::header::HeaderName::from_bytes(k.to_ascii_lowercase().as_bytes()).map_err(|e| fail(e.to_string()))?;
-        let mut value = reqwest::header::HeaderValue::from_str(v).map_err(|e| fail(e.to_string()))?;
-        value.set_sensitive(true);
-        headers.insert(name, value);
-    }
-    let mut c = reqwest::Client::builder().use_preconfigured_tls(crate::pin::client_config(pin).map_err(fail)?).timeout(timeout_for(src)).default_headers(headers);
-    if let Some(s) = &socks {
-        c = c.proxy(reqwest::Proxy::all(s.as_str()).map_err(|e| fail(e.to_string()))?);
-    }
-    let client = c.build().map_err(|e| fail(e.to_string()))?;
-    Ok(esplora_client::AsyncClient::from_client(src.url.trim_end_matches('/').to_string(), client))
-}
-
 /// An error as status and the log show it: script hashes and txids in a failed request's URL
 /// would name the wallet's addresses and payments, so runs of 40 or more hex digits are elided.
 pub fn redact(e: &str) -> String {
@@ -563,8 +521,8 @@ mod tests {
 
     #[test]
     fn errors_name_no_script_hash_or_txid() {
-        let e = "esplora-0: Reqwest(reqwest::Error { url: \"https://h:1/scripthash/90954fa8865a517697fd98bc4248654082a383c1ed6722c1dadeb803b13dd571/txs\" })";
-        assert_eq!(redact(e), "esplora-0: Reqwest(reqwest::Error { url: \"https://h:1/scripthash/…/txs\" })");
+        let e = "electrum-0: Protocol(String(\"no such mempool or blockchain transaction 90954fa8865a517697fd98bc4248654082a383c1ed6722c1dadeb803b13dd571\"))";
+        assert_eq!(redact(e), "electrum-0: Protocol(String(\"no such mempool or blockchain transaction …\"))");
         assert_eq!(redact("timed out after 15 s at deadbeef"), "timed out after 15 s at deadbeef", "short hex stays");
     }
 
@@ -576,8 +534,6 @@ mod tests {
     fn tor_routes_never_go_direct() {
         let iso = Isolation::fresh();
         let e = electrum(&src("ssl://electrum.example:50002", Route::Tor, None), None, &iso, &Cancel::default()).err().unwrap();
-        assert!(e.contains("no proxy"), "{e}");
-        let e = esplora(&src("https://esplora.example/api", Route::Tor, None), None, &iso, None).err().unwrap();
         assert!(e.contains("no proxy"), "{e}");
         let e = electrum(&src("tcp://x:1", Route::Direct, Some("down for a reason")), None, &iso, &Cancel::default()).err().unwrap();
         assert!(e.contains("down for a reason"));

@@ -144,13 +144,13 @@ fn kyoto_is_the_authority_on_regtest() {
         assert_eq!(t.row(id)["state"], "confirmed", "{id} after the rescan");
     }
 
-    // A burst of 100 blocks: the cross-checked electrs lags behind Kyoto for a moment, which
-    // raises nothing; only a lag that lasts does.
-    let stale = t.alerts("stale", "electrum-0");
+    // A burst of 100 blocks: the watched electrs lags behind Kyoto for a moment, which changes
+    // nothing; only a lag that lasts leaves it out.
     t.mine(100);
     t.synced();
     std::thread::sleep(Duration::from_secs(5));
-    assert_eq!(t.alerts("stale", "electrum-0"), stale, "a burst raised a stale alert");
+    let state = t.engine.sources_status()["sources"].as_array().unwrap().iter().find(|s| s["id"] == "electrum-0").map(|s| s["state"].clone());
+    assert_ne!(state, Some(json!("stale")), "a burst left the server lagging");
 
     // Addresses revealed past what the client watches: it is rebuilt, and finds a payment there.
     let rebuilds = kyoto(&t)["rebuilds"].as_u64().unwrap();
@@ -291,7 +291,7 @@ fn kyoto_on_a_live_network() {
     let peers: Vec<&str> = peers.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     let kyoto = json!({"id": "kyoto", "kind": "kyoto", "url": "p2p://peer-list", "operator": "peers", "route": "onion"});
     let table = json!({"ok": true, "network": network, "proxy": proxy, "chain": [kyoto], "history": [kyoto], "broadcast": [kyoto],
-        "pending": [], "fees": [], "check": [], "peers": peers, "crossCheck": false}).to_string();
+        "pending": [], "fees": [], "check": [], "peers": peers}).to_string();
     let (sink, _events) = collecting();
     let manager = Arc::new(MockManager::new(Duration::from_millis(100)));
     let root = tempfile::tempdir().unwrap();

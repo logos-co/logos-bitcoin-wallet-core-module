@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use bdk_electrum::electrum_client::{ElectrumApi, GetMerkleRes};
 use bdk_electrum::BdkElectrumClient;
-use bdk_esplora::EsploraAsyncExt;
 use bdk_wallet::chain::keychain_txout::{FullScanRequestBuilderExt, SyncRequestBuilderExt};
 use bdk_wallet::chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
@@ -23,7 +22,6 @@ use serde_json::{json, Value};
 
 use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
 use crate::checks::{self, ChainView, ProofVerdict};
-use crate::crosscheck::{self, Answer, Verdict};
 use crate::fees::{self, SourceEstimate};
 use crate::kyoto::{self, Feed, PeerBook, Start};
 use crate::errand::TorStatus;
@@ -34,6 +32,7 @@ use crate::node::{self, Follower, NodeClient, NodeRpc, PrunedGap};
 use crate::peers::{self, PeerReports};
 use crate::routes::{Isolation, Kind, Route, Routes, Source};
 use crate::storage::{meta_get, meta_set};
+use crate::tipwatch::{self, Seen};
 use crate::wallet::{Cell, Held};
 use crate::walletdir::now_secs;
 
@@ -52,7 +51,7 @@ pub trait RouteSource: Send + Sync {
     fn route_table(&self, network: &str) -> Result<String, String>;
     /// Tells the node module a source served something false. Best effort.
     fn report_mismatch(&self, _network: &str, _source: &str, _kind: &str, _height: Option<u32>) {}
-    /// An Esplora server's `(username, password)`, held by the node module, never stored here.
+    /// A remote node's `(username, password)`, held by the node module, never stored here.
     fn source_credentials(&self, _network: &str, _source: &str) -> Result<Option<(String, String)>, String> {
         Ok(None)
     }
@@ -60,9 +59,6 @@ pub trait RouteSource: Send + Sync {
     /// (`peers::PeerReports`). Best effort.
     fn report_peers(&self, _network: &str, _report: &str) {}
 }
-
-/// Headers a sync may fetch from Esplora, one request each, to link old anchors to the chain.
-const ESPLORA_LINK_BUDGET: u32 = 144;
 
 /// What checking a reported confirmation against a header came to.
 enum Inclusion {
@@ -294,18 +290,13 @@ struct Loop {
     /// Blocks a pruned node couldn't give, until a history server or Kyoto has scanned them.
     node_gap: Option<PrunedGap>,
     clients: HashMap<String, Electrum>,
-    esplora: HashMap<String, esplora_client_alias::AsyncClient>,
     depths: HashMap<BlockHash, usize>,
     last_history: Option<Instant>,
-    last_cross: Option<Instant>,
-    cross_delay: Duration,
+    last_watch: Option<Instant>,
+    watch_delay: Duration,
     last_fees: Option<Instant>,
     last_expiry: Option<Instant>,
     last_routes: Instant,
-}
-
-mod esplora_client_alias {
-    pub use bdk_esplora::esplora_client::AsyncClient;
 }
 
 fn cp_from(blocks: &[(u32, BlockHash)]) -> Option<CheckPoint> {
@@ -465,7 +456,6 @@ impl Loop {
     fn mark_suspect(&mut self, source: &str, reason: &str) {
         // Its client's caches hold what it served; a cleared suspect starts afresh.
         self.clients.remove(source);
-        self.esplora.remove(source);
         let fresh = self.ctx.netstate.lock().ledger.suspect(source, reason);
         if fresh {
             if let Some(cell) = self.ctx.cell.lock().as_ref() {
@@ -502,7 +492,6 @@ impl Loop {
                     // Kyoto's peers change as the node module learns them; servers stay connected.
                     if (Routes { kyoto: r.kyoto.clone(), ..ns.routes.clone() }) != r {
                         self.clients.clear();
-                        self.esplora.clear();
                         self.node = None;
                         self.node_ok = false;
                         self.node_probe = None;
@@ -530,26 +519,9 @@ impl Loop {
         Ok(&self.clients[&s.id])
     }
 
-    fn esplora(&mut self, s: &Source) -> Result<&esplora_client_alias::AsyncClient, String> {
-        if !self.esplora.contains_key(&s.id) {
-            let (proxy, iso) = {
-                let mut ns = self.ctx.netstate.lock();
-                (ns.routes.proxy.clone(), ns.iso(&s.id))
-            };
-            let creds = match (&self.ctx.routes_src, s.credentials) {
-                (Some(r), true) => r.source_credentials(self.ctx.net.name(), &s.id)?.map(|(u, p)| zeroize::Zeroizing::new((u, p))),
-                _ => None,
-            };
-            let c = net::esplora(s, proxy.as_ref(), &iso, creds.as_deref())?;
-            self.esplora.insert(s.id.clone(), c);
-        }
-        Ok(&self.esplora[&s.id])
-    }
-
     fn failed(&mut self, id: &str, e: &str) {
         let e = &net::redact(e);
         self.clients.remove(id);
-        self.esplora.remove(id);
         // A call a close cut short says nothing of the source.
         if self.stopped() {
             return;
@@ -735,10 +707,6 @@ impl Loop {
         for s in sources {
             let theirs: Result<BlockHash, String> = match s.kind {
                 Kind::Electrum => self.electrum(&s).and_then(|c| c.inner.inner.block_header(at as usize).map(|h| h.block_hash()).map_err(|e| e.to_string())),
-                Kind::Esplora => match self.esplora(&s).map(|c| c.clone()) {
-                    Ok(c) => net::block_on_until(&self.ctx.rt, &self.ctx.stop, c.get_block_hash(at)).and_then(|r| r.map_err(|e| e.to_string())),
-                    Err(e) => Err(e),
-                },
                 Kind::Rpc => continue,
             };
             match theirs {
@@ -1687,30 +1655,6 @@ impl Loop {
                 };
                 Ok(checked(checks::check_proof(txid, proof.pos, &checks::electrum_branch(&proof.merkle), &header, depth)))
             }
-            Kind::Esplora => {
-                let c = self.esplora(src)?.clone();
-                let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
-                let header = match header {
-                    Some(h) => h,
-                    None => match net::block_on_until(&rt, &stop, c.get_header_by_hash(&hash))? {
-                        Ok(h) if h.block_hash() == hash => h,
-                        Ok(h) => return Ok(lied_header(&h)),
-                        Err(e) => return Ok(unknown("header", e.to_string())),
-                    },
-                };
-                let proof = match net::block_on_until(&rt, &stop, c.get_merkle_proof(&txid))? {
-                    Ok(Some(p)) if p.block_height == height => p,
-                    Ok(Some(p)) => return Ok(Inclusion::Lied(format!("its proof is at height {}", p.block_height))),
-                    Ok(None) => return Ok(Inclusion::Lied("no proof for a transaction it says is confirmed".into())),
-                    Err(e) => return Ok(unknown("proof", e.to_string())),
-                };
-                let info = match net::block_on_until(&rt, &stop, c.get_block_info(&hash))? {
-                    Ok(i) => i,
-                    Err(e) => return Ok(unknown("block", e.to_string())),
-                };
-                let branch: Vec<[u8; 32]> = proof.merkle.iter().map(|t| t.to_byte_array()).collect();
-                Ok(checked(checks::check_proof(txid, proof.pos, &branch, &header, checks::tree_depth(info.tx_count))))
-            }
         }
     }
 
@@ -1786,17 +1730,6 @@ impl Loop {
                 let (update, last) = r.map_err(|e| e.to_string())?;
                 (update, last, rec.mismatched, rec.proofs)
             }
-            Kind::Esplora => {
-                let c = self.esplora(&src)?.clone();
-                let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
-                let r = match (sync_req, full_req) {
-                    (Some(req), _) => net::block_on_until(&rt, &stop, c.sync(req, 4))?.map(|r| (r.tx_update, BTreeMap::new())),
-                    (_, Some(req)) => net::block_on_until(&rt, &stop, c.full_scan(req, gap as usize, 4))?.map(|r| (r.tx_update, r.last_active_indices)),
-                    _ => unreachable!(),
-                };
-                let (update, last) = r.map_err(|e| e.to_string())?;
-                (update, last, HashMap::new(), HashMap::new())
-            }
         };
         // The checks before BDK sees anything.
         let screened = {
@@ -1824,20 +1757,12 @@ impl Loop {
             if a.block_id.height < base { unchecked.push((*txid, *a)) } else { settled.push((*txid, *a)) }
         }
         // Old anchors: kept once the server's headers link up to the checkpoint, walking down
-        // from the chain's start or where the last walk stopped: Electrum's headers in ranges,
-        // Esplora's one at a time, a budget a sync. What nothing links yet stays unchecked.
+        // from the chain's start or where the last walk stopped. What nothing links stays unchecked.
         let mut linked: HashMap<u32, Header> = HashMap::new();
         if !screened.needs_linkage.is_empty() {
             let heights: Vec<u32> = screened.needs_linkage.iter().map(|(_, a)| a.block_id.height).collect();
-            let walked = if src.kind == Kind::Esplora {
-                let c = self.esplora(&src)?.clone();
-                let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
-                let mut header_of = |hash: BlockHash| net::block_on_until(&rt, &stop, c.get_header_by_hash(&hash))?.map_err(|e| net::redact(&e.to_string()));
-                self.authority.prove_below_by_hash(&heights, &mut header_of, ESPLORA_LINK_BUDGET)
-            } else {
-                let c = self.clients.get(&src.id).ok_or("no client")?;
-                self.authority.prove_below(&heights, &ElectrumHeaders { id: &src.id, client: &c.inner })
-            };
+            let c = self.clients.get(&src.id).ok_or("no client")?;
+            let walked = self.authority.prove_below(&heights, &ElectrumHeaders { id: &src.id, client: &c.inner });
             match walked {
                 Ok(w) => {
                     let keep: Vec<(u32, BlockHash)> = w.proved.iter().map(|(h, hd)| (*h, hd.block_hash())).chain(w.stopped_at).collect();
@@ -1943,76 +1868,51 @@ impl Loop {
         Ok(())
     }
 
-    /// Tips and one random header from each source enabled for checking.
-    fn cross_check(&mut self) {
+    /// Each enabled server's tip against the authority's; headers it shows above are checked first.
+    fn watch_tips(&mut self) {
         let Some(auth_tip) = self.authority.tip_height() else { return };
         let sources: Vec<Source> = {
             let ns = self.ctx.netstate.lock();
             ns.routes.check.iter().filter(|s| s.down.is_none() && ns.ledger.may_ask(&s.id, now_secs())).cloned().collect()
         };
-        let anchor_heights: HashSet<u32> = match self.ctx.cell.lock().as_ref() {
-            Some(c) => c.wallet.tx_graph().all_anchors().iter().flat_map(|(_, a)| a.iter().map(|x| x.block_id.height)).collect(),
-            None => HashSet::new(),
-        };
-        let birthday = self.birthday().max(self.authority.base_height());
+        let fork = auth_tip.saturating_sub(tipwatch::LINK_BACK).max(self.authority.base_height());
         for s in sources {
-            let lower_of = |tip: u32| tip.min(auth_tip);
-            let random = crosscheck::random_height(birthday, auth_tip.saturating_sub(1), &|h| anchor_heights.contains(&h));
-            let answer: Result<Answer, String> = match s.kind {
-                Kind::Rpc => Err("RPC sources use the Core scanner".into()),
-                Kind::Electrum => (|| {
-                    let c = self.electrum(&s)?;
-                    let tip = c.inner.inner.block_headers_subscribe().map_err(|e| e.to_string())?;
-                    let tip_h = tip.height as u32;
-                    let lower = lower_of(tip_h);
-                    let at_lower = if lower == tip_h { tip.header.block_hash() } else { c.inner.inner.block_header(lower as usize).map_err(|e| e.to_string())?.block_hash() };
-                    let random = match random.filter(|r| *r <= lower) {
-                        Some(r) => Some((r, c.inner.inner.block_header(r as usize).map_err(|e| e.to_string())?.block_hash())),
-                        None => None,
-                    };
-                    Ok(Answer { tip: tip_h, hash_at_lower: Some(at_lower), random })
-                })(),
-                Kind::Esplora => (|| {
-                    let c = self.esplora(&s)?.clone();
-                    let (rt, stop) = (self.ctx.rt.clone(), self.ctx.stop.clone());
-                    let tip_h = net::block_on_until(&rt, &stop, c.get_height())?.map_err(|e| e.to_string())?;
-                    let lower = lower_of(tip_h);
-                    let at_lower = net::block_on_until(&rt, &stop, c.get_block_hash(lower))?.map_err(|e| e.to_string())?;
-                    let random = match random.filter(|r| *r <= lower) {
-                        Some(r) => Some((r, net::block_on_until(&rt, &stop, c.get_block_hash(r))?.map_err(|e| e.to_string())?)),
-                        None => None,
-                    };
-                    Ok(Answer { tip: tip_h, hash_at_lower: Some(at_lower), random })
-                })(),
-            };
-            match answer {
-                Err(e) => self.failed(&s.id, &e),
-                Ok(a) => {
-                    let (before, verdict) = {
-                        let mut ns = self.ctx.netstate.lock();
-                        ns.ledger.ok(&s.id, now_secs());
-                        let h = ns.ledger.health_mut(&s.id);
-                        h.tip = Some(a.tip);
-                        let before = h.track.verdict;
-                        let auth = &self.authority;
-                        let v = crosscheck::judge(&mut h.track, auth_tip, &|x| auth.hash_at(x), &a, now_secs());
-                        (before, v)
-                    };
-                    if before != Some(verdict) {
-                        match verdict {
-                            Verdict::Stale => self.alert(&s.id, "stale", format!("{} blocks behind", auth_tip.saturating_sub(a.tip))),
-                            Verdict::AuthorityBehind => {
-                                self.alert(&s.id, "authority_behind", format!("{} blocks ahead for half an hour", a.tip - auth_tip))
-                            }
-                            Verdict::Suspect => self.mark_suspect(&s.id, "another block below the tip, after the next block"),
-                            Verdict::Agrees => {}
-                        }
-                    }
+            if s.kind == Kind::Rpc {
+                continue;
+            }
+            let answer: Result<(u32, Vec<Header>), String> = (|| {
+                let c = self.electrum(&s)?;
+                let tip = c.inner.inner.block_headers_subscribe().map_err(|e| e.to_string())?.height as u32;
+                if tip <= auth_tip + tipwatch::TIP_SLACK {
+                    return Ok((tip, vec![]));
                 }
+                let count = (tip - fork).min(authority::HEADERS_PER_CALL);
+                Ok((tip, c.inner.inner.block_headers(fork as usize + 1, count as usize).map_err(|e| e.to_string())?.headers))
+            })();
+            let (tip, branch) = match answer {
+                Ok(a) => a,
+                Err(e) => {
+                    self.failed(&s.id, &e);
+                    continue;
+                }
+            };
+            // Headers that don't link, or don't pass, count for nothing.
+            let proved = if branch.is_empty() { tip } else { self.authority.chain().outworked_to(fork, &branch, now_secs() as u32).unwrap_or(auth_tip) };
+            let seen = {
+                let mut ns = self.ctx.netstate.lock();
+                ns.ledger.ok(&s.id, now_secs());
+                let h = ns.ledger.health_mut(&s.id);
+                h.tip = Some(tip);
+                tipwatch::judge(&mut h.watch, auth_tip, proved, now_secs())
+            };
+            match seen {
+                Seen::AuthorityBehind => self.alert(&s.id, "authority_behind", format!("{} checked blocks ahead for half an hour", proved - auth_tip)),
+                Seen::Lags => tracing::info!(target: "bitcoin", "{}: {} blocks behind, left out of history until it catches up", s.id, auth_tip - proved),
+                Seen::Nothing => {}
             }
         }
-        self.last_cross = Some(Instant::now());
-        self.cross_delay = Duration::from_secs(crosscheck::next_delay_secs());
+        self.last_watch = Some(Instant::now());
+        self.watch_delay = Duration::from_secs(tipwatch::next_delay_secs());
     }
 
     fn refresh_fees(&mut self) {
@@ -2033,12 +1933,6 @@ impl Loop {
                     // Where estimatefee says -1, the server's mempool can still say what a block takes.
                     let histogram = if rates.contains(&None) { c.inner.inner.raw_call("mempool.get_fee_histogram", vec![]).ok() } else { None };
                     Ok(fees::from_electrum(&s.id, rates, histogram.as_ref(), min))
-                })(),
-                Kind::Esplora => (|| {
-                    let c = self.esplora(&s)?.clone();
-                    let m = net::block_on_until(&self.ctx.rt, &self.ctx.stop, c.get_fee_estimates())?.map_err(|e| e.to_string())?;
-                    let at = |t: u16| m.get(&t).copied();
-                    Ok(SourceEstimate { source: s.id.clone(), rates: [at(fees::TARGETS[0]), at(fees::TARGETS[1]), at(fees::TARGETS[2])], minimum: None, basis: fees::Basis::Estimate })
                 })(),
             };
             match r {
@@ -2063,7 +1957,7 @@ impl Loop {
         }
         // A round without an estimate keeps the last one: a source failing for a while is no
         // reason to fall back to the floor.
-        let fresh = fees::combine(&estimates);
+        let fresh = fees::floor_on_signet(fees::combine(&estimates), self.ctx.net);
         let mut p = self.ctx.progress.lock();
         if fresh.estimated || !p.fees.as_ref().is_some_and(|f| f.estimated) {
             p.fees = Some(fresh);
@@ -2122,7 +2016,7 @@ impl Loop {
                 break;
             }
             let woken = self.ctx.wake.swap(false, Ordering::SeqCst);
-            // Until a source vouches for the shared headers, history syncs and cross-checks wait.
+            // Until a source vouches for the shared headers, history syncs and the tip watch wait.
             let vouched = self.authority.seed_from().is_none();
             if vouched && self.servers_hold_history() && (moved || woken || self.last_history.is_none_or(|t| t.elapsed() >= history_every)) {
                 if let Err(e) = self.sync_history() {
@@ -2134,8 +2028,8 @@ impl Loop {
             if self.stopped() {
                 break;
             }
-            if vouched && (moved || self.last_cross.is_none_or(|t| t.elapsed() >= self.cross_delay)) {
-                self.cross_check();
+            if vouched && (moved || self.last_watch.is_none_or(|t| t.elapsed() >= self.watch_delay)) {
+                self.watch_tips();
             }
             if self.last_fees.is_none_or(|t| t.elapsed() >= FEES_EVERY) {
                 self.refresh_fees();
@@ -2229,11 +2123,10 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             remote_source: None,
             node_gap,
             clients: HashMap::new(),
-            esplora: HashMap::new(),
             depths: HashMap::new(),
             last_history: None,
-            last_cross: None,
-            cross_delay: Duration::from_secs(crosscheck::next_delay_secs()),
+            last_watch: None,
+            watch_delay: Duration::from_secs(tipwatch::next_delay_secs()),
             last_fees: None,
             last_expiry: None,
             last_routes: Instant::now(),

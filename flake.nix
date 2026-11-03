@@ -121,30 +121,6 @@
             runHook postInstall
           '';
         };
-      # Blockstream's electrs, the esplora flavour, for the regtest test of the Esplora path.
-      esploraElectrs = system:
-        let pkgs = nixpkgs.legacyPackages.${system}; in
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "esplora-electrs";
-          version = "0.4.1-unstable-2026-10-05";
-          src = pkgs.fetchFromGitHub {
-            owner = "Blockstream";
-            repo = "electrs";
-            rev = "dd09701e84dc88a2c58a1365f798222b66e13772";
-            hash = "sha256-AD+EYQnJdbd9VF8nw7dEYIieyjYdSHO8Y8l5HoQHdOs=";
-          };
-          cargoHash = "sha256-P8slOt07Fu6NNzYLEso3UQtfx7Yj+C4w98lq/Wr8oTk=";
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
-          buildInputs = [ pkgs.zeromq ];
-          # nixpkgs' RocksDB, linked dynamically, as electrs' own flake does.
-          ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
-          ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
-          # A test server: no LTO, so it builds in minutes.
-          CARGO_PROFILE_RELEASE_LTO = "false";
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16";
-          cargoBuildFlags = [ "--bin" "electrs" ];
-          doCheck = false;
-        };
       # rustc leaves SQLCipher's OpenSSL (big-obj COFF) out of the staticlib's index, so ld took the
       # host's libcrypto DLL: prefix that OpenSSL and its callers apart from logos-protocol's, re-index.
       opensslApart = ''
@@ -185,7 +161,7 @@
           preConfigure = nixpkgs.lib.optionalString (system == "x86_64-windows") opensslApart;
         }).packages.${system}
         // { bip157-check = bip157Check (buildSystem system); bdk_kyoto-check = bdkKyotoCheck (buildSystem system); }
-        // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; esplora-electrs = esploraElectrs system; }
+        // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-windows") { test-bin = testBinWindows; });
     };
 }

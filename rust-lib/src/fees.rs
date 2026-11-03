@@ -3,7 +3,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::network::Family;
+use crate::network::{BNetwork, Family};
 
 /// Core's default minimum relay fee, the floor when no source names one.
 pub const DEFAULT_MINIMUM: f64 = 1.0;
@@ -23,6 +23,8 @@ pub enum Basis {
     Estimate,
     /// Read off the server's mempool fee histogram, above its relay fee.
     Mempool,
+    /// Signet's relay floor, standing in where no source estimates.
+    Floor,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -81,6 +83,15 @@ pub fn combine(estimates: &[SourceEstimate]) -> FeeRates {
         estimated: medians.iter().all(Option::is_some),
         basis: if mempool { Basis::Mempool } else { Basis::Estimate },
     }
+}
+
+/// Signet's estimators only echo its sparse blocks, and by default nothing estimates there: the
+/// relay floor Kyoto's peers state stands as the estimate.
+pub fn floor_on_signet(mut rates: FeeRates, net: BNetwork) -> FeeRates {
+    if net == BNetwork::Signet && !rates.estimated {
+        (rates.estimated, rates.basis) = (true, Basis::Floor);
+    }
+    rates
 }
 
 fn round(x: f64) -> f64 {
@@ -153,6 +164,17 @@ mod tests {
 
     fn est(source: &str, rates: [Option<f64>; 3], minimum: Option<f64>) -> SourceEstimate {
         SourceEstimate { source: source.into(), rates, minimum, basis: Basis::Estimate }
+    }
+
+    #[test]
+    fn signet_takes_the_floor_where_nothing_estimates() {
+        let floor = combine(&[est("kyoto", [None; 3], Some(1.0))]);
+        assert!(!floor.estimated);
+        let s = floor_on_signet(floor.clone(), BNetwork::Signet);
+        assert_eq!((s.estimated, s.basis, s.fast, s.slow), (true, Basis::Floor, 1.0, 1.0));
+        assert!(!floor_on_signet(floor.clone(), BNetwork::Mainnet).estimated, "mainnet waits for an estimate");
+        let server = combine(&[est("e", [Some(3900.0); 3], Some(1.0))]);
+        assert_eq!(floor_on_signet(server.clone(), BNetwork::Signet), server, "an enabled server's estimate stands");
     }
 
     #[test]

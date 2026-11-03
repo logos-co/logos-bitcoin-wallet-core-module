@@ -250,23 +250,8 @@ impl HeaderChain {
             return out;
         }
         let keep = (fork - self.base + 1) as usize;
-        let mut valid: Vec<Header> = Vec::with_capacity(branch.len());
-        for (i, next) in branch.iter().enumerate() {
-            let height = fork + 1 + i as u32;
-            let prev = if i == 0 { self.headers[keep - 1] } else { valid[i - 1] };
-            let below = |h: u32| -> Option<Header> {
-                if h > fork {
-                    valid.get((h - fork - 1) as usize).copied()
-                } else {
-                    self.header_at(h).copied()
-                }
-            };
-            if let Err(e) = validate(self.net, height, &prev, next, &below, now) {
-                out.error = Some(e);
-                break;
-            }
-            valid.push(*next);
-        }
+        let (valid, error) = self.valid_prefix(fork, branch, now);
+        out.error = error;
         let ours = self.work_above(keep);
         let theirs = valid.iter().fold(Work::from_be_bytes([0; 32]), |acc, h| acc + h.work());
         if valid.is_empty() || theirs <= ours {
@@ -292,6 +277,39 @@ impl HeaderChain {
             out.adopted = false;
         }
         out
+    }
+
+    /// How high `branch`, continuing the header at `fork`, is valid, where that run holds more work
+    /// than the chain above `fork`. Nothing is adopted.
+    pub fn outworked_to(&self, fork: u32, branch: &[Header], now: u32) -> Option<u32> {
+        if fork < self.base || fork > self.tip_height() {
+            return None;
+        }
+        let (valid, _) = self.valid_prefix(fork, branch, now);
+        let theirs = valid.iter().fold(Work::from_be_bytes([0; 32]), |acc, h| acc + h.work());
+        (!valid.is_empty() && theirs > self.work_after(fork)).then(|| fork + valid.len() as u32)
+    }
+
+    /// The valid run of `branch` from its start, and why it stopped short; `fork` is on the chain.
+    fn valid_prefix(&self, fork: u32, branch: &[Header], now: u32) -> (Vec<Header>, Option<HeaderError>) {
+        let keep = (fork - self.base + 1) as usize;
+        let mut valid: Vec<Header> = Vec::with_capacity(branch.len());
+        for (i, next) in branch.iter().enumerate() {
+            let height = fork + 1 + i as u32;
+            let prev = if i == 0 { self.headers[keep - 1] } else { valid[i - 1] };
+            let below = |h: u32| -> Option<Header> {
+                if h > fork {
+                    valid.get((h - fork - 1) as usize).copied()
+                } else {
+                    self.header_at(h).copied()
+                }
+            };
+            if let Err(e) = validate(self.net, height, &prev, next, &below, now) {
+                return (valid, Some(e));
+            }
+            valid.push(*next);
+        }
+        (valid, None)
     }
 
     fn work_above(&self, keep: usize) -> Work {
@@ -390,6 +408,25 @@ pub(crate) mod tests {
         assert_eq!(c.tip_height(), 11);
         // A shorter chain can still win on work alone; regtest's equal targets make length decide.
         assert!(c.total_work() > Work::from_be_bytes([0; 32]));
+    }
+
+    #[test]
+    fn a_branch_is_measured_without_being_adopted() {
+        let mut c = HeaderChain::new(BNetwork::Regtest);
+        let main = regtest_branch(&genesis(), 10, genesis().time, 7);
+        c.try_extend(0, &main, NOW);
+        // Our last headers repeated, then three more: valid up to 13, and the chain stays at 10.
+        let mut ahead = main[4..].to_vec();
+        ahead.extend(regtest_branch(&main[9], 3, main[9].time, 7));
+        assert_eq!(c.outworked_to(4, &ahead, NOW), Some(13));
+        assert_eq!(c.tip_height(), 10);
+        // A broken link stops the count; a run with no more work than ours, or that doesn't link, is nothing.
+        let mut broken = ahead.clone();
+        broken[7].prev_blockhash = BlockHash::all_zeros();
+        assert_eq!(c.outworked_to(4, &broken, NOW), Some(11));
+        assert_eq!(c.outworked_to(4, &main[4..], NOW), None);
+        assert_eq!(c.outworked_to(3, &ahead, NOW), None);
+        assert_eq!(c.outworked_to(11, &ahead, NOW), None, "above the tip");
     }
 
     #[test]

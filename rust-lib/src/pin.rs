@@ -1,4 +1,4 @@
-//! Electrum and Esplora over TLS with a pinned end-entity certificate, for servers with
+//! Electrum and the remote RPC over TLS with a pinned end-entity certificate, for servers with
 //! self-signed ones: the pin takes the place of the CAs and the name check; the handshake
 //! signature is still verified against the pinned certificate's key, so a copy of the
 //! certificate proves nothing.
@@ -287,7 +287,7 @@ mod tests {
         Arc::new(config)
     }
 
-    /// An HTTPS server answering two of Esplora's calls: the tip height and the fee estimates.
+    /// An HTTPS server answering one GET with a tip height.
     fn https(cert: &'static [u8], key: &'static [u8], tls12_only: bool) -> u16 {
         let config = tls_config(cert, key, tls12_only);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -302,7 +302,6 @@ mod tests {
                 let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
                 let body = match path.as_str() {
                     "/blocks/tip/height" => "7".to_string(),
-                    "/fee-estimates" => serde_json::json!({"2": 12.5, "6": 5.0, "24": 1.5}).to_string(),
                     _ => String::new(),
                 };
                 let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
@@ -389,25 +388,23 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_esplora_server_answers_over_its_own_certificate() {
-        use crate::routes::{Isolation, Kind, Route, Source};
+    fn a_pinned_https_server_answers_over_its_own_certificate() {
+        // reqwest with the pinned verifier, as the remote RPC builds it.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let esplora = |port: u16, pin: [u8; 32]| {
-            let src = Source { id: "esplora-0".into(), url: format!("https://127.0.0.1:{port}"), operator: String::new(), route: Route::Direct, kind: Kind::Esplora, down: None, credentials: false, pin: Some(pin), encrypted: true };
-            crate::net::esplora(&src, None, &Isolation::fresh(), None).unwrap()
+        let get = |port: u16, pin: [u8; 32]| -> Result<String, String> {
+            let c = reqwest::Client::builder().use_preconfigured_tls(client_config(pin).unwrap()).build().unwrap();
+            rt.block_on(async { c.get(format!("https://127.0.0.1:{port}/blocks/tip/height")).send().await?.text().await }).map_err(|e| format!("{e:?}"))
         };
         for (cert, key, tls12) in [(V3, V3_KEY, false), (V1, V1_KEY, false), (V1, V1_KEY, true)] {
             let port = https(cert, key, tls12);
-            let c = esplora(port, pin_of(cert));
-            assert_eq!(rt.block_on(c.get_height()).unwrap_or_else(|e| panic!("tls12={tls12}: {e:?}")), 7);
-            assert_eq!(rt.block_on(c.get_fee_estimates()).unwrap().get(&6), Some(&5.0));
-            let e = format!("{:?}", rt.block_on(esplora(port, pin_of(V3_KEY)).get_height()).unwrap_err());
+            assert_eq!(get(port, pin_of(cert)).unwrap_or_else(|e| panic!("tls12={tls12}: {e}")), "7");
+            let e = get(port, pin_of(V3_KEY)).unwrap_err();
             assert!(e.contains("not the pinned one"), "another pin is refused: {e}");
             assert_eq!(certificate_sha256(&format!("https://127.0.0.1:{port}/api"), None, Duration::from_secs(5)).unwrap(), pin_of(cert), "a probe reads it");
         }
         // The pinned certificate served with another key: the handshake signature gives it away.
         let port = https(V3, V1_KEY, false);
-        let e = format!("{:?}", rt.block_on(esplora(port, pin_of(V3)).get_height()).unwrap_err());
+        let e = get(port, pin_of(V3)).unwrap_err();
         assert!(e.to_lowercase().contains("signature"), "{e}");
     }
 
