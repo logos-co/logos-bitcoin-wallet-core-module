@@ -225,9 +225,12 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches eac
   few peers it may dial; on testnet4, 2, or as many as it may dial down to 1, and then
   `status.kyoto.onePeerDecides` is true, for the app's one-operator notice. Over Tor a peer has 30 s for the TCP handshake, 15 s per response
   (the version handshake after the SOCKS connect included) and 240 s per filter batch (bip157 patch 2);
-  directly, 5 s, bip157's default 5 s and 30 s. On bip157's default, one mainnet start in ten
+  directly to a peer on the internet, 5 s, then 15 s and 240 s as over Tor; directly on the user's
+  network, 5 s, bip157's default 5 s and 30 s. On bip157's default, one mainnet start in ten
   through 8 listed onion peers ran out of peers in the peer-list crawler's runs; on 15 s, 10 of
-  10 reached the tip.
+  10 reached the tip. Directly, the shipped clearnet peers answered old filter headers in 4 to 6 s
+  and sent a batch of 1,000 filters in minutes (2026-11-02): on 5 s and 30 s, a start from
+  481,823 lost all 8 peers in about a minute.
 - When Kyoto runs out of peers (`NoReachablePeers`) it restarts on a fresh subset: after 2 s when the
   run got somewhere, else backing off up to 2 minutes.
 - When the client's update stream ends while its node runs on, nothing more would reach the wallet:

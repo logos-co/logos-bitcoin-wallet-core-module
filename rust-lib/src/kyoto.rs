@@ -250,7 +250,8 @@ pub fn required(net: BNetwork, regtest: Option<u8>, peers: usize) -> u8 {
     }
 }
 
-/// How long a peer has, per step: Tor circuits take seconds where a LAN takes milliseconds.
+/// How long a peer has, per step: Tor circuits and peers across the internet take seconds where a
+/// LAN takes milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub handshake: Duration,
@@ -259,9 +260,11 @@ pub struct Timeouts {
     pub filter_batch: Duration,
 }
 
-pub fn timeouts(route: Route) -> Timeouts {
+pub fn timeouts(route: Route, internet: bool) -> Timeouts {
     match route {
-        Route::Direct => Timeouts { handshake: Duration::from_secs(5), response: None, filter_batch: Duration::from_secs(30) },
+        Route::Direct if !internet => Timeouts { handshake: Duration::from_secs(5), response: None, filter_batch: Duration::from_secs(30) },
+        // Public peers answer old filter headers in 4 to 6 s and send a batch of filters in minutes.
+        Route::Direct => Timeouts { handshake: Duration::from_secs(5), response: Some(Duration::from_secs(15)), filter_batch: Duration::from_secs(240) },
         // The response timeout also covers the version handshake after the SOCKS connect.
         Route::Tor | Route::Onion => Timeouts { handshake: Duration::from_secs(30), response: Some(Duration::from_secs(15)), filter_batch: Duration::from_secs(240) },
     }
@@ -382,7 +385,8 @@ impl Client {
         if dial.is_empty() {
             return Err("Kyoto has no peer it can dial on its route".into());
         }
-        let t = timeouts(route.route);
+        let internet = dial.iter().any(|(_, p)| matches!(p, Peer::Ip(sa) if !crate::routes::is_loopback_or_lan(&sa.ip().to_string())));
+        let t = timeouts(route.route, internet);
         // bip157 dials the peer added last first.
         let mut b = Builder::new(net)
             .whitelist_only()
@@ -933,9 +937,11 @@ mod tests {
         assert_eq!(required(BNetwork::Testnet4, None, 0), 1);
         assert_eq!(required(BNetwork::Regtest, Some(3), 3), 3);
         assert_eq!(required(BNetwork::Regtest, None, 0), 1);
-        assert_eq!(timeouts(Route::Tor).handshake, Duration::from_secs(30));
-        assert_eq!(timeouts(Route::Onion).response, Some(Duration::from_secs(15)), "Tor: 15 s per response");
-        assert_eq!(timeouts(Route::Direct).response, None, "directly: bip157's default");
+        assert_eq!(timeouts(Route::Tor, true).handshake, Duration::from_secs(30));
+        assert_eq!(timeouts(Route::Onion, true).response, Some(Duration::from_secs(15)), "Tor: 15 s per response");
+        assert_eq!(timeouts(Route::Direct, false).response, None, "on the user's network: bip157's default");
+        let (t, tor) = (timeouts(Route::Direct, true), timeouts(Route::Tor, true));
+        assert_eq!((t.handshake, t.response, t.filter_batch), (Duration::from_secs(5), tor.response, tor.filter_batch), "across the internet: Tor's, but the TCP handshake");
         assert!(proxy_addr(&Proxy::parse("socks5h://tor.example:9050").unwrap()).is_err());
         assert_eq!(proxy_addr(&Proxy::parse("socks5h://localhost:9050").unwrap()).unwrap().port(), 9050);
     }
