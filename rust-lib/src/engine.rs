@@ -45,6 +45,9 @@ pub const READ_WAIT: Duration = Duration::from_millis(750);
 pub const STALE_TIP_SECS: u64 = 3600;
 /// Kyoto's broadcast counts once a peer asks for the transaction; past this it may still have gone.
 const KYOTO_BROADCAST_WAIT: Duration = Duration::from_secs(20);
+/// Through Tor errands: each needs a circuit and a handshake of its own, and a dead onion takes
+/// 10 to 15 s to fail.
+const ERRAND_BROADCAST_WAIT: Duration = Duration::from_secs(90);
 /// An open waits this long at most; the manager expires an unshown request after 5 minutes.
 const OPEN_LIMIT: Duration = Duration::from_secs(6 * 3600);
 /// A shown approval has no timeout on the person; this only bounds a forgotten one.
@@ -1101,6 +1104,7 @@ impl Engine {
         let net = self.light.lock().network.map(|n| n.bitcoin());
         let txid = tx.compute_txid();
         let mut maybe_left: Option<String> = None;
+        let mut not_sent: Option<String> = None;
         let mut tried = 0;
         for a in by {
             let sent: Result<Outcome, String> = match a {
@@ -1108,21 +1112,23 @@ impl Engine {
                     Some(rpc) => crate::node::broadcast(&NodeClient::new(rpc.clone()), tx).map(|_| Outcome::Seen),
                     None => continue,
                 },
-                // In the split, through Tor errands only, never Kyoto's direct peers; one that
-                // fails sent nothing.
+                // In the split, through Tor errands only, never Kyoto's direct peers; when they
+                // fail, nothing was sent.
                 routes::Authority::Kyoto if errands.is_some() => {
                     tried += 1;
                     let sent = match (&errands, &proxy, net) {
-                        (Some(e), Some(p), Some(n)) => crate::errand::broadcast(n, e, p, &tor, tx, KYOTO_BROADCAST_WAIT),
+                        (Some(e), Some(p), Some(n)) => crate::errand::broadcast(n, e, p, &tor, tx, ERRAND_BROADCAST_WAIT),
                         _ => Err("broadcasts go through Tor, and no proxy is set".into()),
                     };
                     match sent {
-                        Ok(()) => return Ok((Outcome::Requested, KYOTO.to_string())),
+                        Ok(crate::errand::Sent::Taken) => return Ok((Outcome::Requested, KYOTO.to_string())),
+                        Ok(crate::errand::Sent::Maybe) => maybe_left = Some(KYOTO.to_string()),
                         Err(e) => {
                             tracing::info!(target: "bitcoin", "broadcast via Tor errands: {e}");
-                            continue;
+                            not_sent = Some(e);
                         }
                     }
+                    continue;
                 }
                 routes::Authority::Kyoto => match &kyoto {
                     Some(r) => crate::kyoto::broadcast(&self.rt_handle, r, tx, KYOTO_BROADCAST_WAIT).map(|_| Outcome::Requested),
@@ -1178,9 +1184,10 @@ impl Engine {
                 }
             }
         }
-        match maybe_left {
-            Some(via) => Ok((Outcome::Unknown, via)),
-            None => Err("no broadcast source answered".into()),
+        match (maybe_left, not_sent) {
+            (Some(via), _) => Ok((Outcome::Unknown, via)),
+            (None, Some(e)) => Err(format!("not sent: no peer reached over Tor took the transaction ({e})")),
+            (None, None) => Err("no broadcast source answered".into()),
         }
     }
 

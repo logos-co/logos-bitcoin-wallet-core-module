@@ -208,13 +208,17 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches eac
     `kyotoSplit.tor` with fresh SOCKS credentials, so its own circuit: the version handshake,
     `getdata` for the witness block, and the connection closes. Its hash must be the one the
     filter matched, its merkle root and witness commitment must verify, and it must still be
-    Kyoto's block at that height, else it is skipped. Three run at once, oldest first;
+    Kyoto's block at that height, else it is skipped. Six run at once, oldest first;
   - a failed errand goes to another onion peer on a new circuit, backing off to a minute, never
     direct. While Tor's SOCKS port doesn't answer, `status.kyoto.tor.waiting` is true and the scan
     holds below the block (bdk_kyoto patch 6), so a restart checks its filter again;
-  - a send goes the same way: `inv`, the transaction when the peer asks for it, then a ping so it
-    is taken before the close; `requested` as through Kyoto, within the same 20 s. An errand that
-    fails sent nothing, so the next broadcast route is tried; Kyoto's direct peers never see it;
+  - a send goes the same way, three errands at once, each to an onion peer and on a circuit of its
+    own: `inv`, the transaction when the peer asks for it, then a ping so it is taken before the
+    close. The first pong makes it `requested`, as through Kyoto, within 90 s: each errand needs a
+    circuit and a handshake, and a dead onion takes 10 to 15 s to fail. A transaction written with
+    no pong before its errand ended may be out, so the send is `unknown`. When no errand wrote it,
+    nothing was sent: the next broadcast route is tried, and with none left the job fails "not
+    sent: …" (`not_sent`). Kyoto's direct peers never see it;
   - gossip from the direct peers reports public IP addresses too, for the node module's clearnet
     book, which keeps at most 2 per /16 or /32.
   The direct peers see that this IP runs a light client and scans to the tip; an onion peer sees
@@ -481,7 +485,7 @@ Amounts are decimal strings of satoshis.
 | Method | Returns |
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below. Malformed parameters are refused at once with `{ ok: false, error, code: "invalid" }` |
-| `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `dust`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
+| `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `dust`, `no_route`, `not_sent`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
 | `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base, asked, headers }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, gapLimit, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `asked` is false until the open's first round of asking the chain's sources ends (every server asked, a Kyoto peer connected or a start ended, the node answered or failed) or a server's first headers are taken, and again when the authority changes hands: until then `peers` is 0 and `height` is the chain stored last time, which is no news, not "none agrees". `headers: { have, target }` is a header download in progress ("The chain authority"), null otherwise; `target` is null for Kyoto. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
 | `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count, sat, confirmedSat } }`; `unchecked` is what unchecked rows pay the wallet; `beyondGap` is the coins beyond the gap, in none of the other figures; empty strings while busy |
 | `next_address()`, `current_address()`, `addresses()`, `utxos()` | A fresh receive address, `{ address, index, fresh, unused, gapLimit }`: once `unused` addresses stand unused and reach `gapLimit`, none is revealed and the first unused one comes back with `fresh` false; the first unused receive address, revealed only when none is (what an app shows when a wallet opens); revealed receive addresses; outputs confirmed on the authority's chain |

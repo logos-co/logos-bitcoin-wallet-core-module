@@ -26,6 +26,8 @@ use crate::routes::{ErrandRoute, Isolation, Proxy};
 
 /// Block errands at once; the rest wait their turn, oldest first.
 const AT_ONCE: usize = 6;
+/// Broadcast errands at once, each to a peer and on a circuit of its own.
+const BROADCAST_AT_ONCE: usize = 3;
 /// Over Tor: the connection, and each read.
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// One block errand at most, connection to block.
@@ -53,6 +55,23 @@ pub struct TorStatus {
 }
 
 pub type Status = Arc<Mutex<TorStatus>>;
+
+/// How far a broadcast got: a peer's pong came back after the transaction, or the transaction was
+/// written to a peer that asked for it and the errand ended before the pong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    Taken,
+    Maybe,
+}
+
+/// A broadcast's errands so far, shared by its lanes.
+#[derive(Default)]
+struct Round {
+    tried: HashSet<usize>,
+    taken: bool,
+    maybe: bool,
+    last: Option<String>,
+}
 
 /// Why an errand failed; `tor` when Tor's SOCKS port itself doesn't answer.
 #[derive(Debug)]
@@ -154,8 +173,8 @@ impl Errands {
     }
 
     /// `inv`, then the transaction when the peer asks for it; a ping after it, so the peer has
-    /// taken it before the connection closes.
-    fn broadcast(&self, peer: &Peer, tx: &Transaction, until: Instant) -> Result<(), Fail> {
+    /// taken it before the connection closes. Once the transaction is written it may be out.
+    fn broadcast(&self, peer: &Peer, tx: &Transaction, until: Instant) -> Result<Sent, Fail> {
         let (mut c, _) = self.open(peer, true, until)?;
         let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
         c.send(NetworkMessage::Inv(vec![Inventory::Transaction(txid)]))?;
@@ -168,13 +187,45 @@ impl Errands {
         }
         c.send(NetworkMessage::Tx(tx.clone()))?;
         let nonce = rand::random();
-        c.send(NetworkMessage::Ping(nonce))?;
+        if c.send(NetworkMessage::Ping(nonce)).is_err() {
+            return Ok(Sent::Maybe);
+        }
         while let Ok(m) = c.recv() {
             if m == NetworkMessage::Pong(nonce) {
-                break;
+                return Ok(Sent::Taken);
             }
         }
-        Ok(())
+        Ok(Sent::Maybe)
+    }
+
+    /// One lane of a broadcast: peer after peer until one takes it, another lane's peer did, or
+    /// time is up. True when this lane's peer took it.
+    fn broadcast_lane(&self, round: &Mutex<Round>, tx: &Transaction, until: Instant) -> bool {
+        loop {
+            let pick = {
+                let mut r = round.lock();
+                (!r.taken && Instant::now() < until).then(|| self.pick(&mut r.tried))
+            };
+            let Some((name, peer)) = pick else { return false };
+            match self.broadcast(&peer, tx, until) {
+                Ok(Sent::Taken) => {
+                    round.lock().taken = true;
+                    return true;
+                }
+                Ok(Sent::Maybe) => {
+                    tracing::info!(target: "bitcoin", "broadcast errand via {name}: sent, but the errand ended before the peer's pong");
+                    round.lock().maybe = true;
+                }
+                Err(f) => {
+                    tracing::info!(target: "bitcoin", "broadcast errand via {name}: {}", f.why);
+                    self.failed(&name, &f);
+                    round.lock().last = Some(f.why.clone());
+                    if f.tor {
+                        std::thread::sleep(Duration::from_secs(1).min(until.saturating_duration_since(Instant::now())));
+                    }
+                }
+            }
+        }
     }
 
     /// A connection on a circuit of its own, after the version handshake; the peer's services.
@@ -213,33 +264,33 @@ impl Errands {
     }
 }
 
-/// Sends `tx` through onion peers, one errand each, until one asks for it, within `budget`. An
-/// errand that fails sent nothing.
-pub fn broadcast(net: bitcoin::Network, route: &ErrandRoute, proxy: &Proxy, status: &Status, tx: &Transaction, budget: Duration) -> Result<(), String> {
-    let e = Errands::new(net, route, proxy, status.clone())?;
+/// Sends `tx` through onion peers within `budget`, a few errands at once, until a peer takes it.
+/// Err when no errand wrote it: nothing was sent.
+pub fn broadcast(net: bitcoin::Network, route: &ErrandRoute, proxy: &Proxy, status: &Status, tx: &Transaction, budget: Duration) -> Result<Sent, String> {
+    let e = Arc::new(Errands::new(net, route, proxy, status.clone())?);
     let until = Instant::now() + budget;
-    let mut tried = HashSet::new();
-    let mut last = "no onion peer asked for the transaction in time".to_string();
-    while Instant::now() < until {
-        let (name, peer) = e.pick(&mut tried);
-        match e.broadcast(&peer, tx, until) {
-            Ok(()) => {
-                let mut s = status.lock();
-                s.broadcasts += 1;
-                s.waiting = false;
-                return Ok(());
-            }
-            Err(f) => {
-                tracing::info!(target: "bitcoin", "broadcast errand via {name}: {}", f.why);
-                e.failed(&name, &f);
-                last = f.why.clone();
-                if f.tor {
-                    std::thread::sleep(Duration::from_secs(1).min(until.saturating_duration_since(Instant::now())));
-                }
-            }
-        }
+    let round = Arc::new(Mutex::new(Round::default()));
+    let (done, ended) = std::sync::mpsc::channel();
+    let lanes = BROADCAST_AT_ONCE.min(e.peers.len());
+    for _ in 0..lanes {
+        let (e, round, done, tx) = (e.clone(), round.clone(), done.clone(), tx.clone());
+        // A lane still out once another's peer took it ends by `until`.
+        std::thread::spawn(move || {
+            let _ = done.send(e.broadcast_lane(&round, &tx, until));
+        });
     }
-    Err(last)
+    drop(done);
+    if ended.iter().any(|taken| taken) {
+        let mut s = status.lock();
+        s.broadcasts += 1;
+        s.waiting = false;
+        return Ok(Sent::Taken);
+    }
+    let r = round.lock();
+    match r.maybe {
+        true => Ok(Sent::Maybe),
+        false => Err(r.last.clone().unwrap_or_else(|| "no onion peer asked for the transaction in time".into())),
+    }
 }
 
 /// Whether `hash` is still Kyoto's block at `height`; a stopped node never answers, so a scan
@@ -371,5 +422,119 @@ mod tests {
         let s = status.lock().clone();
         assert!(s.waiting && s.retries >= 1 && s.broadcasts == 0, "{s:?}");
         assert!(s.last_error.unwrap().starts_with("Tor can't be reached"));
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Act {
+        Take,
+        Dead,
+        Mute,
+        DropAfterTx,
+    }
+
+    /// A SOCKS5 proxy on loopback that plays each peer itself, as `act` says for its last octet.
+    fn fake_tor(act: fn(u8) -> Act) -> Proxy {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                std::thread::spawn(move || serve(s, act));
+            }
+        });
+        Proxy::parse(&format!("socks5h://{addr}")).unwrap()
+    }
+
+    fn serve(mut s: TcpStream, act: fn(u8) -> Act) -> Result<(), String> {
+        let io = |e: std::io::Error| e.to_string();
+        let mut b = [0u8; 2];
+        s.read_exact(&mut b).map_err(io)?;
+        s.read_exact(&mut vec![0u8; b[1] as usize]).map_err(io)?;
+        s.write_all(&[5, 2]).map_err(io)?;
+        s.read_exact(&mut b).map_err(io)?;
+        let mut user = vec![0u8; b[1] as usize + 1];
+        s.read_exact(&mut user).map_err(io)?;
+        s.read_exact(&mut vec![0u8; user[b[1] as usize] as usize]).map_err(io)?;
+        s.write_all(&[1, 0]).map_err(io)?;
+        let mut req = [0u8; 10];
+        s.read_exact(&mut req).map_err(io)?;
+        let act = act(req[7]);
+        if act == Act::Dead {
+            // Tor's reply for an onion service it can't find.
+            return s.write_all(&[5, 0xf0, 0, 1, 0, 0, 0, 0, 0, 0]).map_err(io);
+        }
+        s.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).map_err(io)?;
+        let mut c = Conn { tcp: s, magic: bitcoin::Network::Regtest.magic(), until: Instant::now() + Duration::from_secs(30) };
+        loop {
+            match c.recv().map_err(|f| f.why)? {
+                NetworkMessage::Version(_) => {
+                    c.send(NetworkMessage::Version(version(true))).map_err(|f| f.why)?;
+                    c.send(NetworkMessage::Verack).map_err(|f| f.why)?;
+                }
+                NetworkMessage::Verack => break,
+                _ => {}
+            }
+        }
+        if act == Act::Mute {
+            std::thread::sleep(Duration::from_secs(30));
+            return Ok(());
+        }
+        loop {
+            if let NetworkMessage::Inv(items) = c.recv().map_err(|f| f.why)? {
+                c.send(NetworkMessage::GetData(items)).map_err(|f| f.why)?;
+                break;
+            }
+        }
+        while !matches!(c.recv().map_err(|f| f.why)?, NetworkMessage::Tx(_)) {}
+        if act == Act::DropAfterTx {
+            return Ok(());
+        }
+        loop {
+            if let NetworkMessage::Ping(n) = c.recv().map_err(|f| f.why)? {
+                c.send(NetworkMessage::Pong(n)).map_err(|f| f.why)?;
+            }
+        }
+    }
+
+    fn send_via(peers: &[u8], act: fn(u8) -> Act, budget: Duration) -> (Result<Sent, String>, TorStatus, Duration) {
+        let route = ErrandRoute { peers: peers.iter().map(|i| format!("127.0.0.{i}:18444")).collect(), max_delay: Duration::ZERO };
+        let (status, start) = (Status::default(), Instant::now());
+        let tx = genesis_block(bitcoin::Network::Regtest).txdata[0].clone();
+        let r = broadcast(bitcoin::Network::Regtest, &route, &fake_tor(act), &status, &tx, budget);
+        let s = status.lock().clone();
+        (r, s, start.elapsed())
+    }
+
+    #[test]
+    fn the_peer_that_asks_takes_it() {
+        let (r, s, _) = send_via(&[1], |_| Act::Take, Duration::from_secs(10));
+        assert_eq!(r, Ok(Sent::Taken));
+        assert_eq!((s.broadcasts, s.retries), (1, 0));
+    }
+
+    #[test]
+    fn a_transaction_written_without_a_pong_may_be_out() {
+        let (r, s, _) = send_via(&[1], |_| Act::DropAfterTx, Duration::from_secs(2));
+        assert_eq!(r, Ok(Sent::Maybe), "not \"nothing sent\"");
+        assert_eq!(s.broadcasts, 0);
+    }
+
+    #[test]
+    fn dead_and_mute_peers_dont_hold_up_one_that_takes_it() {
+        let act = |i| match i {
+            1 => Act::Dead,
+            2 => Act::Mute,
+            _ => Act::Take,
+        };
+        let (r, s, took) = send_via(&[1, 2, 3], act, Duration::from_secs(20));
+        assert_eq!(r, Ok(Sent::Taken));
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        assert_eq!(s.broadcasts, 1);
+    }
+
+    #[test]
+    fn when_every_errand_fails_nothing_was_sent() {
+        let (r, s, _) = send_via(&[1, 2], |_| Act::Dead, Duration::from_secs(1));
+        assert!(r.is_err(), "{r:?}");
+        assert!(s.retries >= 2 && !s.waiting, "{s:?}");
     }
 }
