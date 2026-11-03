@@ -109,6 +109,17 @@ pub struct RegtestConfig {
     /// A checkpoint above genesis, as mainnet's are: `{ height, header }`, the header in hex.
     #[serde(default)]
     pub checkpoint: Option<RegtestCheckpoint>,
+    /// `identifying`'s split: Kyoto's matched blocks and broadcasts go to these peers through
+    /// `proxy` (`socks5h://`), after a random wait of at most `errandDelayMs` (none by default).
+    #[serde(default)]
+    pub kyoto_tor: Vec<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub errand_delay_ms: Option<u64>,
+    /// all, identifying or none; none drops the proxy and the split.
+    #[serde(default)]
+    pub tor_use: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]

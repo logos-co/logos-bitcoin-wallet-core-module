@@ -169,8 +169,8 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five and six patches, below
-(`kyoto.rs`, `peers.rs`):
+bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches each, below
+(`kyoto.rs`, `peers.rs`, `errand.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
   module's peer book for this install, or the user's own, which replace it. Each start dials 8,
@@ -197,14 +197,44 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five and six pa
   peer is.
 - One connection type per client, as the node module routes it: `direct` for peers on the user's
   network (names there resolve locally), else all through Tor's SOCKS port, never a mix. Kyoto
-  takes the proxy by IP address only.
+  takes the proxy by IP address only. A direct peer whose `services` in the table have bit 11 is
+  spoken to in BIP324 (bip157 does so only off a proxy).
+- **Use Tor for** (`torUse`, the node module's setting). In `all` Kyoto runs as above, over Tor.
+  In `none` the table routes it directly to clearnet peers, the core drops any proxy, and nothing
+  goes through Tor. In `identifying` the table's `kyotoSplit` splits it: the client takes headers,
+  filter headers and filters from direct clearnet peers, the data every wallet downloads alike,
+  and what names the wallet's payments goes over Tor as one-shot errands (`errand.rs`):
+  - each matched block, after a random wait of up to 60 s, goes to a random onion peer of
+    `kyotoSplit.tor` with fresh SOCKS credentials, so its own circuit: the version handshake,
+    `getdata` for the witness block, and the connection closes. Its hash must be the one the
+    filter matched, its merkle root and witness commitment must verify, and it must still be
+    Kyoto's block at that height, else it is skipped. Six run at once, oldest first;
+  - a failed errand goes to another onion peer on a new circuit, backing off to a minute, never
+    direct. While Tor's SOCKS port doesn't answer, `status.kyoto.tor.waiting` is true and the scan
+    holds below the block (bdk_kyoto patch 6), so a restart checks its filter again;
+  - a send goes the same way, three errands at once, each to an onion peer and on a circuit of its
+    own: `inv`, the transaction when the peer asks for it, then a ping so it is taken before the
+    close. The first pong makes it `requested`, as through Kyoto, within 90 s: each errand needs a
+    circuit and a handshake, and a dead onion takes 10 to 15 s to fail. A transaction written with
+    no pong before its errand ended may be out, so the send is `unknown`. When no errand wrote it,
+    nothing was sent: the next broadcast route is tried, and with none left the job fails "not
+    sent: …" (`not_sent`). Kyoto's direct peers never see it;
+  - gossip from the direct peers reports public IP addresses too, for the node module's clearnet
+    book, which keeps at most 2 per /16 or /32.
+  The direct peers see that this IP runs a light client and scans to the tip; an onion peer sees
+  one block request from a circuit it can't link to the next. Someone seeing both could still try
+  to match a scan past a block with its fetch by timing, which the random wait makes harder.
+  A table without the keys, from an older node module, keeps Kyoto all-Tor.
 - The quorum (`required_peers`, also the connection count) is 3 on mainnet and 2 on signet, however
   few peers it may dial; on testnet4, 2, or as many as it may dial down to 1, and then
   `status.kyoto.onePeerDecides` is true, for the app's one-operator notice. Over Tor a peer has 30 s for the TCP handshake, 15 s per response
   (the version handshake after the SOCKS connect included) and 240 s per filter batch (bip157 patch 2);
-  directly, 5 s, bip157's default 5 s and 30 s. On bip157's default, one mainnet start in ten
+  directly to a peer on the internet, 5 s, then 15 s and 240 s as over Tor; directly on the user's
+  network, 5 s, bip157's default 5 s and 30 s. On bip157's default, one mainnet start in ten
   through 8 listed onion peers ran out of peers in the peer-list crawler's runs; on 15 s, 10 of
-  10 reached the tip.
+  10 reached the tip. Directly, the shipped clearnet peers answered old filter headers in 4 to 6 s
+  and sent a batch of 1,000 filters in minutes (2026-11-02): on 5 s and 30 s, a start from
+  481,823 lost all 8 peers in about a minute.
 - When Kyoto runs out of peers (`NoReachablePeers`) it restarts on a fresh subset: after 2 s when the
   run got somewhere, else backing off up to 2 minutes.
 - When the client's update stream ends while its node runs on, nothing more would reach the wallet:
@@ -245,7 +275,8 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five and six pa
   filters (two checkpoints) past it, or past where the scan last started, checked none of them.
   bip157 dropped a rescan that came while it synced headers (patch 6), and an update from before
   a rescan still comes after it. Its transactions are taken, `status.kyoto.lastWarning` says so,
-  and the core asks for the scan again from there. On 2026-11-01 a mainnet scan over Tor stored
+  and the core asks for the scan again from there. The check reads the last filter checked
+  (`checked()`), not `scanned()`, which a block still being fetched over Tor holds back. On 2026-11-01 a mainnet scan over Tor stored
   the tip 11 s after resuming at 659,007, and a payment above that was never seen.
 - A filter-header conflict between peers (bip157 can't tell which lies, and disconnects one): the
   peers connected then are reported (`conflict`) and left out of a fresh subset that starts at
@@ -267,14 +298,16 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with five and six pa
   connection limit (135% CPU after one rebuild, before this).
 - `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, quorum, onePeerDecides,
   headers, progress, estimatedTip, scanned, connected, dialled, skipped, restarts, rebuilds, rescans, window,
-  lastWarning, lastStop, lastConflict, gossiped, learned }`. `scanned` is the last block whose filters
+  lastWarning, lastStop, lastConflict, gossiped, learned, tor }`. `scanned` is the last block whose filters
   were checked against the wallet, as stored, null before the first and after a scan starts over: the
   header chain (`walletTip` too) reaches the tip long before a scan from the birthday does. `progress` weighs filter headers a quarter and
   filters the rest, from the heights Kyoto reports since its start: filter headers by finished
   batches, filters one by one, so a catch-up within one batch reads `syncing` until its filter
   headers are in; `headers` is Kyoto's best header; `window` is the highest index the client
   watches per keychain; `gossiped` counts the addresses peers sent since the wallet opened and
-  `learned` those kept for the node module.
+  `learned` those kept for the node module. `tor` is null unless the split runs, else `{ pending,
+  fetched, broadcasts, retries, waiting, lastError }`: matched blocks not yet fetched over Tor,
+  those fetched, sends, errands tried again, and whether Tor can't be reached.
 
 ### Kyoto patches
 
@@ -324,7 +357,7 @@ without Nix (`--update` rewrites the vendored tree). Run against the published c
 fails: that is the bug. The quorum patch went upstream as Kyoto #612, closed for 0.8.0's fix; the
 others have not been sent.
 
-`patches/bdk_kyoto/` holds five on bdk_kyoto 0.18.1, in the files `tools/kyoto/patch-bdk_kyoto.sh`
+`patches/bdk_kyoto/` holds six on bdk_kyoto 0.18.1, in the files `tools/kyoto/patch-bdk_kyoto.sh`
 allows (`src/lib.rs`, `src/builder.rs`, and for patch 5 the manifest and the examples):
 
 1. matched blocks applied oldest first: the published crate drains them newest first
@@ -344,7 +377,14 @@ allows (`src/lib.rs`, `src/builder.rs`, and for patch 5 the manifest and the exa
    matched block: it keeps a reorganized branch's headers and fetches the block from there;
 5. bip157 0.8.0: the requirement, the bounded warning receiver in `LoggingSubscribers`, and the
    examples' progress from the heights that replace `Info::Progress`. The published 0.18.1, and
-   bdk-kyoto's master, require bip157 0.7.
+   bdk-kyoto's master, require bip157 0.7;
+6. `UpdateSubscriber::fetch_blocks_with(fetch)`: matched blocks fetched in the background by the
+   caller (the Tor errands of `identifying`), each as its filter matches, while the scan goes on.
+   They are applied oldest first up to the first still being fetched; `scanned()` stays below it,
+   so a restart checks its filter again, and `synced()` is false while any is pending. At the tip,
+   each fetch that lets blocks apply makes an update. `checked()` is the last filter checked,
+   held back or not. Blocking the subscriber on a Tor fetch
+   instead would queue the direct filters in bip157's unbounded channel, about 20 kB each.
 
 0.18.1 indexes every script the filters are checked against (`extend_index_to_policy`), which our
 patch 3 on 0.18.0 did: with a recovery lookahead past the wallet's own 25, a matched block's
@@ -445,7 +485,7 @@ Amounts are decimal strings of satoshis.
 | Method | Returns |
 |---|---|
 | `start_job(kind, params)` | `{ jobId, receipt }`; kinds below. Malformed parameters are refused at once with `{ ok: false, error, code: "invalid" }` |
-| `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `dust`, `no_route`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
+| `job_status`, `job_result`, `ack_job`, `cancel_job` | Keyed by job id and receipt. A failed job carries a stable `code`: `rejected`, `expired`, `cancelled`, `insufficient_funds`, `dust`, `no_route`, `not_sent`, `busy`, `refused`, `no_wallet`, `signer_unavailable`, `invalid` or `failed`. An unknown broadcast is not a failure: it is `broadcast: "unknown"` with the txid |
 | `status()` | `{ state: no_wallet\|awaiting_open\|opening\|syncing\|ready\|closing\|failed, network, group, family, authority: { kind: local_node\|kyoto\|electrum_headers, height, hash, tipAgeSecs, peers, base, asked, headers }, kyoto, node, synced, busy, needsBirthday, birthday, birthdaySource, gapLimit, rescanFrom, lastReorg, openHandle, approvalHandle, historyServer, lastError }`; never waits on the wallet more than 750 ms. `synced` is false without authority progress or with a tip older than an hour. `asked` is false until the open's first round of asking the chain's sources ends (every server asked, a Kyoto peer connected or a start ended, the node answered or failed) or a server's first headers are taken, and again when the authority changes hands: until then `peers` is 0 and `height` is the chain stored last time, which is no news, not "none agrees". `headers: { have, target }` is a header download in progress ("The chain authority"), null otherwise; `target` is null for Kyoto. `lastReorg: { height, depth, moved, at }` is the last reorg that moved confirmed transactions of the wallet: from `height` up, `depth` blocks, the txids in `moved`; their rows' `blockHash` then names the block that confirms them again |
 | `balance()` | `{ confirmed, waiting, unchecked, pending, sent, immature, tooSmall: { count, sat }, beyondGap: { count, sat, confirmedSat } }`; `unchecked` is what unchecked rows pay the wallet; `beyondGap` is the coins beyond the gap, in none of the other figures; empty strings while busy |
 | `next_address()`, `current_address()`, `addresses()`, `utxos()` | A fresh receive address, `{ address, index, fresh, unused, gapLimit }`: once `unused` addresses stand unused and reach `gapLimit`, none is revealed and the first unused one comes back with `fresh` false; the first unused receive address, revealed only when none is (what an app shows when a wallet opens); revealed receive addresses; outputs confirmed on the authority's chain |
@@ -492,11 +532,14 @@ more: `{ "modules": [...], "allowHost": true }`.
 ## Routes
 
 From `bitcoin_node_module`'s `route_table(network)`: `{ proxy, chain, history, pending, fees,
-broadcast, check, peers, crossCheck }`, each role `[{ id, kind, url, operator, route:
+broadcast, check, peers, crossCheck, torUse, kyotoSplit }`, each role `[{ id, kind, url, operator, route:
 tor|direct|onion, credentials?, certSha256?, userAdded? }]`. A `local` entry in `chain` makes the local node an
-authority, a `kyoto` entry Kyoto, with `peers` as its peers (`{ peer, source, ok }`, or plain
-`host:port`, which keeps the core's own rules); `local` and `kyoto` in `broadcast` put
-them ahead of the servers there. Tor and onion routes go through the `socks5h://` proxy with SOCKS
+authority, a `kyoto` entry Kyoto, with `peers` as its peers (`{ peer, source, ok, services }`, or plain
+`host:port`, which keeps the core's own rules; `services` a decimal string); `local` and `kyoto` in `broadcast` put
+them ahead of the servers there. `torUse` is `all`, `identifying` or `none`; `none` drops the
+proxy whatever the table says. In `identifying`, `kyotoSplit: { chain: { route: direct, peers },
+tor: { route: onion, peers } }` replaces Kyoto's route and peers with `chain`'s, and its errands go
+to `tor`'s; with no proxy the split is down rather than half of it running (Kyoto, above). Tor and onion routes go through the `socks5h://` proxy with SOCKS
 credentials per server, so each gets its own circuit; with no proxy they are down, never reached
 directly. Plain `tcp://` and `http://` go only to an onion service, through Tor, or to a server
 the person added (`userAdded`) on their own network (loopback, private ranges, `.local`, `.lan`,
@@ -528,7 +571,9 @@ isn't loaded or doesn't answer within 3 s (it would otherwise hold an open for t
 budget), do `regtest.json`'s own loopback sources serve; other networks keep failing closed:
 `{ "electrum": ["tcp://127.0.0.1:60601", ...], "esplora": [], "kyoto": ["127.0.0.1:18544", ...],
 "local": false, "kyotoRequired": 2, "checkOnly": false, "pollSecs": 1 }`. So pins, `userAdded` and
-the plain-text rule run end to end on regtest (`tools/e2e/pins.sh`).
+the plain-text rule run end to end on regtest (`tools/e2e/pins.sh`). `kyotoTor` (onion peers),
+`proxy` (`socks5h://`), `errandDelayMs` (the errands' longest wait, none by default) and
+`torUse` run `identifying`'s split there, or `none`.
 
 ## Shared headers
 
@@ -626,8 +671,9 @@ REGTEST_ELECTRUM=127.0.0.1:60601,127.0.0.1:60611 \
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test kyoto -- --ignored --exact kyoto_is_the_authority_on_regtest --nocapture
 # then, on the same chain, kyoto_with_a_history_server, kyoto_skips_a_matched_block_reorganized_away
-# kyoto_restarts_a_client_whose_updates_ended and kyoto_asks_again_when_a_scan_never_ran the
-# same way, one at a time
+# kyoto_restarts_a_client_whose_updates_ended, kyoto_asks_again_when_a_scan_never_ran,
+# kyoto_identifying_fetches_matched_blocks_over_tor, kyoto_identifying_waits_for_tor and
+# kyoto_none_makes_no_socks_connection the same way, one at a time
 # a fresh chain each, then
 REGTEST_ELECTRUM=127.0.0.1:60601 cargo test --release --no-default-features --features test-hooks \
   --test node -- --ignored --nocapture
@@ -715,7 +761,16 @@ scan's updates at its first checkpoint, so the restart syncs headers first, and 
 rescan from the node. The next block's update claims the tip with nothing checked past the resume
 point, 136: the core warns once and asks again, and the scan reaches the tip, which it can only
 through its checkpoints, as a finish further on is refused again. Without the check the false
-finish is stored, as on mainnet. `kyoto_first_sync_on_a_long_chain`
+finish is stored, as on mainnet. The split runs behind `examples/socks_proxy.rs`, a SOCKS5 server
+that maps two onion names to proxies in front of the main node and the follower and records each
+connection's credentials; Kyoto's direct peers are two more proxies, which count what the client
+sends. `kyoto_identifying_fetches_matched_blocks_over_tor` receives and sends: the direct side is
+sent no block `getdata`, no `inv` and no `tx`, the onion side no `getcfilters`, `getcfheaders` or
+`getheaders`, and every errand comes with credentials of its own. `kyoto_identifying_waits_for_tor`
+takes the SOCKS port down before a payment's block: `scanned` holds at the block before it for
+10 s, `tor.waiting` is true and nothing asks a direct peer for it; with the port back the payment
+confirms. `kyoto_none_makes_no_socks_connection` sets `none` with a proxy configured: nothing
+connects to it, and blocks and the send go to the direct peers. `kyoto_first_sync_on_a_long_chain`
 times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_a_live_network` restores the test phrase
 on signet or testnet4 (`LIVE_NETWORK`, signet by default) with a birthday (`LIVE_BIRTHDAY`) through
 Tor (`LIVE_PROXY`, a `socks5h://` port with IsolateDestAddr) from `LIVE_PEERS` (comma-separated

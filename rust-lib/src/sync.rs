@@ -26,12 +26,13 @@ use crate::checks::{self, ChainView, ProofVerdict};
 use crate::crosscheck::{self, Answer, Verdict};
 use crate::fees::{self, SourceEstimate};
 use crate::kyoto::{self, Feed, PeerBook, Start};
+use crate::errand::TorStatus;
 use crate::ledger::Ledger;
 use crate::net::{self, Checked};
 use crate::network::{BNetwork, Family};
 use crate::node::{self, Follower, NodeClient, NodeRpc, PrunedGap};
 use crate::peers::{self, PeerReports};
-use crate::routes::{Isolation, Kind, Routes, Source};
+use crate::routes::{Isolation, Kind, Route, Routes, Source};
 use crate::storage::{meta_get, meta_set};
 use crate::wallet::{Cell, Held};
 use crate::walletdir::now_secs;
@@ -101,6 +102,8 @@ pub struct NetState {
     pub chain_by: &'static str,
     /// The running Kyoto client, for broadcasts.
     pub kyoto: Option<bdk_kyoto::Requester>,
+    /// Kyoto's Tor errands while the split runs, for `status.kyoto.tor`.
+    pub kyoto_tor: crate::errand::Status,
     pub node_rpc: Option<Arc<dyn NodeRpc>>,
     pub node_id: String,
 }
@@ -143,6 +146,8 @@ pub struct KyotoStatus {
     /// Addresses Kyoto's peers gossiped since the wallet opened, and those kept for the node module.
     pub gossiped: u64,
     pub learned: u64,
+    /// Matched blocks and broadcasts over Tor while Kyoto takes the chain directly; else null.
+    pub tor: Option<crate::errand::TorStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -1098,11 +1103,15 @@ impl Loop {
     fn tend_kyoto(&mut self) -> (Change, Vec<Found>) {
         let mut change = Change::default();
         let mut found = vec![];
-        let (route, proxy, quorum) = {
+        let (route, proxy, quorum, tor) = {
             let ns = self.ctx.netstate.lock();
-            (ns.routes.kyoto.clone(), ns.routes.proxy.clone(), ns.routes.kyoto_required)
+            (ns.routes.kyoto.clone(), ns.routes.proxy.clone(), ns.routes.kyoto_required, ns.kyoto_tor.clone())
         };
         let Some(route) = route else { return (change, found) };
+        self.kyoto_status.tor = route.errands.as_ref().map(|_| {
+            let s = tor.lock().clone();
+            TorStatus { waiting: s.waiting || proxy.is_none(), ..s }
+        });
         if let Some(d) = &route.down {
             self.stop_kyoto(None);
             self.ctx.progress.lock().last_error = Some(format!("Kyoto: {d}"));
@@ -1133,7 +1142,7 @@ impl Loop {
             let started = {
                 let guard = self.ctx.cell.lock();
                 match guard.as_ref() {
-                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, snapshot, self.kyoto_lookahead, reporting, self.ctx.wake.clone()),
+                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, snapshot, self.kyoto_lookahead, reporting, &tor, self.ctx.wake.clone()),
                     None => Err("closed".into()),
                 }
             };
@@ -1179,8 +1188,8 @@ impl Loop {
                 Feed::Ended(why) => ended = Some(why),
                 Feed::Dial { peer, outcome } if !self.kyoto_own.contains(&peer) => self.peer_reports.dial(&peer, outcome),
                 Feed::Dial { .. } => {}
-                Feed::Gossip { from, addrs } => self.peer_reports.gossip(self.ctx.net, &from, &addrs, now),
-                Feed::Update { update, scanned, synced } => match self.take_kyoto_update(*update, scanned, synced) {
+                Feed::Gossip { from, addrs } => self.peer_reports.gossip(self.ctx.net, &from, &addrs, route.route == Route::Direct, now),
+                Feed::Update { update, scanned, checked, synced } => match self.take_kyoto_update(*update, scanned, checked, synced) {
                     Ok((c, f)) => {
                         change = merge(change, c);
                         found.extend(f);
@@ -1260,14 +1269,15 @@ impl Loop {
 
     /// Mirrors Kyoto's chain since its start into the authority's, then hands over what its
     /// filters matched. Below the wallet's checkpoint, Kyoto's chain must reach that checkpoint.
-    fn take_kyoto_update(&mut self, u: bdk_wallet::Update, scanned: Option<u32>, synced: bool) -> Result<(Change, Vec<Found>), String> {
+    fn take_kyoto_update(&mut self, u: bdk_wallet::Update, scanned: Option<u32>, checked: Option<u32>, synced: bool) -> Result<(Change, Vec<Found>), String> {
         let (requester, start) = match &self.kyoto {
             Some(c) => (c.requester.clone(), c.start),
             None => return Ok((Change::default(), vec![])),
         };
-        let skipped = self.kyoto_rescan.is_none() && kyoto::finish_skipped(self.kyoto_mark, scanned, synced);
-        if !skipped && scanned.is_some() {
-            self.kyoto_mark = scanned;
+        // Filters checked, not `scanned`: that one holds below a block still being fetched over Tor.
+        let skipped = self.kyoto_rescan.is_none() && kyoto::finish_skipped(self.kyoto_mark, checked, synced);
+        if !skipped && checked.is_some() {
+            self.kyoto_mark = checked;
         }
         let Some(cp) = u.chain else { return Ok((Change::default(), vec![])) };
         let mut ids: Vec<(u32, BlockHash)> = cp.iter().map(|c| (c.height(), c.hash())).take_while(|(h, _)| *h > start.known_to).collect();
@@ -1343,7 +1353,7 @@ impl Loop {
             if skipped {
                 // Its transactions count; the scan goes on from where filters were last checked.
                 let m = self.kyoto_mark.unwrap_or_default();
-                let why = format!("filters reported synced at {} with none checked after {m}; scanning again from there", scanned.unwrap_or_default());
+                let why = format!("filters reported synced at {} with none checked after {m}; scanning again from there", checked.unwrap_or_default());
                 tracing::warn!(target: "bitcoin", "kyoto: {why}");
                 self.kyoto_status.last_warning = Some(why);
                 let _ = requester.rescan_from(m);

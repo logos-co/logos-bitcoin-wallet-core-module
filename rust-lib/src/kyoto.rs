@@ -24,6 +24,8 @@ use crate::authority::HeaderProgress;
 use crate::network::BNetwork;
 use crate::routes::{KyotoRoute, Proxy, Route};
 
+type Fetch = std::pin::Pin<Box<dyn std::future::Future<Output = Option<bitcoin::Block>> + Send>>;
+
 /// Peers dialled per start, taken at random from the list.
 pub const SUBSET: usize = 8;
 /// Starts in a row a peer may fail before it is skipped.
@@ -132,10 +134,28 @@ pub fn parse_peer(text: &str, default_port: u16) -> Result<Peer, String> {
     Err(format!("{t}: Kyoto would resolve {host} outside Tor; use an IP address or an onion name"))
 }
 
+/// The network's P2P port, for a peer listed without one.
+pub fn default_port(net: bitcoin::Network) -> u16 {
+    match net {
+        bitcoin::Network::Bitcoin => 8333,
+        bitcoin::Network::Testnet4 => 48333,
+        bitcoin::Network::Signet => 38333,
+        bitcoin::Network::Regtest => 18444,
+        _ => 18333,
+    }
+}
+
 impl Peer {
-    fn trusted(&self) -> TrustedPeer {
+    /// With the services the table lists: bip157 speaks BIP324 to a direct peer with bit 11.
+    fn trusted(&self, services: u64) -> TrustedPeer {
         match self {
-            Peer::Ip(sa) => TrustedPeer::from_socket_addr(*sa),
+            Peer::Ip(sa) => {
+                let addr = match sa.ip() {
+                    IpAddr::V4(ip) => AddrV2::Ipv4(ip),
+                    IpAddr::V6(ip) => AddrV2::Ipv6(ip),
+                };
+                TrustedPeer::new(addr, Some(sa.port()), ServiceFlags::from(services))
+            }
             Peer::Onion(key, port) => TrustedPeer::new(AddrV2::TorV3(*key), Some(*port), ServiceFlags::NONE),
             Peer::Lan(host, port) => TrustedPeer::from_hostname(host.clone(), *port),
         }
@@ -230,7 +250,8 @@ pub fn required(net: BNetwork, regtest: Option<u8>, peers: usize) -> u8 {
     }
 }
 
-/// How long a peer has, per step: Tor circuits take seconds where a LAN takes milliseconds.
+/// How long a peer has, per step: Tor circuits and peers across the internet take seconds where a
+/// LAN takes milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub handshake: Duration,
@@ -239,9 +260,11 @@ pub struct Timeouts {
     pub filter_batch: Duration,
 }
 
-pub fn timeouts(route: Route) -> Timeouts {
+pub fn timeouts(route: Route, internet: bool) -> Timeouts {
     match route {
-        Route::Direct => Timeouts { handshake: Duration::from_secs(5), response: None, filter_batch: Duration::from_secs(30) },
+        Route::Direct if !internet => Timeouts { handshake: Duration::from_secs(5), response: None, filter_batch: Duration::from_secs(30) },
+        // Public peers answer old filter headers in 4 to 6 s and send a batch of filters in minutes.
+        Route::Direct => Timeouts { handshake: Duration::from_secs(5), response: Some(Duration::from_secs(15)), filter_batch: Duration::from_secs(240) },
         // The response timeout also covers the version handshake after the SOCKS connect.
         Route::Tor | Route::Onion => Timeouts { handshake: Duration::from_secs(30), response: Some(Duration::from_secs(15)), filter_batch: Duration::from_secs(240) },
     }
@@ -269,9 +292,9 @@ pub struct Start {
 
 /// What a running client reports to the sync thread.
 pub enum Feed {
-    /// The wallet's transactions since the last update and Kyoto's chain, with the height of the
-    /// last filter checked, and whether that is the tip or a checkpoint on the way there.
-    Update { update: Box<Update>, scanned: Option<u32>, synced: bool },
+    /// The wallet's transactions since the last update and Kyoto's chain, with the height a
+    /// restart scans from, the last filter checked, and whether that is the tip or a checkpoint.
+    Update { update: Box<Update>, scanned: Option<u32>, checked: Option<u32>, synced: bool },
     /// The share of filter headers and filters done, and Kyoto's header height.
     Progress { fraction: f32, height: u32 },
     Warning(String),
@@ -349,15 +372,9 @@ impl Client {
     /// keychain's revealed index plus `lookahead`. `snapshot` holds the headers from `start.from`
     /// to `start.known_to`. With `report`, it feeds each dial's outcome and the peers' gossip.
     #[allow(clippy::too_many_arguments)]
-    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, report: bool, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, report: bool, tor: &crate::errand::Status, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
         let net = wallet.network();
-        let default_port = match net {
-            bitcoin::Network::Bitcoin => 8333,
-            bitcoin::Network::Testnet4 => 48333,
-            bitcoin::Network::Signet => 38333,
-            bitcoin::Network::Regtest => 18444,
-            _ => 18333,
-        };
+        let default_port = default_port(net);
         let mut dial = vec![];
         for p in &peers {
             match parse_peer(p, default_port).and_then(|x| x.reachable(route.route).map(|_| x)) {
@@ -368,11 +385,12 @@ impl Client {
         if dial.is_empty() {
             return Err("Kyoto has no peer it can dial on its route".into());
         }
-        let t = timeouts(route.route);
+        let internet = dial.iter().any(|(_, p)| matches!(p, Peer::Ip(sa) if !crate::routes::is_loopback_or_lan(&sa.ip().to_string())));
+        let t = timeouts(route.route, internet);
         // bip157 dials the peer added last first.
         let mut b = Builder::new(net)
             .whitelist_only()
-            .add_peers(dial.iter().rev().map(|(_, p)| p.trusted()))
+            .add_peers(dial.iter().rev().map(|(t, p)| p.trusted(route.services.get(t).copied().unwrap_or(0))))
             .required_peers(required)
             .handshake_timeout(t.handshake)
             .filter_batch_timeout(t.filter_batch);
@@ -382,6 +400,10 @@ impl Client {
         if matches!(route.route, Route::Tor | Route::Onion) {
             b = b.socks5_proxy(proxy_addr(proxy.ok_or("routed through Tor, and no proxy is set")?)?);
         }
+        let errands = match &route.errands {
+            Some(e) => Some(Arc::new(crate::errand::Errands::new(net, e, proxy.ok_or("matched blocks go through Tor, and no proxy is set")?, tor.clone())?)),
+            None => None,
+        };
         if start.headers_only {
             b = b.headers_only_sync();
         }
@@ -412,13 +434,17 @@ impl Client {
         });
         let (updated, woken) = (tx.clone(), wake.clone());
         updates.checkpoint_every(CHECKPOINT_FILTERS);
+        if let Some(e) = errands {
+            let r = requester.clone();
+            updates.fetch_blocks_with(Arc::new(move |height, hash| -> Fetch { Box::pin(e.clone().block(r.clone(), height, hash)) }));
+        }
         let widen = updates.widen_handle();
         // Why the stream ended, or none once the sync thread is gone.
         let stream = rt.spawn(async move {
             loop {
                 match updates.update().await {
                     Ok(u) => {
-                        if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), synced: updates.synced() }).is_err() {
+                        if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), checked: updates.checked(), synced: updates.synced() }).is_err() {
                             return None;
                         }
                         woken.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -448,8 +474,8 @@ impl Client {
         let (seen, connected, best_header) = (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(0usize)), Arc::new(Mutex::new(start.from.0)));
         let now = Arc::new(Mutex::new(vec![]));
         rt.spawn(watch_peers(requester.clone(), dial.clone(), Watched { seen: seen.clone(), now: now.clone(), connected: connected.clone(), best_header: best_header.clone() }));
-        tracing::info!(target: "bitcoin", "kyoto: started after {} holding headers to {} with {} peers, quorum {required}{}", start.from.0, start.known_to, dial.len(),
-            if start.headers_only { ", headers first" } else { "" });
+        tracing::info!(target: "bitcoin", "kyoto: started after {} holding headers to {} with {} peers, quorum {required}{}{}", start.from.0, start.known_to, dial.len(),
+            if start.headers_only { ", headers first" } else { "" }, if route.errands.is_some() { ", matched blocks over Tor" } else { "" });
         let lan = dial.iter().filter(|(_, p)| matches!(p, Peer::Lan(..))).map(|(t, _)| t.clone()).collect();
         Ok(Client { requester, feed, rt: Some(rt), peers: dial.into_iter().map(|(p, _)| p).collect(), lan, seen, now, connected, best_header, revealed, window, widen, start, started: Instant::now(), updated: false, synced: false, ended: false })
     }
@@ -911,9 +937,11 @@ mod tests {
         assert_eq!(required(BNetwork::Testnet4, None, 0), 1);
         assert_eq!(required(BNetwork::Regtest, Some(3), 3), 3);
         assert_eq!(required(BNetwork::Regtest, None, 0), 1);
-        assert_eq!(timeouts(Route::Tor).handshake, Duration::from_secs(30));
-        assert_eq!(timeouts(Route::Onion).response, Some(Duration::from_secs(15)), "Tor: 15 s per response");
-        assert_eq!(timeouts(Route::Direct).response, None, "directly: bip157's default");
+        assert_eq!(timeouts(Route::Tor, true).handshake, Duration::from_secs(30));
+        assert_eq!(timeouts(Route::Onion, true).response, Some(Duration::from_secs(15)), "Tor: 15 s per response");
+        assert_eq!(timeouts(Route::Direct, false).response, None, "on the user's network: bip157's default");
+        let (t, tor) = (timeouts(Route::Direct, true), timeouts(Route::Tor, true));
+        assert_eq!((t.handshake, t.response, t.filter_batch), (Duration::from_secs(5), tor.response, tor.filter_batch), "across the internet: Tor's, but the TCP handshake");
         assert!(proxy_addr(&Proxy::parse("socks5h://tor.example:9050").unwrap()).is_err());
         assert_eq!(proxy_addr(&Proxy::parse("socks5h://localhost:9050").unwrap()).unwrap().port(), 9050);
     }
