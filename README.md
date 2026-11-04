@@ -880,8 +880,9 @@ on that node for the invalidated block, and stops answering.
 `signer_manager_module`, `evm_keystore_cli` (custodian) and `evm_signer_cli` (approver), an isolated
 HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
 
-- `logosctl.sh`: the gate refusing the host, an open decided by the custodian, a receive, a send
-  approved by the approver, a close and an unload;
+- `logosctl.sh`: the gate refusing the host, an open the approver consents to (only that consent
+  carries the seed the core takes its keys by), a receive, a send approved by the approver, a close
+  and an unload;
 - `device.sh`: a device account, the manager's `mock_device_signer` fixture, opened by its id
   (`mock-segwit`) under a data password the custodian sets at the first open; a receive, a send the
   approver confirms with no password and the device confirms, and a reopen that refuses a wrong
