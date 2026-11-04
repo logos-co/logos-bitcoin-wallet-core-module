@@ -421,8 +421,7 @@ impl Engine {
     /// Emits `walletStateChanged` when what status says has changed.
     fn emit_state(&self) {
         let s = self.status_inner(false);
-        let digest = json!([s["state"], s["synced"], s["authority"]["kind"], s["authority"]["height"], s["authority"]["headers"], s["openHandle"], s["approvalHandle"], s["lastError"], s["historyServer"], s["needsBirthday"],
-            s["birthday"], s["rescanFrom"], s["lastReorg"]["at"], s["gapLimit"]]).to_string();
+        let digest = state_digest(&s);
         let mut last = self.last_emitted.lock();
         if *last != digest {
             *last = digest;
@@ -1606,6 +1605,14 @@ fn release_stale_locks(cell: &mut Cell) -> Result<(), String> {
     Ok(())
 }
 
+/// What a `walletStateChanged` event goes out on. `catchingUp` ending at its grace changes nothing
+/// else, and apps read the status on events.
+fn state_digest(s: &Value) -> String {
+    json!([s["state"], s["synced"], s["authority"]["kind"], s["authority"]["height"], s["authority"]["headers"], s["authority"]["catchingUp"], s["openHandle"],
+        s["approvalHandle"], s["lastError"], s["historyServer"], s["needsBirthday"], s["birthday"], s["rescanFrom"], s["lastReorg"]["at"], s["gapLimit"]])
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2069,5 +2076,14 @@ mod tests {
         // A birthday kept from an earlier open stands; an override replaces it.
         assert_eq!(resolve_birthday(None, Some((900_000, "set".into())), &chain, net, fam), (900_000, "set".to_string()));
         assert_eq!(resolve_birthday(Some(Birthday::Height(910_000)), Some((900_000, "set".into())), &chain, net, fam).0, 910_000);
+    }
+
+    #[test]
+    fn a_catch_up_that_ends_at_its_grace_is_an_event() {
+        let st = |on: bool| json!({"state": "syncing", "synced": false, "authority": {"kind": "kyoto", "height": 974_439, "tipAgeSecs": 64_800, "peers": 3, "catchingUp": on}});
+        assert_ne!(state_digest(&st(true)), state_digest(&st(false)), "the app hears the stall");
+        let mut older = st(true);
+        older["authority"]["tipAgeSecs"] = json!(64_801);
+        assert_eq!(state_digest(&st(true)), state_digest(&older), "the tip's age alone is no event");
     }
 }
