@@ -20,6 +20,7 @@
 # listen, 0.0.0.0 for a wallet on another machine of the LAN; HOST is the address `peers` and
 # `electrum` print; WHITELIST adds peers (a subnet) the nodes give download,noban, as loopback
 # has. RPC stays on loopback.
+# electrs before 0.12, which drops --daemon-p2p-addr: the README's recipe pins 0.11.0.
 set -u
 C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
 BITCOIND="${BITCOIND:-bitcoind}"; ELECTRS="${ELECTRS:-electrs}"

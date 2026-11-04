@@ -153,10 +153,10 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   shown as `status.node.prunedGap: { from, below, heights, via, resolved }`, and scanned
   elsewhere: by the history server's next full scan when one is enabled, else by Kyoto, which
   holds the chain from the gap's first block until it has scanned past it, then hands it back.
-  With neither, `via` stays null. A pruned node without filters skips the blocks below its prune
+  With neither, `via` stays null; while your node is asked alone (Routes) that is always so. A pruned node without filters skips the blocks below its prune
   height the same way, with `heights` empty.
 - Broadcasts go through `sendrawtransaction` while the node is the authority; fees come from
-  `estimatesmartfee` and `getnetworkinfo`'s relay fee.
+  `estimatesmartfee` and `getnetworkinfo`'s relay fee, and from nothing else while it is asked alone.
 - `bitcoind_module` serves `getblockcount`, `getrawtransaction` (the mempool's transactions),
   `getblockfilter`, `getblockfrompeer` and `getpeerinfo` since its eece3b9. From an older module,
   `getblockcount` is answered from `getblockchaininfo` and `getrawtransaction` reads as "not
@@ -444,6 +444,12 @@ pass count for nothing. Checked headers more than 2 above the authority for 30 m
 be held back. They are never adopted. With no server enabled, "Stalled" (a tip over an hour old)
 says the same. A source is marked suspect only by the checks on its answers, never by the watch.
 
+Your node, asked alone, is judged from its own `getblockchaininfo` on each status read (every
+30 s): more than 2 headers past its blocks, or (not on regtest) a last block 90 minutes old, for
+30 minutes raises the same `authority_behind` alert once, with the node's id as `source` and the
+reason in `detail` (`your node has had no new block for 120 minutes`). Never
+during its first sync, which `status.node.initialSync` shows.
+
 ## Sends
 
 `build_send` uses BDK's TxBuilder with confirmed coins only, leaving out coins too small to spend at
@@ -537,8 +543,11 @@ broadcast, check, peers, torUse, kyotoSplit }`, each role `[{ id, kind, url, ope
 tor|direct|onion, credentials?, certSha256?, userAdded? }]`. A `local` entry in `chain` makes the local node an
 authority, a `kyoto` entry Kyoto, with `peers` as its peers (`{ peer, source, ok, services }`, or plain
 `host:port`, which keeps the core's own rules; `services` a decimal string); `local` and `kyoto` in `broadcast` put
-them ahead of the servers there. `torUse` is `all`, `identifying` or `none`; `none` drops the
-proxy whatever the table says. In `identifying`, `kyotoSplit: { chain: { route: direct, peers },
+them ahead of the servers there. A `local` or `rpc` entry in `chain` is your node, asked alone:
+every server and Kyoto in the table are left out of every role, whatever an older node module
+lists, so no Electrum server is asked for fees, tips, headers or history. `torUse` is `all`,
+`identifying` or `none`; `none` drops the proxy whatever the table says, unless the `rpc` entry is
+routed `tor` or `onion` (your node's own Tor switch). In `identifying`, `kyotoSplit: { chain: { route: direct, peers },
 tor: { route: onion, peers } }` replaces Kyoto's route and peers with `chain`'s, and its errands go
 to `tor`'s; with no proxy the split is down rather than half of it running (Kyoto, above). Tor and onion routes go through the `socks5h://` proxy with SOCKS
 credentials per server, so each gets its own circuit; with no proxy they are down, never reached
@@ -656,11 +665,14 @@ loopback stand in for two operators. `chain.sh pruned` adds a pruned node (`-pru
 it. `nix build .#regtest-chain` packages the script with bitcoind and electrs.
 `LISTEN=0.0.0.0` puts the P2P and Electrum ports on the LAN for a wallet on another machine, `HOST`
 is the address `peers` and `electrum` print, and `WHITELIST` gives a subnet download,noban as
-loopback has; RPC stays on loopback.
+loopback has; RPC stays on loopback. The recipe takes bitcoind and electrs from the nixpkgs
+`regtest.yml` pins (Core 31.1, electrs 0.11.0): electrs 0.12 drops `--daemon-p2p-addr`, which
+`chain.sh` passes, so the registry's `nixpkgs#electrs` no longer starts.
 
 ```bash
-export BITCOIND=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind
-export ELECTRS=$(nix build nixpkgs#electrs --no-link --print-out-paths)/bin/electrs
+pkgs=github:NixOS/nixpkgs/39ad350a0602fa0a58a544344e3e9187526ea45c
+export BITCOIND=$(nix build "$pkgs#bitcoind" --no-link --print-out-paths)/bin/bitcoind
+export ELECTRS=$(nix build "$pkgs#electrs" --no-link --print-out-paths)/bin/electrs
 export CHAIN_DIR=/tmp/btc-chain REGTEST_CHAIN=$PWD/tools/regtest/chain.sh
 export REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE=$CHAIN_DIR/bitcoind/regtest/.cookie
 tools/regtest/chain.sh prepare
