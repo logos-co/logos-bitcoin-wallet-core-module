@@ -36,6 +36,42 @@ pub struct Summary {
     pub base: u32,
     /// While headers are being taken in: the chain's tip and the tip its source announced.
     pub headers: Option<HeaderProgress>,
+    /// The first catch-up since the open or a change of feeder is under way (`CatchUp`): an old tip
+    /// is no stall yet.
+    pub catching_up: bool,
+}
+
+/// With nothing new this long, a first catch-up is a stall: two of Kyoto's 240 s filter-batch
+/// timeouts and its longest restart backoff, 120 s.
+pub const CATCH_UP_GRACE_SECS: u64 = 600;
+
+/// The chain's first catch-up since the open or a change of feeder: on until the tip reaches its
+/// sources' best height, and off while neither rose for `CATCH_UP_GRACE_SECS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchUp {
+    /// The start, or when the tip or the sources' best last rose.
+    moved_at: u64,
+    tip: u32,
+    best: u32,
+    done: bool,
+}
+
+impl CatchUp {
+    pub fn new(now: u64, tip: u32) -> Self {
+        Self { moved_at: now, tip, best: tip, done: false }
+    }
+
+    /// A round's tip and the best height its sources showed; `reached` once the tip is at it.
+    pub fn observe(&mut self, now: u64, tip: u32, best: u32, reached: bool) {
+        self.done |= reached;
+        if tip > self.tip || best > self.best {
+            (self.moved_at, self.tip, self.best) = (now, self.tip.max(tip), self.best.max(best));
+        }
+    }
+
+    pub fn on(&self, now: u64) -> bool {
+        !self.done && now.saturating_sub(self.moved_at) < CATCH_UP_GRACE_SECS
+    }
 }
 
 /// A header download: `have` the height reached, `target` the tip the source announced, unknown
@@ -492,6 +528,8 @@ impl Authority for ChainAuthority {
             asked: self.asked,
             base: self.chain.base(),
             headers: self.target.filter(|t| *t > tip).map(|t| HeaderProgress { have: tip, target: Some(t) }),
+            // The sync loop's to say.
+            catching_up: false,
         }
     }
 
@@ -907,5 +945,39 @@ mod tests {
         let e = b.prove_below(&[2], &fake("liar", lie)).unwrap_err();
         assert!(e.contains("does not link"), "{e}");
         assert_eq!(b.hash_at(2), None);
+    }
+
+    /// The 2026-11-04 mainnet reopen: 974,439 stored, the peers' best at 974,543, the first new
+    /// header 6 min 16 s after the start.
+    #[test]
+    fn a_first_catch_up_is_on_until_the_tip_reaches_the_sources_best() {
+        let (t0, grace) = (1_000_000, CATCH_UP_GRACE_SECS);
+        let mut c = CatchUp::new(t0, 974_439);
+        assert!(c.on(t0));
+        c.observe(t0 + 60, 974_439, 974_439, false);
+        assert!(c.on(t0 + 376), "nothing new for 6 min is still the catch-up");
+        c.observe(t0 + 376, 974_543, 974_543, false);
+        assert!(c.on(t0 + 376 + grace - 1));
+        c.observe(t0 + 380, 974_543, 974_543, true);
+        assert!(!c.on(t0 + 380), "at its sources' best, it is over");
+        c.observe(t0 + 400, 974_544, 974_544, false);
+        assert!(!c.on(t0 + 400), "for good: a later old tip is a stall again");
+    }
+
+    #[test]
+    fn a_catch_up_with_nothing_new_past_the_grace_is_a_stall() {
+        let (t0, grace) = (1_000_000, CATCH_UP_GRACE_SECS);
+        let mut c = CatchUp::new(t0, 974_439);
+        c.observe(t0 + grace - 1, 974_439, 974_439, false);
+        assert!(c.on(t0 + grace - 1));
+        c.observe(t0 + grace, 974_439, 974_439, false);
+        assert!(!c.on(t0 + grace), "no new height since the start");
+        // Kyoto's best header rising is progress, though the tip stays: on again, for a grace.
+        c.observe(t0 + grace + 5, 974_439, 974_500, false);
+        assert!(c.on(t0 + grace + 5));
+        assert!(!c.on(t0 + 2 * grace + 5));
+        // A restart that reaches the same heights again is no progress.
+        c.observe(t0 + 2 * grace + 10, 974_431, 974_500, false);
+        assert!(!c.on(t0 + 2 * grace + 10));
     }
 }

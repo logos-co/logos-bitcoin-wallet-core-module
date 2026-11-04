@@ -20,7 +20,7 @@ use bitcoin::{BlockHash, ScriptBuf, Txid};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use crate::authority::{self, Authority, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
+use crate::authority::{self, Authority, CatchUp, ChainAuthority, Change, ElectrumHeaders, HeaderSource, ELECTRUM_HEADERS, KYOTO, LOCAL_NODE, RPC_NODE};
 use crate::checks::{self, ChainView, ProofVerdict};
 use crate::fees::{self, SourceEstimate};
 use crate::kyoto::{self, Feed, PeerBook, Start};
@@ -297,6 +297,7 @@ struct Loop {
     last_fees: Option<Instant>,
     last_expiry: Option<Instant>,
     last_routes: Instant,
+    catch_up: CatchUp,
 }
 
 fn cp_from(blocks: &[(u32, BlockHash)]) -> Option<CheckPoint> {
@@ -439,7 +440,28 @@ impl Loop {
                 s.headers = Some(h);
             }
         }
+        s.catching_up = self.catch_up.on(now_secs());
         s
+    }
+
+    /// How far this round's sources reached, for the first catch-up: their best height, and
+    /// whether the chain is at it.
+    fn note_catch_up(&mut self) {
+        let s = self.authority.summary(now_secs());
+        let tip = self.authority.chain().tip_height();
+        let answered = s.asked && s.peers > 0 && s.headers.is_none();
+        let (best, reached) = match self.feeder {
+            Feeder::Servers => (s.headers.and_then(|h| h.target).unwrap_or(tip), answered),
+            Feeder::Node => match self.ctx.progress.lock().node.as_ref() {
+                Some(n) => (n.headers, answered && n.synced && tip >= n.blocks),
+                None => (tip, false),
+            },
+            Feeder::Kyoto => {
+                let best = self.kyoto_status.headers;
+                (best, answered && self.kyoto.as_ref().is_some_and(|c| c.synced) && tip >= best)
+            }
+        };
+        self.catch_up.observe(now_secs(), tip, best, reached);
     }
 
     /// Puts the authority's figures in `status` now, for the app.
@@ -605,6 +627,7 @@ impl Loop {
             self.node = None;
         }
         self.feeder = to;
+        self.catch_up = CatchUp::new(now_secs(), self.authority.chain().tip_height());
         let kind = match to {
             Feeder::Servers => ELECTRUM_HEADERS,
             Feeder::Kyoto => KYOTO,
@@ -681,6 +704,7 @@ impl Loop {
                 }
             }
         }
+        self.note_catch_up();
         self.ctx.progress.lock().authority = self.summary();
         if reorged {
             // The app hears of it now, not after this round's history sync.
@@ -2098,6 +2122,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
         peer_reports.load_credits(&meta(KYOTO_CREDITS).unwrap_or_default());
         let node_gap = meta(NODE_GAP).and_then(|t| serde_json::from_str(&t).ok());
         let n = kyoto::lookahead_for(ctx.gap_limit.load(Ordering::SeqCst));
+        let catch_up = CatchUp::new(now_secs(), authority.chain().tip_height());
         let mut l = Loop {
             ctx,
             authority,
@@ -2130,6 +2155,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             last_fees: None,
             last_expiry: None,
             last_routes: Instant::now(),
+            catch_up,
         };
         l.run();
     })
