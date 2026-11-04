@@ -11,7 +11,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${WORK:?set WORK to a scratch directory}"; mkdir -p "$WORK"; cd "$WORK"
 source "$HERE/common.sh"
 # The manager's fixture where it can enroll its seed (`enroll`), so an approver can open its account.
-DEVICE="github:logos-co/logos-signer-manager-module/2052aaab41df190bd33e67b8f28bf4280d3e61ac?dir=doctests/mock-device"
+DEVICE="github:logos-co/logos-signer-manager-module/3797807a422fee09dadaa8d8047a99237083d695?dir=doctests/mock-device"
 ACCOUNT=mock-segwit
 PEOPLE='"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]'
 
