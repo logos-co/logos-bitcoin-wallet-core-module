@@ -1358,13 +1358,12 @@ impl Engine {
     fn address_with(&self, f: impl FnOnce(&mut Cell) -> Result<Value, String>) -> Value {
         let r = self.cell_job(Duration::from_secs(5), f);
         self.wake();
-        match r {
-            Ok(mut v) => {
-                v["ok"] = json!(true);
-                v
-            }
-            Err(e) => json!({"ok": false, "error": e}),
-        }
+        answer(r)
+    }
+
+    /// A label for a revealed receive address, in the wallet's database; nothing to sync.
+    pub fn set_address_label(&self, index: i64, label: &str) -> Value {
+        answer(self.cell_job(Duration::from_secs(5), |c| c.set_address_label(index, label)))
     }
 
     fn read_json(&self, f: impl FnOnce(&Cell, &OpenWallet) -> Result<Value, String>, key: &str) -> Value {
@@ -1550,6 +1549,17 @@ fn refuse_birthday(b: &Birthday, first: Option<(u32, u64)>, now: u64) -> Result<
     }
 }
 
+/// A cell write's reply: its value with `ok`, or the refusal.
+fn answer(r: Result<Value, String>) -> Value {
+    match r {
+        Ok(mut v) => {
+            v["ok"] = json!(true);
+            v
+        }
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
 /// The lowest height and earliest block time of the wallet's confirmed and waiting transactions.
 fn first_known(cell: &Cell) -> Result<Option<(u32, u64)>, String> {
     let mut first: Option<(u32, u64)> = None;
@@ -1675,6 +1685,35 @@ mod tests {
         finish(&e, "close_wallet", json!({}));
         let other = finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset", "gapLimit": 40}));
         assert_eq!(other["gapLimit"], 40, "asked for on open");
+        e.shutdown();
+    }
+
+    /// A label goes through the open wallet's cell and stays with the wallet across a close.
+    #[test]
+    fn a_receive_label_is_written_through_the_cell_and_kept() {
+        crate::network::configure_regtest(Default::default());
+        let root = tempfile::tempdir().unwrap();
+        let e = Engine::new(root.path().join("wallets"), Arc::new(|_| {}), Arc::new(KeyChanging::fixed()), None);
+        assert_eq!(e.set_address_label(0, "x")["error"], "no wallet is open");
+        finish(&e, "open_wallet", json!({"network": "regtest", "family": "bitcoin"}));
+        e.current_address();
+        assert_eq!(e.set_address_label(0, " Rent "), json!({"ok": true, "index": 0, "label": "Rent"}));
+        assert_eq!(e.set_address_label(1, "x"), json!({"ok": false, "error": "no receive address #1 yet"}));
+        let rows = |e: &Arc<Engine>| {
+            let t0 = Instant::now();
+            loop {
+                let a = e.addresses();
+                if a["busy"] != true {
+                    return a["addresses"].clone();
+                }
+                assert!(t0.elapsed() < Duration::from_secs(10), "{a}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert_eq!(rows(&e)[0]["label"], "Rent");
+        finish(&e, "close_wallet", json!({}));
+        finish(&e, "open_wallet", json!({"network": "regtest", "group": "g_reset"}));
+        assert_eq!((rows(&e)[0]["label"].clone(), rows(&e)[0]["receivedSat"].clone()), (json!("Rent"), json!("0")));
         e.shutdown();
     }
 

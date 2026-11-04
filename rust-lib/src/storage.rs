@@ -74,7 +74,7 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), Storage
 }
 
 /// Logs to `core.log` in the persistence directory, restarting it past 10 MB. Never logs secrets,
-/// account ids, txids or addresses: callers pass heights, counts, source ids and errors.
+/// account ids, txids, addresses or their labels: callers pass heights, counts, source ids and errors.
 pub fn init_log(dir: &Path) {
     let path = dir.join("core.log");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {

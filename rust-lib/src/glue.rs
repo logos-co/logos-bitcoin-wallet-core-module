@@ -1,5 +1,6 @@
-//! Logos glue for `bitcoin_wallet_core_module`: JSON strings in and out, sends, cancels, descriptors
-//! and source changes for `bitcoin_wallet_backend` only, and no secret ever taken as a parameter.
+//! Logos glue for `bitcoin_wallet_core_module`: JSON strings in and out, sends, cancels, descriptors,
+//! receive addresses and their labels, and source changes for `bitcoin_wallet_backend` only, and no
+//! secret ever taken as a parameter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
@@ -42,8 +43,12 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     fn next_address(&self) -> String;
     /// `{ ok, address, index }`: the first unused receive address, revealed only when none is.
     fn current_address(&self) -> String;
-    /// `{ ok, addresses: [{ index, address, used }] }`, the revealed receive addresses.
+    /// `{ ok, addresses: [{ index, address, used, receivedSat, label }] }`, the revealed receive addresses;
+    /// `receivedSat` is all its outputs ever paid, unconfirmed included, `label` "" for none. Backend only.
     fn addresses(&self) -> String;
+    /// `{ ok, index, label }`: labels a revealed receive address, at most 64 characters, trimmed; ""
+    /// removes it. Kept in the wallet's encrypted database. Backend only.
+    fn set_address_label(&self, index: i64, label: String) -> String;
     /// `{ ok, utxos: [...] }`, outputs confirmed on the authority's chain.
     fn utxos(&self) -> String;
     /// `{ ok, rows: [{ txid, intent: send|self|combine|fee_bump|receive, amountSat, feeSat,
@@ -178,7 +183,11 @@ impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
     }
 
     fn addresses(&self) -> String {
-        self.with(|e| e.addresses())
+        self.backend_with(|e| e.addresses())
+    }
+
+    fn set_address_label(&self, index: i64, label: String) -> String {
+        self.backend_with(|e| e.set_address_label(index, &label))
     }
 
     fn utxos(&self) -> String {

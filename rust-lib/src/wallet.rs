@@ -36,6 +36,10 @@ pub const CHAIN_TIP_KEY: &str = "chain_tip";
 pub const GAP_LIMIT_KEY: &str = "gap_limit";
 pub const MAX_GAP_LIMIT: u32 = 1000;
 
+/// The person's labels for receive addresses, `{ "<index>": "<label>" }` in `core_meta`.
+pub const RECEIVE_LABELS_KEY: &str = "receive_labels";
+pub const MAX_LABEL_CHARS: usize = 64;
+
 /// The highest address index of each keychain within the gap: past the last used index a scan
 /// from 0 reaches, by the gap limit. A coin further out was found only because a scan watched past.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,23 +479,54 @@ impl Cell {
         Ok(json!({"address": info.address.to_string(), "index": info.index}))
     }
 
+    /// The revealed receive addresses. `used` is BDK's, as next_address counts it: any output seen
+    /// paying it; `receivedSat` sums the canonical ones, unconfirmed included.
     pub fn addresses(&self) -> Value {
-        let used: HashSet<u32> = self
-            .wallet
-            .list_output()
-            .filter(|o| o.keychain == KeychainKind::External)
-            .map(|o| o.derivation_index)
-            .collect();
-        let rows: Vec<Value> = self
-            .wallet
-            .spk_index()
+        let mut received: BTreeMap<u32, u64> = BTreeMap::new();
+        for o in self.wallet.list_output().filter(|o| o.keychain == KeychainKind::External) {
+            *received.entry(o.derivation_index).or_default() += o.txout.value.to_sat();
+        }
+        let labels = self.receive_labels();
+        let index = self.wallet.spk_index();
+        let rows: Vec<Value> = index
             .revealed_keychain_spks(KeychainKind::External)
             .map(|(i, spk)| {
                 let a = Address::from_script(&spk, self.network.bitcoin()).map(|a| a.to_string()).unwrap_or_default();
-                json!({"index": i, "address": a, "used": used.contains(&i)})
+                json!({"index": i, "address": a, "used": index.is_used(KeychainKind::External, i),
+                       "receivedSat": received.get(&i).copied().unwrap_or(0).to_string(),
+                       "label": labels.get(&i).map_or("", String::as_str)})
             })
             .collect();
         json!(rows)
+    }
+
+    fn receive_labels(&self) -> BTreeMap<u32, String> {
+        let stored = crate::storage::meta_get(&self.conn, RECEIVE_LABELS_KEY).ok().flatten();
+        let doc: BTreeMap<String, String> = stored.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        doc.into_iter().filter_map(|(i, l)| Some((i.parse().ok()?, l))).collect()
+    }
+
+    /// Labels a revealed receive address, trimmed; an empty label removes it.
+    pub fn set_address_label(&mut self, index: i64, label: &str) -> Result<Value, String> {
+        let label = label.trim();
+        if label.chars().count() > MAX_LABEL_CHARS {
+            return Err(format!("a label is at most {MAX_LABEL_CHARS} characters"));
+        }
+        if label.chars().any(char::is_control) {
+            return Err("a label can't hold control characters".into());
+        }
+        let revealed = self.wallet.derivation_index(KeychainKind::External);
+        let i = u32::try_from(index).ok().filter(|i| revealed.is_some_and(|r| *i <= r)).ok_or_else(|| format!("no receive address #{index} yet"))?;
+        let mut labels = self.receive_labels();
+        if label.is_empty() {
+            labels.remove(&i);
+        } else {
+            labels.insert(i, label.to_string());
+        }
+        let doc: BTreeMap<String, &String> = labels.iter().map(|(i, l)| (i.to_string(), l)).collect();
+        let text = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
+        crate::storage::meta_set(&self.conn, RECEIVE_LABELS_KEY, &text).map_err(|e| e.to_string())?;
+        Ok(json!({"index": i, "label": label}))
     }
 
     pub fn utxos(&self, rate: f64) -> Value {
@@ -955,6 +990,88 @@ mod tests {
         crate::storage::meta_set(&cell.conn, GAP_LIMIT_KEY, "30").unwrap();
         let a = cell.next_address().unwrap();
         assert_eq!((a["index"].as_u64(), a["fresh"].as_bool(), a["gapLimit"].as_u64()), (Some(u64::from(GAP_LIMIT)), Some(true), Some(30)), "{a}");
+    }
+
+    /// A label is trimmed, at most 64 characters (not bytes) and no control character, only for an
+    /// address already revealed; "" removes it, and it is in the database after a reopen.
+    #[test]
+    fn receive_labels_are_set_cleared_and_kept() {
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let open = || {
+            let mut conn = crate::storage::open_encrypted(&path, &[6; 32]).unwrap();
+            let (w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+            Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None }
+        };
+        let mut cell = open();
+        let labels = |c: &Cell| c.addresses().as_array().unwrap().iter().map(|r| r["label"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(cell.set_address_label(0, "x"), Err("no receive address #0 yet".into()), "nothing revealed yet");
+        cell.current_address().unwrap();
+        cell.next_address().unwrap();
+        assert_eq!(cell.set_address_label(0, "  Rent from Ana \t").unwrap(), json!({"index": 0, "label": "Rent from Ana"}));
+        let wide = "é".repeat(MAX_LABEL_CHARS);
+        assert_eq!(cell.set_address_label(1, &wide).unwrap()["label"], wide.as_str(), "64 characters, 128 bytes");
+        assert_eq!(labels(&cell), vec!["Rent from Ana".to_string(), wide.clone()]);
+        assert!(cell.set_address_label(1, &"a".repeat(MAX_LABEL_CHARS + 1)).unwrap_err().contains("at most 64"));
+        assert!(cell.set_address_label(1, "two\nlines").unwrap_err().contains("control"));
+        assert_eq!(cell.set_address_label(2, "x"), Err("no receive address #2 yet".into()));
+        assert_eq!(cell.set_address_label(-1, "x"), Err("no receive address #-1 yet".into()));
+        assert_eq!(labels(&cell)[1], wide, "a refusal changes nothing");
+        assert_eq!(cell.set_address_label(1, "   ").unwrap(), json!({"index": 1, "label": ""}));
+        drop(cell);
+        let cell = open();
+        assert_eq!(labels(&cell), vec!["Rent from Ana".to_string(), String::new()], "kept across a reopen");
+        let raw = crate::storage::meta_get(&cell.conn, RECEIVE_LABELS_KEY).unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(), json!({"0": "Rent from Ana"}));
+    }
+
+    /// Each receive address sums what it was paid, pending and in several outputs alike; change
+    /// is no receive address.
+    #[test]
+    fn a_receive_address_sums_what_it_received() {
+        use bdk_wallet::chain::{CheckPoint, TxUpdate};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, TxIn, TxOut};
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[7; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (mut w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let _ = w.reveal_addresses_to(KeychainKind::External, 2).count();
+        let spk = |w: &PersistedWallet<Connection>, k, i| w.peek_address(k, i).script_pubkey();
+        let pay = |n: u8, outs: Vec<(ScriptBuf, u64)>| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([n; 32]), vout: 0 }, ..Default::default() }],
+            output: outs.into_iter().map(|(s, v)| TxOut { value: Amount::from_sat(v), script_pubkey: s }).collect(),
+        };
+        let a0 = spk(&w, KeychainKind::External, 0);
+        let first = pay(1, vec![(a0.clone(), 10_000), (a0.clone(), 2_500), (spk(&w, KeychainKind::Internal, 0), 7_000)]);
+        let second = pay(2, vec![(a0, 500)]);
+        let pending = pay(3, vec![(spk(&w, KeychainKind::External, 1), 40_000)]);
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let b1 = BlockId { height: 1, hash: BlockHash::from_byte_array([1; 32]) };
+        let mut u = TxUpdate::default();
+        for tx in [&first, &second] {
+            u.anchors.insert((ConfirmationBlockTime { block_id: b1, confirmation_time: 1 }, tx.compute_txid()));
+        }
+        u.seen_ats.insert((pending.compute_txid(), 5));
+        for tx in [first, second, pending] {
+            u.txs.push(std::sync::Arc::new(tx));
+        }
+        let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
+        w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
+        let cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
+        let rows = cell.addresses();
+        let got: Vec<(u64, bool, &str)> = rows.as_array().unwrap().iter()
+            .map(|r| (r["index"].as_u64().unwrap(), r["used"].as_bool().unwrap(), r["receivedSat"].as_str().unwrap()))
+            .collect();
+        assert_eq!(got, vec![(0, true, "13000"), (1, true, "40000"), (2, false, "0")], "{rows}");
+        assert!(rows.as_array().unwrap().iter().all(|r| r["label"] == ""));
     }
 
     #[test]
