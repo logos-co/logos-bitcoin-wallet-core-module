@@ -894,19 +894,19 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
   authority: a coinbase received and matured, a send through its `sendrawtransaction`, confirmed,
   then `set_birthday`, whose rescan reads the node's block filters over IPC and fetches only the
   blocks they match;
-- `pins.sh`: the real `bitcoin_node_module` routing regtest: Kyoto's peers through
-  `set_own_peers`, and through `set_sources` a self-signed `ssl://` front for electrs
-  (`examples/tls_front.rs`, a version 1 certificate) pinned with `certSha256`, plus a plain
-  `tcp://` electrs on loopback. The core's `regtest.json` names no server. A payment shows pending
-  from the front, reached by its pin, and confirms; `sources_status` marks the front encrypted and
-  the plain one not. Once `set_source` pins another certificate the core refuses the front, and
-  takes it back with the right pin;
-- `peers.sh`: the real `bitcoin_node_module`'s peer book. Kyoto goes direct on regtest
-  (`set_source kyoto {"tor":false}`); through the person's own peer, the follower behind a
-  `p2p_proxy` front that gossips four peers on loopback, the core reports them and the book keeps
-  them, learned. With no own peer Kyoto dials the book, two a start (one gossiper), and each start
-  is cut once it syncs, so it dials its second peer: the reports turn the good peer `ok` and first,
-  and the book skips a failing one after three failures in a row.
+- `pins.sh`: the real `bitcoin_node_module`, with the `tor_module` its manifest requires, routing
+  regtest: Kyoto's peers through `set_own_peers`, and through `set_sources` a self-signed `ssl://`
+  front for electrs (`examples/tls_front.rs`, a version 1 certificate) pinned with `certSha256`,
+  plus a plain `tcp://` electrs on loopback. The core's `regtest.json` names no server. A payment
+  shows pending from the front, reached by its pin, and confirms; `sources_status` marks the front
+  encrypted and the plain one not. Once `set_source` pins another certificate the core refuses the
+  front, and takes it back with the right pin;
+- `peers.sh`: the real `bitcoin_node_module`'s peer book, `tor_module` laid out beside it. Kyoto
+  goes direct on regtest (`set_source kyoto {"tor":false}`); through the person's own peer, the
+  follower behind a `p2p_proxy` front that gossips four peers on loopback, the core reports them and
+  the book keeps them, learned. With no own peer Kyoto dials the book, two a start (one gossiper),
+  and each start is cut once it syncs, so it dials its second peer: the reports turn the good peer
+  `ok` and first, and the book skips a failing one after three failures in a row.
 
 Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of 20 unloads within
 2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians
