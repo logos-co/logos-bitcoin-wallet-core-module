@@ -1,6 +1,7 @@
 //! The tip watch: each enabled server's tip against the chain authority's. Headers a server shows
 //! above it count once they link to the authority's chain and pass the same checks; shown for
 //! half an hour, the authority may be held back. A server that lags is left out of history.
+//! Your own node, asked alone, is judged from its own report instead.
 
 use rand::Rng;
 
@@ -64,6 +65,33 @@ pub fn judge(w: &mut Watch, auth_tip: u32, tip: u32, now: u64) -> Seen {
     seen
 }
 
+/// Your node's last block this old says it may be cut off; a test chain's blocks come as mined.
+pub const STALE_TIP_SECS: u64 = 90 * 60;
+
+/// Why your node may be behind, from its own report; `None` while it looks current.
+pub fn node_behind(blocks: u32, headers: u32, tip_time: Option<u64>, by_age: bool, now: u64) -> Option<String> {
+    if headers > blocks + TIP_SLACK {
+        return Some(format!("knows of {} blocks it hasn't downloaded", headers - blocks));
+    }
+    let age = now.saturating_sub(tip_time?);
+    (by_age && age >= STALE_TIP_SECS).then(|| format!("has had no new block for {} minutes", age / 60))
+}
+
+/// Judges your node as a server ahead is judged: behind for half an hour raises the alert, once,
+/// and never during its first sync, which the app shows on its own.
+pub fn judge_node(w: &mut Watch, behind: bool, initial_sync: bool, now: u64) -> Seen {
+    if !behind || initial_sync {
+        (w.ahead_since, w.ahead) = (None, false);
+        return Seen::Nothing;
+    }
+    let since = *w.ahead_since.get_or_insert(now);
+    if !w.ahead && now.saturating_sub(since) >= AHEAD_ALERT_SECS {
+        w.ahead = true;
+        return Seen::AuthorityBehind;
+    }
+    Seen::Nothing
+}
+
 /// The next scheduled check: the interval, plus or minus a fifth.
 pub fn next_delay_secs() -> u64 {
     let jitter = INTERVAL_SECS / 5;
@@ -119,6 +147,27 @@ mod tests {
         assert_eq!((w.ahead_since, w.ahead), (None, false));
         assert_eq!(judge(&mut w, 104, 110, 4000), Seen::Nothing);
         assert_eq!(judge(&mut w, 104, 110, 4000 + AHEAD_ALERT_SECS), Seen::AuthorityBehind);
+    }
+
+    #[test]
+    fn your_node_behind_for_half_an_hour_says_so_once() {
+        let now = 10_000_000;
+        assert_eq!(node_behind(100, 102, Some(now - 600), true, now), None, "level within the slack");
+        assert_eq!(node_behind(100, 103, Some(now), true, now).as_deref(), Some("knows of 3 blocks it hasn't downloaded"));
+        assert_eq!(node_behind(100, 100, Some(now - STALE_TIP_SECS), true, now).as_deref(), Some("has had no new block for 90 minutes"));
+        assert_eq!(node_behind(100, 100, Some(now - STALE_TIP_SECS), false, now), None, "a test chain's tip is as old as it was mined");
+        assert_eq!(node_behind(100, 100, None, true, now), None);
+
+        let mut w = Watch::default();
+        assert_eq!(judge_node(&mut w, true, false, 0), Seen::Nothing);
+        assert_eq!(judge_node(&mut w, true, false, AHEAD_ALERT_SECS - 1), Seen::Nothing);
+        assert_eq!(judge_node(&mut w, true, false, AHEAD_ALERT_SECS), Seen::AuthorityBehind);
+        assert_eq!(judge_node(&mut w, true, false, AHEAD_ALERT_SECS + 600), Seen::Nothing, "said once");
+        assert_eq!(judge_node(&mut w, false, false, 4000), Seen::Nothing);
+        assert_eq!(w, Watch::default(), "caught up: a later lag is news");
+        // The first sync is behind by design.
+        assert_eq!(judge_node(&mut w, true, true, 0), Seen::Nothing);
+        assert_eq!(judge_node(&mut w, true, true, 2 * AHEAD_ALERT_SECS), Seen::Nothing);
     }
 
     #[test]

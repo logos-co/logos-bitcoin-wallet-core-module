@@ -28,7 +28,7 @@ use crate::errand::TorStatus;
 use crate::ledger::Ledger;
 use crate::net::{self, Checked};
 use crate::network::{BNetwork, Family};
-use crate::node::{self, Follower, NodeClient, NodeRpc, PrunedGap};
+use crate::node::{self, Follower, NodeClient, NodeRpc, NodeStatus, PrunedGap};
 use crate::peers::{self, PeerReports};
 use crate::routes::{Isolation, Kind, Route, Routes, Source};
 use crate::storage::{meta_get, meta_set};
@@ -286,6 +286,8 @@ struct Loop {
     node_rescans: u32,
     node_ok: bool,
     node_probe: Option<Instant>,
+    /// Your node judged from its own report, as servers are by the tip watch.
+    node_watch: tipwatch::Watch,
     remote_source: Option<Source>,
     /// Blocks a pruned node couldn't give, until a history server or Kyoto has scanned them.
     node_gap: Option<PrunedGap>,
@@ -541,6 +543,7 @@ impl Loop {
             self.node = None;
             self.node_probe = None;
             self.node_ok = false;
+            self.node_watch = tipwatch::Watch::default();
             self.remote_source = remote.clone();
             self.ctx.netstate.lock().node_rpc = None;
         }
@@ -563,6 +566,7 @@ impl Loop {
                 match checked {
                     Ok((rpc, st)) => {
                         self.node_ok = st.synced;
+                        self.watch_node(&id, &st);
                         self.ctx.progress.lock().node = Some(st);
                         let mut ns = self.ctx.netstate.lock();
                         ns.node_rpc = Some(rpc);
@@ -585,6 +589,14 @@ impl Loop {
             self.ctx.netstate.lock().node_rpc = None;
         }
         if kyoto { Feeder::Kyoto } else { Feeder::Servers }
+    }
+
+    /// The single "may be behind" alert from your node's own report: no server is asked.
+    fn watch_node(&mut self, id: &str, st: &NodeStatus) {
+        let behind = tipwatch::node_behind(st.blocks, st.headers, st.tip_time, self.ctx.net != BNetwork::Regtest, now_secs());
+        if tipwatch::judge_node(&mut self.node_watch, behind.is_some(), st.initial_sync, now_secs()) == Seen::AuthorityBehind {
+            self.alert(id, "authority_behind", format!("your node {}", behind.unwrap_or_default()));
+        }
     }
 
     /// Hands the chain to another feeder: the header chain stays, the old feeder stops.
@@ -2005,7 +2017,7 @@ impl Loop {
                 self.scan_wider();
             }
             // Without routes, as when the node module wasn't up at open, ask again soon.
-            let none = self.ctx.routes_src.is_some() && self.ctx.netstate.lock().routes.every().is_empty();
+            let none = self.ctx.routes_src.is_some() && !self.ctx.netstate.lock().routes.has_entries();
             let due = if none { Duration::from_secs(15) } else { ROUTES_EVERY };
             if self.ctx.reload_routes.swap(false, Ordering::SeqCst) || self.last_routes.elapsed() >= due {
                 self.reload_routes();
@@ -2120,6 +2132,7 @@ pub fn spawn(ctx: Ctx, authority: ChainAuthority) -> std::io::Result<std::thread
             node_rescans: 0,
             node_ok: false,
             node_probe: None,
+            node_watch: tipwatch::Watch::default(),
             remote_source: None,
             node_gap,
             clients: HashMap::new(),
