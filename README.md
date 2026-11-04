@@ -656,11 +656,14 @@ loopback stand in for two operators. `chain.sh pruned` adds a pruned node (`-pru
 it. `nix build .#regtest-chain` packages the script with bitcoind and electrs.
 `LISTEN=0.0.0.0` puts the P2P and Electrum ports on the LAN for a wallet on another machine, `HOST`
 is the address `peers` and `electrum` print, and `WHITELIST` gives a subnet download,noban as
-loopback has; RPC stays on loopback.
+loopback has; RPC stays on loopback. The recipe takes bitcoind and electrs from the nixpkgs
+`regtest.yml` pins (Core 31.1, electrs 0.11.0): electrs 0.12 drops `--daemon-p2p-addr`, which
+`chain.sh` passes, so the registry's `nixpkgs#electrs` no longer starts.
 
 ```bash
-export BITCOIND=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind
-export ELECTRS=$(nix build nixpkgs#electrs --no-link --print-out-paths)/bin/electrs
+pkgs=github:NixOS/nixpkgs/39ad350a0602fa0a58a544344e3e9187526ea45c
+export BITCOIND=$(nix build "$pkgs#bitcoind" --no-link --print-out-paths)/bin/bitcoind
+export ELECTRS=$(nix build "$pkgs#electrs" --no-link --print-out-paths)/bin/electrs
 export CHAIN_DIR=/tmp/btc-chain REGTEST_CHAIN=$PWD/tools/regtest/chain.sh
 export REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE=$CHAIN_DIR/bitcoind/regtest/.cookie
 tools/regtest/chain.sh prepare
