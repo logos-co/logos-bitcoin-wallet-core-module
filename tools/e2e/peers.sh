@@ -14,7 +14,7 @@ source "$HERE/common.sh"
 NODE_REPO="${NODE_MODULE:-$HOME/repos/logos-bitcoin-node-module}"
 
 build_all
-[ -n "${SKIP_BUILD:-}" ] || nix build "$NODE_REPO#install" -o result-node
+[ -n "${SKIP_BUILD:-}" ] || { nix build "$NODE_REPO#install" -o result-node; nix build "$TOR#install" -o result-tor; }
 PROXY="$(cargo build --release --no-default-features --example p2p_proxy --manifest-path "$REPO/rust-lib/Cargo.toml" \
   --message-format=json 2>/dev/null | python3 -c "
 import sys, json
@@ -24,8 +24,8 @@ for l in sys.stdin:
 node() { call bitcoin_node_module "$@"; }
 port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 
-step "Lay out the session with bitcoin_node_module"
-lay_out result-node
+step "Lay out the session with bitcoin_node_module and its tor_module"
+lay_out result-node result-tor
 
 step "A fresh regtest chain; four peers on loopback, and the follower's front gossiping them"
 "$CHAIN" stop > /dev/null 2>&1 || true

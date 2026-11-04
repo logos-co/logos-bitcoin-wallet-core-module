@@ -153,10 +153,10 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   shown as `status.node.prunedGap: { from, below, heights, via, resolved }`, and scanned
   elsewhere: by the history server's next full scan when one is enabled, else by Kyoto, which
   holds the chain from the gap's first block until it has scanned past it, then hands it back.
-  With neither, `via` stays null. A pruned node without filters skips the blocks below its prune
+  With neither, `via` stays null; while your node is asked alone (Routes) that is always so. A pruned node without filters skips the blocks below its prune
   height the same way, with `heights` empty.
 - Broadcasts go through `sendrawtransaction` while the node is the authority; fees come from
-  `estimatesmartfee` and `getnetworkinfo`'s relay fee.
+  `estimatesmartfee` and `getnetworkinfo`'s relay fee, and from nothing else while it is asked alone.
 - `bitcoind_module` serves `getblockcount`, `getrawtransaction` (the mempool's transactions),
   `getblockfilter`, `getblockfrompeer` and `getpeerinfo` since its eece3b9. From an older module,
   `getblockcount` is answered from `getblockchaininfo` and `getrawtransaction` reads as "not
@@ -444,6 +444,12 @@ pass count for nothing. Checked headers more than 2 above the authority for 30 m
 be held back. They are never adopted. With no server enabled, "Stalled" (a tip over an hour old)
 says the same. A source is marked suspect only by the checks on its answers, never by the watch.
 
+Your node, asked alone, is judged from its own `getblockchaininfo` on each status read (every
+30 s): more than 2 headers past its blocks, or (not on regtest) a last block 90 minutes old, for
+30 minutes raises the same `authority_behind` alert once, with the node's id as `source` and the
+reason in `detail` (`your node has had no new block for 120 minutes`). Never
+during its first sync, which `status.node.initialSync` shows.
+
 ## Sends
 
 `build_send` uses BDK's TxBuilder with confirmed coins only, leaving out coins too small to spend at
@@ -537,8 +543,11 @@ broadcast, check, peers, torUse, kyotoSplit }`, each role `[{ id, kind, url, ope
 tor|direct|onion, credentials?, certSha256?, userAdded? }]`. A `local` entry in `chain` makes the local node an
 authority, a `kyoto` entry Kyoto, with `peers` as its peers (`{ peer, source, ok, services }`, or plain
 `host:port`, which keeps the core's own rules; `services` a decimal string); `local` and `kyoto` in `broadcast` put
-them ahead of the servers there. `torUse` is `all`, `identifying` or `none`; `none` drops the
-proxy whatever the table says. In `identifying`, `kyotoSplit: { chain: { route: direct, peers },
+them ahead of the servers there. A `local` or `rpc` entry in `chain` is your node, asked alone:
+every server and Kyoto in the table are left out of every role, whatever an older node module
+lists, so no Electrum server is asked for fees, tips, headers or history. `torUse` is `all`,
+`identifying` or `none`; `none` drops the proxy whatever the table says, unless the `rpc` entry is
+routed `tor` or `onion` (your node's own Tor switch). In `identifying`, `kyotoSplit: { chain: { route: direct, peers },
 tor: { route: onion, peers } }` replaces Kyoto's route and peers with `chain`'s, and its errands go
 to `tor`'s; with no proxy the split is down rather than half of it running (Kyoto, above). Tor and onion routes go through the `socks5h://` proxy with SOCKS
 credentials per server, so each gets its own circuit; with no proxy they are down, never reached
@@ -656,11 +665,14 @@ loopback stand in for two operators. `chain.sh pruned` adds a pruned node (`-pru
 it. `nix build .#regtest-chain` packages the script with bitcoind and electrs.
 `LISTEN=0.0.0.0` puts the P2P and Electrum ports on the LAN for a wallet on another machine, `HOST`
 is the address `peers` and `electrum` print, and `WHITELIST` gives a subnet download,noban as
-loopback has; RPC stays on loopback.
+loopback has; RPC stays on loopback. The recipe takes bitcoind and electrs from the nixpkgs
+`regtest.yml` pins (Core 31.1, electrs 0.11.0): electrs 0.12 drops `--daemon-p2p-addr`, which
+`chain.sh` passes, so the registry's `nixpkgs#electrs` no longer starts.
 
 ```bash
-export BITCOIND=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind
-export ELECTRS=$(nix build nixpkgs#electrs --no-link --print-out-paths)/bin/electrs
+pkgs=github:NixOS/nixpkgs/39ad350a0602fa0a58a544344e3e9187526ea45c
+export BITCOIND=$(nix build "$pkgs#bitcoind" --no-link --print-out-paths)/bin/bitcoind
+export ELECTRS=$(nix build "$pkgs#electrs" --no-link --print-out-paths)/bin/electrs
 export CHAIN_DIR=/tmp/btc-chain REGTEST_CHAIN=$PWD/tools/regtest/chain.sh
 export REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE=$CHAIN_DIR/bitcoind/regtest/.cookie
 tools/regtest/chain.sh prepare
@@ -880,12 +892,14 @@ on that node for the invalidated block, and stops answering.
 `signer_manager_module`, `evm_keystore_cli` (custodian) and `evm_signer_cli` (approver), an isolated
 HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
 
-- `logosctl.sh`: the gate refusing the host, an open decided by the custodian, a receive, a send
-  approved by the approver, a close and an unload;
-- `device.sh`: a device account, the manager's `mock_device_signer` fixture, opened by its id
-  (`mock-segwit`) under a data password the custodian sets at the first open; a receive, a send the
-  approver confirms with no password and the device confirms, and a reopen that refuses a wrong
-  data password and finds the same database;
+- `logosctl.sh`: the gate refusing the host, an open the approver consents to (only that consent
+  carries the seed the core takes its keys by), a receive, a send approved by the approver, a close
+  and an unload;
+- `device.sh`: a device account, the manager's `mock_device_signer` fixture, which enrolls its
+  seed as a wallet of its own (the keystore imports nothing), opened by its id (`mock-segwit`) with
+  the approver's consent; a receive, a send the approver confirms with no password and the device
+  confirms, and after a lock, a reopen that waits until the device unlocks the wallet and finds the
+  same database;
 - `unload-spike.sh`: spike 3, `RUNS` unloads (20) each while Kyoto syncs headers, downloads
   filters, and idles, its peers slowed through `p2p_proxy` mode files; every cycle reopens the
   database (no reset, the first payment there);
@@ -893,19 +907,19 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
   authority: a coinbase received and matured, a send through its `sendrawtransaction`, confirmed,
   then `set_birthday`, whose rescan reads the node's block filters over IPC and fetches only the
   blocks they match;
-- `pins.sh`: the real `bitcoin_node_module` routing regtest: Kyoto's peers through
-  `set_own_peers`, and through `set_sources` a self-signed `ssl://` front for electrs
-  (`examples/tls_front.rs`, a version 1 certificate) pinned with `certSha256`, plus a plain
-  `tcp://` electrs on loopback. The core's `regtest.json` names no server. A payment shows pending
-  from the front, reached by its pin, and confirms; `sources_status` marks the front encrypted and
-  the plain one not. Once `set_source` pins another certificate the core refuses the front, and
-  takes it back with the right pin;
-- `peers.sh`: the real `bitcoin_node_module`'s peer book. Kyoto goes direct on regtest
-  (`set_source kyoto {"tor":false}`); through the person's own peer, the follower behind a
-  `p2p_proxy` front that gossips four peers on loopback, the core reports them and the book keeps
-  them, learned. With no own peer Kyoto dials the book, two a start (one gossiper), and each start
-  is cut once it syncs, so it dials its second peer: the reports turn the good peer `ok` and first,
-  and the book skips a failing one after three failures in a row.
+- `pins.sh`: the real `bitcoin_node_module`, with the `tor_module` its manifest requires, routing
+  regtest: Kyoto's peers through `set_own_peers`, and through `set_sources` a self-signed `ssl://`
+  front for electrs (`examples/tls_front.rs`, a version 1 certificate) pinned with `certSha256`,
+  plus a plain `tcp://` electrs on loopback. The core's `regtest.json` names no server. A payment
+  shows pending from the front, reached by its pin, and confirms; `sources_status` marks the front
+  encrypted and the plain one not. Once `set_source` pins another certificate the core refuses the
+  front, and takes it back with the right pin;
+- `peers.sh`: the real `bitcoin_node_module`'s peer book, `tor_module` laid out beside it. Kyoto
+  goes direct on regtest (`set_source kyoto {"tor":false}`); through the person's own peer, the
+  follower behind a `p2p_proxy` front that gossips four peers on loopback, the core reports them and
+  the book keeps them, learned. With no own peer Kyoto dials the book, two a start (one gossiper),
+  and each start is cut once it syncs, so it dials its second peer: the reports turn the good peer
+  `ok` and first, and the book skips a failing one after three failures in a row.
 
 Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of 20 unloads within
 2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians

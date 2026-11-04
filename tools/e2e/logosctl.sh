@@ -1,7 +1,8 @@
 #!/bin/bash
 # The module under a logosctl daemon, as the keystore handoff's headless steps run it: the real
-# keystore_module and signer_manager_module, evm_keystore_cli deciding the open as custodian,
-# evm_signer_cli approving the send as approver, and this core as the requester, on regtest.
+# keystore_module and signer_manager_module, evm_keystore_cli importing the wallet as custodian,
+# evm_signer_cli consenting to the open and approving the send as approver, and this core as the
+# requester, on regtest.
 #   WORK=<dir> tools/e2e/logosctl.sh
 # Env: WORK (required: builds, the session, an isolated HOME and the chain go there), BITCOIND,
 # ELECTRS (as for tools/regtest/chain.sh), SKIP_BUILD=1 to reuse WORK's builds.
@@ -28,7 +29,7 @@ step "Load the core; regtest.json gives it the loopback servers"
 load_core "$REPO/tools/regtest/regtest.json"
 echo "persistence: $PERSIST"
 
-step "Open: the core asks the manager; the custodian decides"
+step "Open: the core asks the manager; the approver consents"
 T0=$(ms)
 open_approved '{"network":"regtest","family":"bitcoin"}' | tee opened.json; echo
 until_true 'v["synced"] is True' "$CORE" status > /dev/null

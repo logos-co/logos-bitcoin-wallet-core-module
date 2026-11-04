@@ -16,7 +16,7 @@ CERT="$REPO/rust-lib/tests/data/pin/v1.der"; KEY="$REPO/rust-lib/tests/data/pin/
 PIN="$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$CERT")"
 
 build_all
-[ -n "${SKIP_BUILD:-}" ] || nix build "$NODE_REPO#install" -o result-node
+[ -n "${SKIP_BUILD:-}" ] || { nix build "$NODE_REPO#install" -o result-node; nix build "$TOR#install" -o result-tor; }
 FRONT="$(cargo build --release --no-default-features --example tls_front --manifest-path "$REPO/rust-lib/Cargo.toml" \
   --message-format=json 2>/dev/null | python3 -c "
 import sys, json
@@ -25,8 +25,8 @@ for l in sys.stdin:
     if d.get('reason') == 'compiler-artifact' and d['target']['name'] == 'tls_front' and d.get('executable'): print(d['executable'])")"
 node() { call bitcoin_node_module "$@"; }
 
-step "Lay out the session with bitcoin_node_module"
-lay_out result-node
+step "Lay out the session with bitcoin_node_module and its tor_module"
+lay_out result-node result-tor
 
 step "A fresh regtest chain, and a TLS front for its first electrs with a self-signed version 1 certificate"
 "$CHAIN" stop > /dev/null 2>&1 || true
