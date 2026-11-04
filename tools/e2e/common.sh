@@ -3,12 +3,12 @@
 # Sourced with WORK set; REPO, CHAIN and CORE come from here.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHAIN="$REPO/tools/regtest/chain.sh"; export CHAIN_DIR="$WORK/chain"
-# The keystore, manager and keys CLI at their mains after the device-account opens (2026-10-10).
+# The keystore side as the keys CLI's headless doctest pins it (2026-11-01).
 CLI=github:logos-co/logos-logoscore-cli/ca70bcdd9fc20434d423669652966e7fdd6148f0
-KEYSTORE=github:logos-co/logos-evm-keystore-module/1f3d62f306f0e4dc7e5d96d478f9770ab3713ce6
+KEYSTORE=github:logos-co/logos-evm-keystore-module/6ab1d08dfc45d0a472d156cf255bd47d79763a5b
 MANAGER=github:logos-co/logos-signer-manager-module/48c106c702446a99c529b1febfcdedf1261e7407
-KCLI=github:logos-co/logos-evm-keystore-cli/99b7af1f6fa02258c4de2275ed3a019c1235aaba
-SCLI=github:logos-co/logos-evm-signer-cli/07929a33ec2d44901a1335064960d4a718b13ebe
+KCLI=github:logos-co/logos-evm-keystore-cli/74bcbc526cea65a673202886a4c2475c2c3dbd27
+SCLI=github:logos-co/logos-evm-signer-cli/34bf8d6f4291b5ef3c6ab3d9958b0e5bfb7922b0
 CORE=bitcoin_wallet_core_module
 
 step() { printf '\n== %s\n' "$*"; }
@@ -84,18 +84,15 @@ load_core() {
   ctl module unload "$CORE"; sleep 1; ctl module load "$CORE"; sleep 1
 }
 
-# Opens `$1` (open_wallet params) with the custodian approving; prints the job's result.
+# Opens `$1` (open_wallet params) with the approver consenting in evm_signer_cli; prints the job's result.
+# Only an approver's consent carries the seed the core takes its keys by; the import left GROUP unlocked.
 open_approved() {
   local r oid orc handle
   r="$(call "$CORE" start_job open_wallet "$1")"
   oid="$(printf '%s' "$r" | js 'v["jobId"]')"; orc="$(printf '%s' "$r" | js 'v["receipt"]')"
   handle="$(until_true 'v.get("openHandle")' "$CORE" status | js 'v["openHandle"]')"
-  call evm_keystore_cli show_access "$handle" > shown.json
-  python3 -c "
-import json
-s = json.load(open('shown.json'))
-json.dump({'handle': s['handle'], 'bundle_id': s['bundle_id'], 'group': '$GROUP', 'password': 'btc-pw'}, open('decision.json', 'w'))"
-  call evm_keystore_cli approve_access @decision.json > /dev/null
+  call evm_signer_cli show_open "$handle" > shown.json
+  call evm_signer_cli approve_open "$handle" "$(js 'v["bundle_id"]' < shown.json)" "str:$GROUP" > /dev/null
   until_true 'v["state"] in ("done","failed","cancelled")' "$CORE" job_status "$oid" "$orc" > /dev/null
   call "$CORE" job_result "$oid" "$orc"
 }
