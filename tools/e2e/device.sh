@@ -1,18 +1,17 @@
 #!/bin/bash
 # A device account's wallet under a logosctl daemon, on regtest: the real keystore_module and
-# signer_manager_module, the manager's mock_device_signer fixture as the device, evm_keystore_cli
-# setting the account's data password at its first open, and the device confirming the send.
-# The account opens by the id the manager lists (`mock-segwit`), not a keystore group.
+# signer_manager_module, the manager's mock_device_signer fixture as the device enrolling its seed,
+# evm_signer_cli consenting to the open, the device confirming the send and unlocking its wallet.
+# The account opens by the id the manager lists (`mock-segwit`), not a keystore group. The keystore
+# imports nothing, so the device's seed is a wallet of its own.
 #   WORK=<dir> tools/e2e/device.sh
 # Env: as tools/e2e/logosctl.sh; chain.sh's port variables move the chain off its defaults.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${WORK:?set WORK to a scratch directory}"; mkdir -p "$WORK"; cd "$WORK"
 source "$HERE/common.sh"
-# The mains a device account opens with (data password, origins): keystore, manager, its fixture.
-KEYSTORE=github:logos-co/logos-evm-keystore-module/40633a919d0299eca5c4511971191c8a3dd173c4
-MANAGER=github:logos-co/logos-signer-manager-module/48c106c702446a99c529b1febfcdedf1261e7407
-DEVICE="$MANAGER?dir=doctests/mock-device"
+# The manager's fixture where it can enroll its seed (`enroll`), so an approver can open its account.
+DEVICE="github:logos-co/logos-signer-manager-module/2052aaab41df190bd33e67b8f28bf4280d3e61ac?dir=doctests/mock-device"
 ACCOUNT=mock-segwit
 PEOPLE='"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]'
 
@@ -29,47 +28,27 @@ rm -rf "$CHAIN_DIR"
 IFS=, read -r -a EP <<< "${ELECTRUM_PORTS:-60601,60611}"
 printf '{"electrum": ["tcp://127.0.0.1:%s", "tcp://127.0.0.1:%s"], "pollSecs": 1}\n' "${EP[0]}" "${EP[1]}" > regtest.json
 
-step "Start the daemon and the keystore side; the device joins the manager's signers"
-keystore_side
+step "Start the daemon and the keystore side; the device joins the manager's signers and enrolls its seed"
+keystore_side bare
 ctl module load mock_device_signer
 sleep 1
 call signer_manager_module configure "{$PEOPLE,\"signers\":[\"keystore_module\",\"mock_device_signer\"]}" > /dev/null
 until_true '[a for a in v["accounts"] if a["id"] == "'"$ACCOUNT"'" and a["signer"] == "mock_device_signer"]' signer_manager_module accounts \
   | js '[a for a in v["accounts"] if a["id"] == "'"$ACCOUNT"'"][0]'
+call mock_device_signer enroll "Mock device" | tee enrolled.json; echo
+js 'v["ok"] and v["new"] and v["unlocked"]' < enrolled.json | grep -qx True
+SEED="$(js 'v["seed"]' < enrolled.json)"; GROUP="$ACCOUNT"
 
 step "Load the core; regtest.json gives it the loopback servers"
 load_core "$WORK/regtest.json"
 
-# Opens the device account; decides with `$1` (extra decision fields), then `$2` if given.
-device_open() {
-  local r oid orc handle d
-  r="$(call "$CORE" start_job open_wallet "{\"network\":\"regtest\",\"group\":\"$ACCOUNT\"}")"
-  oid="$(printf '%s' "$r" | js 'v["jobId"]')"; orc="$(printf '%s' "$r" | js 'v["receipt"]')"
-  handle="$(until_true 'v.get("openHandle")' "$CORE" status | js 'v["openHandle"]')"
-  call evm_keystore_cli show_access "$handle" > shown.json
-  for d in "$@"; do
-    python3 -c "
-import json, sys
-s = json.load(open('shown.json'))
-d = {'handle': s['handle'], 'bundle_id': s['bundle_id']}
-d.update(json.loads(sys.argv[1]))
-json.dump(d, open('decision.json', 'w'))" "$d"
-    call evm_keystore_cli approve_access @decision.json >> decisions.log 2>&1 || true; echo >> decisions.log
-  done
-  cat decisions.log >&2
-  until_true 'v["state"] in ("done","failed","cancelled")' "$CORE" job_status "$oid" "$orc" > /dev/null
-  call "$CORE" job_result "$oid" "$orc"
-}
-
-step "Open the device's account by its id; the custodian sets its data password"
-: > decisions.log
-device_open '{"password":"data-pw","birthday":"2021-11-14"}' | tee opened.json; echo
+step "Open the device's account by its id; the approver consents, the wallet unlocked since its enroll"
+open_approved "{\"network\":\"regtest\",\"group\":\"$ACCOUNT\"}" | tee opened.json; echo
 python3 -c "
 import json; r = json.load(open('opened.json'))['result']
 assert (r['group'], r['family'], r['created']) == ('$ACCOUNT', 'bitcoin', True), r"
 ls -d "$PERSIST"/*/regtest/"$ACCOUNT" 2>/dev/null || find session home -type d -name "$ACCOUNT" -path '*regtest*'
 until_true 'v["synced"] is True and v["group"] == "'"$ACCOUNT"'"' "$CORE" status | js '{k: v[k] for k in ("state", "group", "family", "birthday", "birthdaySource")}'
-call evm_keystore_cli device_wallets
 
 step "Receive and confirm"
 ADDR="$(call "$CORE" next_address | js 'v["address"]')"
@@ -96,11 +75,25 @@ TXID="$(js 'v["result"]["txid"]' < sent.json)"
 "$CHAIN" mine 1
 until_true 'any(r["txid"] == "'"$TXID"'" and r["state"] == "confirmed" for r in v["rows"])' "$CORE" history 0 | js '[r for r in v["rows"] if r["txid"] == "'"$TXID"'"][0]'
 
-step "Reopen: a wrong data password is refused, the right one opens the same database"
+step "Lock, reopen: the open waits until the device unlocks its wallet, then finds the same database"
 job close_wallet '{}'; echo
-: > decisions.log
-device_open '{"password":"wrong"}' '{"password":"data-pw"}' | tee reopened.json; echo
-grep -q wrong_secret decisions.log
+call evm_signer_cli lock_wallets '{}'; echo
+R="$(call "$CORE" start_job open_wallet "{\"network\":\"regtest\",\"group\":\"$ACCOUNT\"}")"
+OID="$(printf '%s' "$R" | js 'v["jobId"]')"; ORC="$(printf '%s' "$R" | js 'v["receipt"]')"
+OH="$(until_true 'v.get("openHandle")' "$CORE" status | js 'v["openHandle"]')"
+OB="$(call evm_signer_cli show_open "$OH" | js 'v["bundle_id"]')"
+call evm_signer_cli approve_open "$OH" "$OB" "str:$GROUP" | tee refused.json; echo
+js 'v.get("code")' < refused.json | grep -qx locked
+WAY="$(call evm_signer_cli wallets | js '[w for w in v["wallets"] if w["seed"] == "'"$SEED"'"][0]["ways"][0]["id"]')"
+call evm_signer_cli unlock_wallet "{\"seed\":\"$SEED\",\"way\":\"$WAY\"}" > unlocked.json &
+UNLOCKING=$!
+KJOB="$(until_true 'v["unlocking"]' mock_device_signer screen | js 'v["unlocking"][0]')"
+call mock_device_signer press "$KJOB" confirm; echo
+wait "$UNLOCKING"; cat unlocked.json; echo
+js 'v["state"]' < unlocked.json | grep -qx done
+call evm_signer_cli approve_open "$OH" "$OB" "str:$GROUP"; echo
+until_true 'v["state"] in ("done","failed","cancelled")' "$CORE" job_status "$OID" "$ORC" > /dev/null
+call "$CORE" job_result "$OID" "$ORC" | tee reopened.json; echo
 python3 -c "
 import json; r = json.load(open('reopened.json'))['result']
 assert (r['group'], r['created'], r['reset']) == ('$ACCOUNT', False, False), r"

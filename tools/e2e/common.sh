@@ -59,7 +59,8 @@ lay_out() {
   export HOME="$WORK/home"
 }
 
-# The daemon, the keystore side configured, and the test phrase's wallet imported: sets GROUP.
+# The daemon, the keystore side configured, and the test phrase's wallet imported (sets GROUP),
+# unless `$1` is `bare`.
 keystore_side() {
   ctl daemon start --detach
   sleep 3
@@ -67,6 +68,7 @@ keystore_side() {
   sleep 2
   call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"],"managers":["signer_manager_module"]}' > /dev/null
   call signer_manager_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"],"signers":["keystore_module"]}' > /dev/null
+  [ "${1:-}" = bare ] && return 0
   printf '%s' 'btc-pw' > pw.txt
   printf '%s' '{"phrase":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about","family":"bitcoin","chain":"test","password":"btc-pw","label":"Regtest wallet"}' > btc.json
   call evm_keystore_cli import_bitcoin @btc.json > import.json

@@ -883,10 +883,11 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
 - `logosctl.sh`: the gate refusing the host, an open the approver consents to (only that consent
   carries the seed the core takes its keys by), a receive, a send approved by the approver, a close
   and an unload;
-- `device.sh`: a device account, the manager's `mock_device_signer` fixture, opened by its id
-  (`mock-segwit`) under a data password the custodian sets at the first open; a receive, a send the
-  approver confirms with no password and the device confirms, and a reopen that refuses a wrong
-  data password and finds the same database;
+- `device.sh`: a device account, the manager's `mock_device_signer` fixture, which enrolls its
+  seed as a wallet of its own (the keystore imports nothing), opened by its id (`mock-segwit`) with
+  the approver's consent; a receive, a send the approver confirms with no password and the device
+  confirms, and after a lock, a reopen that waits until the device unlocks the wallet and finds the
+  same database;
 - `unload-spike.sh`: spike 3, `RUNS` unloads (20) each while Kyoto syncs headers, downloads
   filters, and idles, its peers slowed through `p2p_proxy` mode files; every cycle reopens the
   database (no reset, the first payment there);
