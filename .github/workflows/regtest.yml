@@ -109,6 +109,13 @@ jobs:
           REGTEST_ELECTRUM=127.0.0.1:60601 REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
             cargo test --release --no-default-features --features test-hooks --locked --test shared_headers -- --ignored --nocapture
 
+      - name: Your node at an address is asked alone, and an Electrum server beside it is never dialled
+        run: |
+          cd rust-lib
+          REGTEST_RPC=http://127.0.0.1:18543 REGTEST_COOKIE="$CHAIN_DIR/bitcoind/regtest/.cookie" \
+          REGTEST_CHAIN="$GITHUB_WORKSPACE/tools/regtest/chain.sh" \
+            cargo test --release --no-default-features --features test-hooks --locked --test rpc -- --ignored --exact your_node_alone_dials_no_electrum_server --nocapture
+
       - name: Stop the chain
         if: always()
         run: tools/regtest/chain.sh stop

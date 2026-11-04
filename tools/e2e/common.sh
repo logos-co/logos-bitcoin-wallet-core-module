@@ -9,6 +9,8 @@ KEYSTORE=github:logos-co/logos-evm-keystore-module/6ab1d08dfc45d0a472d156cf255bd
 MANAGER=github:logos-co/logos-signer-manager-module/48c106c702446a99c529b1febfcdedf1261e7407
 KCLI=github:logos-co/logos-evm-keystore-cli/74bcbc526cea65a673202886a4c2475c2c3dbd27
 SCLI=github:logos-co/logos-evm-signer-cli/34bf8d6f4291b5ef3c6ab3d9958b0e5bfb7922b0
+# The tor_module bitcoin_node_module's manifest requires, as node-module 46d8209's flake.lock locks it.
+TOR=github:logos-co/logos-tor-module/6fba1edd753758930ce0cbc9a854be7863fd35e0
 CORE=bitcoin_wallet_core_module
 
 step() { printf '\n== %s\n' "$*"; }

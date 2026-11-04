@@ -155,6 +155,9 @@ pub struct NodeStatus {
     pub rescans: u32,
     pub pending_scan_remaining: usize,
     pub window: [u32; 2],
+    /// The time in the node's last block's header, for the tip watch.
+    #[serde(skip)]
+    pub tip_time: Option<u64>,
 }
 
 /// Matched blocks below a pruned node's prune height that neither it nor its peers gave.
@@ -183,7 +186,8 @@ pub fn status(c: &NodeClient, net: BNetwork) -> Result<NodeStatus, String> {
     let (blocks, headers) = (n("blocks"), n("headers"));
     let pruned = i["pruned"].as_bool().unwrap_or(false);
     let prune_height = i["pruneheight"].as_u64().filter(|_| pruned).map(|h| h as u32);
-    Ok(NodeStatus { blocks, headers, initial_sync, synced: !initial_sync && blocks + 1 >= headers, pruned, prune_height, ..Default::default() })
+    let tip_time = i["time"].as_u64();
+    Ok(NodeStatus { blocks, headers, initial_sync, synced: !initial_sync && blocks + 1 >= headers, pruned, prune_height, tip_time, ..Default::default() })
 }
 
 pub(crate) fn hash_at(c: &NodeClient, height: u32) -> Result<BlockHash, String> {

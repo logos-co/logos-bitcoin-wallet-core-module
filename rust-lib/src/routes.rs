@@ -187,7 +187,8 @@ pub struct Routes {
     pub poll_secs: u64,
     /// Kyoto's quorum on a test chain; the network's own elsewhere.
     pub kyoto_required: Option<u8>,
-    /// As the table says; `none` drops the proxy, so nothing goes through Tor.
+    /// As the table says; `none` drops the proxy, so nothing goes through Tor but your node at an
+    /// address routed through it.
     pub tor_use: Option<TorUse>,
 }
 
@@ -360,7 +361,9 @@ impl Routes {
             return Err(v["error"].as_str().unwrap_or("route_table refused").to_string());
         }
         let tor_use = v["torUse"].as_str().and_then(TorUse::parse);
-        let proxy = match v["proxy"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != "direct" && tor_use != Some(TorUse::None)) {
+        // Your node at an address keeps its own Tor switch whatever Use Tor for says.
+        let own_tor = v["chain"].as_array().is_some_and(|c| c.iter().any(|e| e["kind"] == "rpc" && matches!(e["route"].as_str(), Some("tor" | "onion"))));
+        let proxy = match v["proxy"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != "direct" && (tor_use != Some(TorUse::None) || own_tor)) {
             Some(p) => Some(Proxy::parse(p)?),
             None => None,
         };
@@ -370,12 +373,17 @@ impl Routes {
                 _ => Ok(vec![]),
             }
         };
-        let servers = |name: &str| -> Result<Vec<Source>, String> { Ok(entries(name)?.iter().filter_map(|e| resolve(e, proxy.as_ref())).filter(|s| s.kind != Kind::Rpc).collect()) };
         let kind = |e: &Entry, k: &str| e.kind.as_deref() == Some(k);
         let chain = entries("chain")?;
+        // While your node is on it is asked alone, even when an older node module lists more.
+        let own_node = chain.iter().any(|e| kind(e, "local") || kind(e, "rpc"));
+        let servers = |name: &str| -> Result<Vec<Source>, String> {
+            if own_node { return Ok(vec![]); }
+            Ok(entries(name)?.iter().filter_map(|e| resolve(e, proxy.as_ref())).filter(|s| s.kind != Kind::Rpc).collect())
+        };
         let (peers, listed, services) = parse_peers(v.get("peers"));
         let split = v.get("kyotoSplit").filter(|_| tor_use != Some(TorUse::None)).and_then(parse_split);
-        let kyoto = chain.iter().find(|e| kind(e, "kyoto")).map(|e| match &split {
+        let kyoto = chain.iter().find(|e| kind(e, "kyoto")).filter(|_| !own_node).map(|e| match &split {
             Some((route, (peers, listed, services), tor)) => {
                 let k = KyotoRoute { listed: listed.clone(), services: services.clone(), ..resolve_kyoto(&e.id, *route, peers.clone(), proxy.as_ref()) };
                 with_errands(k, ErrandRoute { peers: tor.clone(), max_delay: ERRAND_MAX_DELAY }, proxy.as_ref())
@@ -389,7 +397,7 @@ impl Routes {
             .filter_map(|e| match e.kind.as_deref() {
                 Some("local") => Some(Authority::Local),
                 Some("rpc") => Some(Authority::Rpc),
-                Some("kyoto") => Some(Authority::Kyoto),
+                Some("kyoto") if !own_node => Some(Authority::Kyoto),
                 _ => None,
             })
             .collect();
@@ -639,17 +647,20 @@ mod tests {
     }
 
     #[test]
-    fn the_local_node_comes_before_kyoto() {
+    fn your_node_is_asked_alone() {
+        // An older node module lists Kyoto and servers beside your node: the core leaves them out.
         let local = json!({"id": "local", "kind": "local", "url": "logos://bitcoind_module", "operator": "local", "route": "direct"});
         let kyoto = json!({"id": "kyoto", "kind": "kyoto", "url": "p2p://peer-list", "operator": "peers", "route": "direct"});
-        let reply = json!({"ok": true, "proxy": null, "chain": [local, kyoto], "broadcast": [local, kyoto], "fees": [local],
-            "history": [local, kyoto], "peers": ["192.168.1.20:8333"]})
+        let server = json!({"id": "e", "kind": "electrum", "url": "ssl://electrum.example:50002", "operator": "op", "route": "direct"});
+        let reply = json!({"ok": true, "proxy": null, "chain": [local, kyoto], "broadcast": [local, kyoto, server], "fees": [local, server, kyoto],
+            "history": [local, kyoto, server], "pending": [local, server], "check": [server], "peers": ["192.168.1.20:8333"]})
         .to_string();
         let r = Routes::from_table(&reply).unwrap();
         assert_eq!(r.local.as_deref(), Some("local"));
-        assert_eq!(r.broadcast_by, vec![Authority::Local, Authority::Kyoto]);
-        assert!(r.fees_local && r.history.is_empty() && r.chain.is_empty());
-        assert_eq!(r.kyoto.unwrap().down, None, "the user's own network needs no proxy");
+        assert_eq!(r.broadcast_by, vec![Authority::Local]);
+        assert!(r.fees_local && r.kyoto.is_none() && r.every().is_empty() && r.has_entries());
+        let k = Routes::from_table(&json!({"ok": true, "proxy": null, "chain": [kyoto], "peers": ["192.168.1.20:8333"]}).to_string()).unwrap();
+        assert_eq!(k.kyoto.unwrap().down, None, "the user's own network needs no proxy");
         // Tor routes without a proxy fail closed, and an empty list has no one to dial.
         assert!(resolve_kyoto("kyoto", Route::Tor, vec!["a:1".into()], None).down.is_some());
         assert!(resolve_kyoto("kyoto", Route::Direct, vec![], None).down.is_some());
@@ -719,5 +730,15 @@ mod rpc_tests {
         assert!(r.history.is_empty() && r.pending.is_empty() && r.fees.is_empty() && r.check.is_empty());
         assert_eq!(r.broadcast_by,vec![Authority::Rpc]);
         assert_eq!(r.every().len(),1);
+    }
+
+    #[test]
+    fn your_node_at_an_address_keeps_tor_when_use_tor_for_is_nothing() {
+        let rpc = |route: &str| serde_json::json!({"id":"rpc","kind":"rpc","url":"https://rpc.example","route":route});
+        let table = |route: &str| serde_json::json!({"torUse":"none","proxy":"socks5h://127.0.0.1:9050","chain":[rpc(route)]}).to_string();
+        let r = Routes::from_table(&table("tor")).unwrap();
+        assert!(r.proxy.is_some() && r.rpc.unwrap().down.is_none(), "its own switch says Tor");
+        let r = Routes::from_table(&table("direct")).unwrap();
+        assert!(r.proxy.is_none() && r.rpc.unwrap().down.is_none());
     }
 }
