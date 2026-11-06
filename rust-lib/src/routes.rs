@@ -179,7 +179,8 @@ pub struct Routes {
     /// The local node's estimatesmartfee is asked first.
     pub fees_local: bool,
     pub fees: Vec<Source>,
-    /// The authorities enabled for broadcast, tried before `broadcast`'s servers.
+    /// The authorities enabled for broadcast, tried before `broadcast`'s servers. Empty when the
+    /// node module says payments go through public servers (`localSends`), so none falls back to your node.
     pub broadcast_by: Vec<Authority>,
     pub broadcast: Vec<Source>,
     pub check: Vec<Source>,
@@ -363,7 +364,9 @@ impl Routes {
         let tor_use = v["torUse"].as_str().and_then(TorUse::parse);
         // Your node at an address keeps its own Tor switch whatever Use Tor for says.
         let own_tor = v["chain"].as_array().is_some_and(|c| c.iter().any(|e| e["kind"] == "rpc" && matches!(e["route"].as_str(), Some("tor" | "onion"))));
-        let proxy = match v["proxy"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != "direct" && (tor_use != Some(TorUse::None) || own_tor)) {
+        // With your node on, payments through public servers, over Tor whatever Use Tor for says.
+        let sends_public = v["localSends"] == "servers";
+        let proxy = match v["proxy"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != "direct" && (tor_use != Some(TorUse::None) || own_tor || sends_public)) {
             Some(p) => Some(Proxy::parse(p)?),
             None => None,
         };
@@ -378,7 +381,7 @@ impl Routes {
         // While your node is on it is asked alone, even when an older node module lists more.
         let own_node = chain.iter().any(|e| kind(e, "local") || kind(e, "rpc"));
         let servers = |name: &str| -> Result<Vec<Source>, String> {
-            if own_node { return Ok(vec![]); }
+            if own_node && !(sends_public && name == "broadcast") { return Ok(vec![]); }
             Ok(entries(name)?.iter().filter_map(|e| resolve(e, proxy.as_ref())).filter(|s| s.kind != Kind::Rpc).collect())
         };
         let (peers, listed, services) = parse_peers(v.get("peers"));
@@ -395,8 +398,8 @@ impl Routes {
         let broadcast_by = entries("broadcast")?
             .iter()
             .filter_map(|e| match e.kind.as_deref() {
-                Some("local") => Some(Authority::Local),
-                Some("rpc") => Some(Authority::Rpc),
+                Some("local") if !sends_public => Some(Authority::Local),
+                Some("rpc") if !sends_public => Some(Authority::Rpc),
                 Some("kyoto") if !own_node => Some(Authority::Kyoto),
                 _ => None,
             })
@@ -664,6 +667,27 @@ mod tests {
         // Tor routes without a proxy fail closed, and an empty list has no one to dial.
         assert!(resolve_kyoto("kyoto", Route::Tor, vec!["a:1".into()], None).down.is_some());
         assert!(resolve_kyoto("kyoto", Route::Direct, vec![], None).down.is_some());
+    }
+
+    #[test]
+    fn payments_through_public_servers_beside_your_node() {
+        // The node module lists your node last for an older core; `localSends` leaves it out.
+        let local = json!({"id": "local", "kind": "local", "url": "logos://bitcoind_module", "operator": "local", "route": "direct"});
+        let server = json!({"id": "e", "kind": "electrum", "url": format!("tcp://{}:110", onion()), "operator": "op", "route": "onion"});
+        let table = |sends: &str, tor_use: &str| {
+            json!({"ok": true, "proxy": "socks5h://127.0.0.1:9050", "torUse": tor_use, "localSends": sends, "chain": [local], "history": [local],
+                   "pending": [local], "fees": [local], "broadcast": [server, local], "check": []})
+            .to_string()
+        };
+        let r = Routes::from_table(&table("servers", "none")).unwrap();
+        assert!(r.broadcast_by.is_empty(), "no fallback to your node");
+        assert_eq!(r.broadcast.iter().map(|s| (s.id.as_str(), s.down.is_none())).collect::<Vec<_>>(), [("e", true)]);
+        assert!(r.proxy.is_some(), "over Tor whatever Use Tor for says");
+        assert!(r.history.is_empty() && r.local.as_deref() == Some("local"), "reads stay with your node");
+        let n = Routes::from_table(&table("node", "none")).unwrap();
+        assert_eq!((n.broadcast_by, n.broadcast.len(), n.proxy.is_none()), (vec![Authority::Local], 0, true));
+        let old = Routes::from_table(&json!({"ok": true, "proxy": null, "chain": [local], "broadcast": [server, local]}).to_string()).unwrap();
+        assert_eq!((old.broadcast_by, old.broadcast.len()), (vec![Authority::Local], 0), "an older node module: your node alone");
     }
 
     #[test]
