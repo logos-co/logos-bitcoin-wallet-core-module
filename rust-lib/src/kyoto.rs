@@ -292,9 +292,9 @@ pub struct Start {
 
 /// What a running client reports to the sync thread.
 pub enum Feed {
-    /// The wallet's transactions since the last update and Kyoto's chain, with the height a
-    /// restart scans from, the last filter checked, and whether that is the tip or a checkpoint.
-    Update { update: Box<Update>, scanned: Option<u32>, checked: Option<u32>, synced: bool },
+    /// The wallet's transactions since the last update and Kyoto's chain, with the last filter
+    /// checked, the matched blocks not applied yet, and whether that is the tip or a checkpoint.
+    Update { update: Box<Update>, checked: Option<u32>, pending: Vec<(u32, BlockHash)>, synced: bool },
     /// The share of filter headers and filters done, and Kyoto's header height.
     Progress { fraction: f32, height: u32 },
     Warning(String),
@@ -370,9 +370,10 @@ impl Client {
     /// Builds and starts a client for `wallet`, dialling `peers` on `route`, first ones first;
     /// `wake` is set when an update or a stop waits for the sync thread. It watches each
     /// keychain's revealed index plus `lookahead`. `snapshot` holds the headers from `start.from`
-    /// to `start.known_to`. With `report`, it feeds each dial's outcome and the peers' gossip.
+    /// to `start.known_to`, and `again` the matched blocks a stopped client hadn't applied, fetched
+    /// as if matched. With `report`, it feeds each dial's outcome and the peers' gossip.
     #[allow(clippy::too_many_arguments)]
-    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, lookahead: u32, report: bool, tor: &crate::errand::Status, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
+    pub fn start(wallet: &Wallet, route: &KyotoRoute, proxy: Option<&Proxy>, required: u8, peers: Vec<String>, start: Start, snapshot: Vec<Header>, again: Vec<(u32, BlockHash)>, lookahead: u32, report: bool, tor: &crate::errand::Status, wake: Arc<std::sync::atomic::AtomicBool>) -> Result<Client, String> {
         let net = wallet.network();
         let default_port = default_port(net);
         let mut dial = vec![];
@@ -438,13 +439,14 @@ impl Client {
             let r = requester.clone();
             updates.fetch_blocks_with(Arc::new(move |height, hash| -> Fetch { Box::pin(e.clone().block(r.clone(), height, hash)) }));
         }
+        updates.fetch_also(again);
         let widen = updates.widen_handle();
         // Why the stream ended, or none once the sync thread is gone.
         let stream = rt.spawn(async move {
             loop {
                 match updates.update().await {
                     Ok(u) => {
-                        if updated.send(Feed::Update { update: Box::new(u), scanned: updates.scanned(), checked: updates.checked(), synced: updates.synced() }).is_err() {
+                        if updated.send(Feed::Update { update: Box::new(u), checked: updates.checked(), pending: updates.pending(), synced: updates.synced() }).is_err() {
                             return None;
                         }
                         woken.store(true, std::sync::atomic::Ordering::SeqCst);
