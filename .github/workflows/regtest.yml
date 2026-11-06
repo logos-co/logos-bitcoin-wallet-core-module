@@ -81,7 +81,8 @@ jobs:
           for t in kyoto_is_the_authority_on_regtest kyoto_with_a_history_server \
                    kyoto_skips_a_matched_block_reorganized_away kyoto_restarts_a_client_whose_updates_ended \
                    kyoto_asks_again_when_a_scan_never_ran kyoto_identifying_fetches_matched_blocks_over_tor \
-                   kyoto_identifying_waits_for_tor kyoto_none_makes_no_socks_connection; do
+                   kyoto_identifying_waits_for_tor kyoto_identifying_restart_resumes_past_a_pending_block \
+                   kyoto_none_makes_no_socks_connection; do
             cargo test --release --no-default-features --features test-hooks --locked --test kyoto -- --ignored --exact "$t" --nocapture
           done
 

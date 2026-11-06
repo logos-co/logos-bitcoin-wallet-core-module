@@ -1,7 +1,7 @@
 # logos-bitcoin-wallet-core-module
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
-bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_kyoto` 0.18.1 with five patches and
+bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_kyoto` 0.18.1 with seven patches and
 `bip157` 0.8.1 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.
@@ -150,9 +150,13 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
   blocks (`getpeerinfo`'s `NETWORK`) with `getblockfrompeer`, and read once it arrives (20 s a
   peer). The node asks a peer it is already connected to, so its own proxy setting (`-proxy`,
   `-onlynet=onion`) holds. When no peer sends it, the block is a gap, kept in `core_meta` and
-  shown as `status.node.prunedGap: { from, below, heights, via, resolved }`, and scanned
-  elsewhere: by the history server's next full scan when one is enabled, else by Kyoto, which
-  holds the chain from the gap's first block until it has scanned past it, then hands it back.
+  shown as `status.node.prunedGap: { from, below, heights, via, resolved, unscannedFrom }`, and
+  scanned elsewhere: by the history server's next full scan when one is enabled, else by Kyoto,
+  which holds the chain until it has scanned past the gap, then hands it back. Kyoto fetches the
+  matched blocks (`heights`) as it would blocks its filters matched, over Tor errands under
+  `identifying`, and checks filters from the first block the node had none for (`unscannedFrom`),
+  else from the prune height: where its filters start never depends on a matched block. A block
+  that lands before its filters start counts as found.
   With neither, `via` stays null; while your node is asked alone (Routes) that is always so. A pruned node without filters skips the blocks below its prune
   height the same way, with `heights` empty.
 - Broadcasts go through `sendrawtransaction` while the node is the authority; fees come from
@@ -167,7 +171,7 @@ bitcoincore_rpc's `RpcApi` (`node.rs`), and follows it with bdk_bitcoind_rpc's `
 
 ### Kyoto
 
-bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches each, below
+bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with seven and six patches, below
 (`kyoto.rs`, `peers.rs`, `errand.rs`):
 
 - Peers come from the route table's `peers`, `{ peer, source: list|learned|own, ok }`: the node
@@ -208,8 +212,12 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches eac
     filter matched, its merkle root and witness commitment must verify, and it must still be
     Kyoto's block at that height, else it is skipped. Six run at once, oldest first;
   - a failed errand goes to another onion peer on a new circuit, backing off to a minute, never
-    direct. While Tor's SOCKS port doesn't answer, `status.kyoto.tor.waiting` is true and the scan
-    holds below the block (bdk_kyoto patch 6), so a restart checks its filter again;
+    direct. While Tor's SOCKS port doesn't answer, `status.kyoto.tor.waiting` is true and
+    `status.kyoto.scanned` holds below the block (bdk_kyoto patch 6). The core stores the last
+    filter checked (`kyoto_scanned`, `status.kyoto.checked`) and the matched blocks still to fetch
+    (`kyoto_pending`, bdk_kyoto patch 7): a restart, on its own, on a stall, on close or on quit,
+    resumes filters 8 below the last one checked and fetches those blocks again as errands, so the
+    direct peers can't tell from where it resumes which block is pending;
   - a send goes the same way, three errands at once, each to an onion peer and on a circuit of its
     own: `inv`, the transaction when the peer asks for it, then a ping so it is taken before the
     close. The first pong makes it `requested`, as through Kyoto, within 90 s: each errand needs a
@@ -255,9 +263,11 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches eac
   used addresses a gap-limit scan reaches count, from index 0 and never past `gapLimit` unused in a row:
   the public test phrase also has payments far beyond (testnet4 index 313 after 151), which a
   window happens to hold now and then, and which would otherwise widen it again and again.
-- A start begins 8 blocks below the last height whose filters were scanned. A first sync hands over
-  what it found every 144 filters (patch 2), and that height is stored (`status.kyoto.scanned`), so
-  a run that loses its peers goes on from there. Each start fetches every filter header from its own
+- A start begins 8 blocks below the last height whose filters were checked, whatever matched, and
+  holds the headers from the block before the first matched block still to fetch, if lower, so that
+  block can be checked against Kyoto's chain. A first sync hands over what it found every 144 filters
+  (patch 2), and that height is stored (`status.kyoto.checked`), so a run that loses its peers goes
+  on from there. Each start fetches every filter header from its own
   start to the tip before the first filter, which over Tor can take most of a run whose peers drop
   within a quarter hour; 144 filters then take about half a minute, so such a run still keeps its
   work, where at 2,016 many kept none. A first start begins at the block before the birthday when the header
@@ -295,10 +305,12 @@ bdk_kyoto 0.18.1 and bip157 0.8.1 (published from af976b2), with six patches eac
   peer, and once its node is dropped those tasks spin on a closed channel for up to the two-hour
   connection limit (135% CPU after one rebuild, before this).
 - `status.kyoto`: `{ running, phase: syncing|filter_headers|filters|synced, quorum, onePeerDecides,
-  headers, progress, estimatedTip, scanned, connected, dialled, skipped, restarts, rebuilds, rescans, window,
-  lastWarning, lastStop, lastConflict, gossiped, learned, tor }`. `scanned` is the last block whose filters
-  were checked against the wallet, as stored, null before the first and after a scan starts over: the
-  header chain (`walletTip` too) reaches the tip long before a scan from the birthday does. `progress` weighs filter headers a quarter and
+  headers, progress, estimatedTip, scanned, checked, connected, dialled, skipped, restarts, rebuilds, rescans,
+  window, lastWarning, lastStop, lastConflict, gossiped, learned, tor }`. `scanned` is the last block whose filters
+  were checked against the wallet with every matched block up to it applied, as stored, null before the
+  first and after a scan starts over: the header chain (`walletTip` too) reaches the tip long before a
+  scan from the birthday does. `checked` is the last filter checked, as stored, above `scanned` while a
+  matched block is still being fetched over Tor. `progress` weighs filter headers a quarter and
   filters the rest, from the heights Kyoto reports since its start: filter headers by finished
   batches, filters one by one, so a catch-up within one batch reads `syncing` until its filter
   headers are in; `headers` is Kyoto's best header; `window` is the highest index the client
@@ -355,7 +367,7 @@ without Nix (`--update` rewrites the vendored tree). Run against the published c
 fails: that is the bug. The quorum patch went upstream as Kyoto #612, closed for 0.8.0's fix; the
 others have not been sent.
 
-`patches/bdk_kyoto/` holds six on bdk_kyoto 0.18.1, in the files `tools/kyoto/patch-bdk_kyoto.sh`
+`patches/bdk_kyoto/` holds seven on bdk_kyoto 0.18.1, in the files `tools/kyoto/patch-bdk_kyoto.sh`
 allows (`src/lib.rs`, `src/builder.rs`, and for patch 5 the manifest and the examples):
 
 1. matched blocks applied oldest first: the published crate drains them newest first
@@ -382,7 +394,11 @@ allows (`src/lib.rs`, `src/builder.rs`, and for patch 5 the manifest and the exa
    so a restart checks its filter again, and `synced()` is false while any is pending. At the tip,
    each fetch that lets blocks apply makes an update. `checked()` is the last filter checked,
    held back or not. Blocking the subscriber on a Tor fetch
-   instead would queue the direct filters in bip157's unbounded channel, about 20 kB each.
+   instead would queue the direct filters in bip157's unbounded channel, about 20 kB each;
+7. `UpdateSubscriber::pending()`: the matched blocks not applied yet, and `fetch_also(blocks)`, which
+   fetches given blocks as if their filters matched. The core stores the first with `checked()`, so a
+   restart resumes filters from there and fetches those blocks again: resuming below `scanned()`
+   told the direct peers where a pending block was (resume + 8 or 9).
 
 0.18.1 indexes every script the filters are checked against (`extend_index_to_policy`), which our
 patch 3 on 0.18.0 did: with a recovery lookahead past the wallet's own 25, a matched block's
@@ -639,7 +655,8 @@ take the wallet's chain, or until a wallet from before it writes again), `core_o
 and unchecked ones below the chain's start), `core_exposure`, `core_suspects`, `core_reported`,
 `core_sends` (state `broadcasting`, `sent`, `replaced`, `confirmed`, `conflicted`, `abandoned` or
 `failed`) and `core_meta`, which keeps the gap limit (`gap_limit`), the receive addresses' labels (`receive_labels`, `{ "<index>": "<label>" }`), the chain's checkpoint (`chain_base`) and its last stored tip (`chain_tip`), the last
-heights Kyoto and the node scanned (`kyoto_scanned`, `node_scanned`), the indices a scan from the
+heights Kyoto and the node scanned (`kyoto_scanned`, Kyoto's last filter checked; `node_scanned`), Kyoto's
+matched blocks still to fetch then (`kyoto_pending`, `height:hash` by commas), the indices a scan from the
 birthday watched (`kyoto_window`, `node_window`), a pruned node's gap (`node_gap`), Kyoto's peer
 failures on `regtest.json`'s peers (`kyoto_peers`) and whom each learned peer the wallet reported
 is credited to (`kyoto_learned_from`). `scan_rules` marks the scan rules a wallet was scanned under: a wallet
@@ -781,7 +798,10 @@ sent no block `getdata`, no `inv` and no `tx`, the onion side no `getcfilters`, 
 `getheaders`, and every errand comes with credentials of its own. `kyoto_identifying_waits_for_tor`
 takes the SOCKS port down before a payment's block: `scanned` holds at the block before it for
 10 s, `tor.waiting` is true and nothing asks a direct peer for it; with the port back the payment
-confirms. `kyoto_none_makes_no_socks_connection` sets `none` with a proxy configured: nothing
+confirms. `kyoto_identifying_restart_resumes_past_a_pending_block` does the same, mines 20 more
+blocks, waits for `checked` at the tip, closes and reopens the wallet: every filter request the
+direct peers get after the reopen starts above the paying block (the stored height before this
+change resumed 8 below it), and the payment still confirms once the port is back. `kyoto_none_makes_no_socks_connection` sets `none` with a proxy configured: nothing
 connects to it, and blocks and the send go to the direct peers. `kyoto_first_sync_on_a_long_chain`
 times a first sync of `KYOTO_BLOCKS` blocks; `kyoto_on_a_live_network` restores the test phrase
 on signet or testnet4 (`LIVE_NETWORK`, signet by default) with a birthday (`LIVE_BIRTHDAY`) through
