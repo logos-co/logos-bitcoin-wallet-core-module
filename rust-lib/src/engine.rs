@@ -1091,10 +1091,11 @@ impl Engine {
     /// Sends through the broadcast route: the local node while it is the authority, then Kyoto's
     /// peers, then the servers enabled for broadcast; the first that takes it.
     fn broadcast(&self, tx: &Transaction) -> Result<(Outcome, String), String> {
-        let (sources, by, chain_by, kyoto, proxy, netstate) = self.with_open(|w| {
+        let (sources, by, chain_by, kyoto, proxy, netstate, down) = self.with_open(|w| {
             let ns = w.netstate.lock();
             let list: Vec<Source> = ns.routes.broadcast.iter().filter(|s| s.down.is_none() && ns.ledger.health.get(&s.id).is_none_or(|h| h.suspect.is_none())).cloned().collect();
-            Ok((list, ns.routes.broadcast_by.clone(), ns.chain_by, ns.kyoto.clone(), ns.routes.proxy.clone(), w.netstate.clone()))
+            let down = ns.routes.broadcast.iter().find_map(|s| s.down.as_ref().map(|d| format!("{}: {d}", s.id)));
+            Ok((list, ns.routes.broadcast_by.clone(), ns.chain_by, ns.kyoto.clone(), ns.routes.proxy.clone(), w.netstate.clone(), down))
         })?;
         let (errands, tor) = {
             let ns = netstate.lock();
@@ -1108,7 +1109,7 @@ impl Engine {
         for a in by {
             let sent: Result<Outcome, String> = match a {
                 routes::Authority::Local | routes::Authority::Rpc if chain_by == LOCAL_NODE || chain_by == RPC_NODE => match netstate.lock().node_rpc.clone() {
-                    Some(rpc) => crate::node::broadcast(&NodeClient::new(rpc.clone()), tx).map(|_| Outcome::Seen),
+                    Some(rpc) => crate::node::broadcast(&NodeClient::new(rpc.clone()), tx),
                     None => continue,
                 },
                 // In the split, through Tor errands only, never Kyoto's direct peers; when they
@@ -1149,7 +1150,10 @@ impl Engine {
             }
         }
         if sources.is_empty() && tried == 0 {
-            return Err("no source is enabled for broadcast".into());
+            return Err(match down {
+                Some(why) => format!("not sent: {why}"),
+                None => "no source is enabled for broadcast".into(),
+            });
         }
         for s in sources {
             let iso = netstate.lock().iso(&s.id);
