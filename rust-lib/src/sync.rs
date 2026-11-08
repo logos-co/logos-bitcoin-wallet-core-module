@@ -125,7 +125,10 @@ pub struct KyotoStatus {
     /// About the chain's tip now (`BNetwork::estimated_tip`), for a share of a header download.
     pub estimated_tip: Option<u32>,
     /// The last block whose filters were checked against the wallet, as stored; null before any.
+    /// Below a matched block still being fetched, which a restart fetches again.
     pub scanned: Option<u32>,
+    /// The last filter checked, as stored, whatever is still being fetched: a restart resumes below it.
+    pub checked: Option<u32>,
     pub connected: usize,
     pub dialled: usize,
     pub skipped: usize,
@@ -226,8 +229,18 @@ struct Found {
     evicted: Vec<(Txid, u64)>,
     /// The meta key and the last block whose filters or contents were scanned.
     scanned: Option<(&'static str, (u32, BlockHash))>,
+    /// Kyoto's matched blocks not applied yet, stored with `scanned`; none from other sources.
+    pending: Option<Vec<(u32, BlockHash)>>,
     /// The scan reached the tip with this; before, it is a checkpoint on the way.
     at_tip: bool,
+}
+
+impl Found {
+    /// How far this leaves the wallet complete: the height scanned, below any block still pending.
+    fn applied(&self) -> Option<u32> {
+        let (_, (h, _)) = self.scanned?;
+        Some(self.pending.iter().flatten().map(|(p, _)| p.saturating_sub(1)).fold(h, u32::min))
+    }
 }
 
 /// The height of the checkpoint the wallet's chain starts from.
@@ -236,6 +249,9 @@ pub const CHAIN_BASE: &str = "chain_base";
 pub const SCAN_RULES_KEY: &str = "scan_rules";
 pub const SCAN_RULES: &str = "2";
 const KYOTO_SCANNED: &str = "kyoto_scanned";
+/// Kyoto's matched blocks not applied when `kyoto_scanned` was stored, `height:hash` by commas: a
+/// restart fetches them again and resumes filters below `kyoto_scanned`, whatever matched.
+const KYOTO_PENDING: &str = "kyoto_pending";
 const NODE_SCANNED: &str = "node_scanned";
 /// While a scan from the scan start runs: the fewest indices any part of it watched, per keychain.
 const KYOTO_WINDOW: &str = "kyoto_window";
@@ -337,7 +353,7 @@ impl Loop {
     fn restart_scan(&mut self) {
         tracing::info!(target: "bitcoin", "scanning again from {}", self.birthday());
         self.stop_kyoto(None);
-        self.kyoto_status.scanned = None;
+        (self.kyoto_status.scanned, self.kyoto_status.checked) = (None, None);
         self.kyoto_retry_at = Instant::now();
         self.node = None;
         let want = self.ctx.net.checkpoint_below(self.birthday().saturating_sub(1));
@@ -381,7 +397,7 @@ impl Loop {
             kyoto::wider_lookahead(&kyoto::reachable_used(cell.wallet.spk_index(), gap), gap)
         };
         tracing::info!(target: "bitcoin", "gap limit {gap}: scanning again from {}", self.birthday());
-        self.kyoto_status.scanned = None;
+        (self.kyoto_status.scanned, self.kyoto_status.checked) = (None, None);
         self.kyoto_lookahead = self.kyoto_lookahead.max(n);
         if self.kyoto.is_some() {
             self.kyoto_status.rescans += 1;
@@ -841,36 +857,61 @@ impl Loop {
         self.ctx.cell.lock().as_ref().and_then(|c| meta_get(&c.conn, key).ok().flatten())
     }
 
-    /// Where Kyoto starts, holding the authority's headers from there to 8 below its tip: from
-    /// the block before the birthday while a scan from it runs, so the scan can start over in
-    /// place; else 8 blocks below the last height scanned (README, "Kyoto").
-    fn kyoto_start(&self) -> (Start, Vec<Header>) {
-        if self.ctx.widen_by_restart {
-            return (self.kyoto_start_by_checkpoint(), vec![]);
-        }
+    /// Kyoto's matched blocks not applied when it last stored how far it checked.
+    fn kyoto_pending(&self) -> Vec<(u32, BlockHash)> {
+        self.kyoto_meta(KYOTO_PENDING).map(|t| t.split(',').filter_map(parse_scanned).collect()).unwrap_or_default()
+    }
+
+    /// How far Kyoto's finds are in the wallet, as stored: below any block still to fetch.
+    fn kyoto_applied(&self) -> Option<u32> {
+        let (h, _) = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned)?;
+        Some(self.kyoto_pending().iter().map(|(p, _)| p.saturating_sub(1)).fold(h, u32::min))
+    }
+
+    /// Where Kyoto starts, holding the authority's headers from there to 8 below its tip, and the
+    /// matched blocks it fetches again: filters from 8 blocks below the last height checked,
+    /// whatever matched, or from the block before the birthday while a scan from it runs, so the
+    /// scan can start over in place (README, "Kyoto").
+    fn kyoto_start(&self) -> (Start, Vec<Header>, Vec<(u32, BlockHash)>) {
         let a = &self.authority;
+        // Blocks a stopped client hadn't applied, and those a pruned node couldn't give: fetched as
+        // if matched, so no filter start depends on them. One that left the chain is dropped.
+        let (mut again, gone): (Vec<_>, Vec<_>) = self.kyoto_pending().into_iter().partition(|(h, hash)| a.hash_at(*h) == Some(*hash));
+        let gap = self.node_gap.as_ref().filter(|_| self.gap_pending(KYOTO));
+        if let Some(g) = gap {
+            again.extend(g.heights.iter().filter_map(|&h| a.hash_at(h).map(|hash| (h, hash))));
+        }
+        again.sort_unstable();
+        again.dedup();
+        if self.ctx.widen_by_restart {
+            return (self.kyoto_start_by_checkpoint(&again), vec![], vec![]);
+        }
         let (base, tip) = (a.base_height(), a.chain().tip_height());
-        // From `s`, holding the authority's headers but the top few, which Kyoto downloads so a
-        // reorg there shows in its update; filters after `resume`.
+        // From `s`, or the block before the first to fetch again so Kyoto can tell it's still in its
+        // chain, holding the authority's headers but the top few, which Kyoto downloads so a reorg
+        // there shows in its update; filters after `resume`.
         let top = tip.saturating_sub(kyoto::RESTART_DEPTH);
-        let held = |s: u32, resume: u32| -> Option<(Start, Vec<Header>)> {
+        let lowest = again.first().map(|(h, _)| h.saturating_sub(1));
+        let held = |s: u32, resume: u32| -> Option<(Start, Vec<Header>, Vec<(u32, BlockHash)>)> {
+            let s = lowest.map_or(s, |l| l.min(s));
             let hash = a.hash_at(s)?;
             let known_to = top.max(s);
             let snapshot: Vec<Header> = (s..=known_to).map(|h| a.chain().header_at(h).copied()).collect::<Option<_>>()?;
             let (headers_only, rescan_from) = if resume > s { (true, Some(resume)) } else { (false, None) };
-            Some((Start { from: (s, hash), known_to, headers_only, rescan_from }, snapshot))
+            Some((Start { from: (s, hash), known_to, headers_only, rescan_from }, snapshot, again.clone()))
         };
         let want = self.birthday().saturating_sub(1);
-        // Covering a pruned node's gap: from its first block, whatever Kyoto scanned before.
-        if let Some(g) = self.node_gap.as_ref().filter(|_| self.gap_pending(KYOTO)) {
-            let s = g.heights.iter().copied().min().unwrap_or(g.from).min(g.from).saturating_sub(1).max(base);
+        // Covering a pruned node's gap: filters from the blocks it had none for, else its prune height.
+        if let Some(g) = gap {
+            let s = g.unscanned_start().unwrap_or(g.below).saturating_sub(1).max(base);
             if let Some(x) = held(s, s) {
                 return x;
             }
         }
         if let Some((h, hash)) = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned) {
-            if a.hash_at(h) == Some(hash) {
-                let resume = h.saturating_sub(kyoto::RESTART_DEPTH).max(base);
+            let resume = h.saturating_sub(kyoto::RESTART_DEPTH).max(base);
+            // A block to fetch left the chain at or below the resume: its replacement's filter is unchecked.
+            if a.hash_at(h) == Some(hash) && gone.iter().all(|(g, _)| *g > resume) {
                 let in_pass = self.kyoto_meta(KYOTO_WINDOW).is_some_and(|w| !w.is_empty());
                 let from = if in_pass && want >= base && want < resume { want } else { resume };
                 if let Some(x) = held(from, resume).or_else(|| held(resume, resume)) {
@@ -878,24 +919,27 @@ impl Loop {
                 }
             }
         }
+        // From the birthday the filters match every block again: none to fetch without holding it.
         if want >= base {
             if let Some(x) = held(want, want) {
                 return x;
             }
-            return (Start { from: (tip, a.chain().tip_hash()), known_to: tip, headers_only: true, rescan_from: Some(want) }, vec![]);
+            return (Start { from: (tip, a.chain().tip_hash()), known_to: tip, headers_only: true, rescan_from: Some(want) }, vec![], vec![]);
         }
         let from = kyoto::builtin_checkpoint(self.ctx.net, want);
-        (Start { from, known_to: from.0, headers_only: false, rescan_from: None }, vec![])
+        (Start { from, known_to: from.0, headers_only: false, rescan_from: None }, vec![], vec![])
     }
 
     /// Where Kyoto started before it held the authority's headers, downloading every one from its
-    /// start: kept for the tests that compare the two (`Ctx::widen_by_restart`).
-    fn kyoto_start_by_checkpoint(&self) -> Start {
+    /// start: kept for the tests that compare the two (`Ctx::widen_by_restart`). Its filters start
+    /// below the blocks `again` names, which match again.
+    fn kyoto_start_by_checkpoint(&self, again: &[(u32, BlockHash)]) -> Start {
         let a = &self.authority;
         let base = a.base_height();
         let at = |s: u32| a.hash_at(s).map(|hash| Start { from: (s, hash), known_to: s, headers_only: false, rescan_from: None });
         if let Some((h, hash)) = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned) {
-            if let Some(s) = (a.hash_at(h) == Some(hash)).then(|| at(h.saturating_sub(kyoto::RESTART_DEPTH).max(base))).flatten() {
+            let resume = again.iter().map(|(p, _)| p.saturating_sub(1)).fold(h.saturating_sub(kyoto::RESTART_DEPTH), u32::min);
+            if let Some(s) = (a.hash_at(h) == Some(hash)).then(|| at(resume.max(base))).flatten() {
                 return s;
             }
         }
@@ -1058,7 +1102,7 @@ impl Loop {
             Ok(()) => {
                 self.kyoto_status.window = c.window;
                 if rescan_from.is_some() {
-                    self.kyoto_status.scanned = None;
+                    (self.kyoto_status.scanned, self.kyoto_status.checked) = (None, None);
                     self.kyoto_mark = rescan_from;
                 }
                 tracing::info!(target: "bitcoin", "kyoto: watching to {:?}{}", c.window, rescan_from.map(|h| format!(", scanning filters again after {h}")).unwrap_or_default());
@@ -1124,7 +1168,7 @@ impl Loop {
         }
         let now = now_secs();
         if self.kyoto.is_none() && Instant::now() >= self.kyoto_retry_at {
-            let (start, snapshot) = self.kyoto_start();
+            let (start, snapshot, again) = self.kyoto_start();
             // The node module's records choose the peers and hear how they did; regtest.json's
             // peers are a random 8 with the core's own count of failures.
             let reporting = route.listed.is_some() && self.ctx.routes_src.is_some();
@@ -1146,7 +1190,7 @@ impl Loop {
             let started = {
                 let guard = self.ctx.cell.lock();
                 match guard.as_ref() {
-                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, snapshot, self.kyoto_lookahead, reporting, &tor, self.ctx.wake.clone()),
+                    Some(cell) => kyoto::Client::start(&cell.wallet, &route, proxy.as_ref(), required, peers, start, snapshot, again, self.kyoto_lookahead, reporting, &tor, self.ctx.wake.clone()),
                     None => Err("closed".into()),
                 }
             };
@@ -1166,7 +1210,8 @@ impl Loop {
                     self.kyoto_status.phase = "syncing";
                     self.kyoto_status.progress = 0.0;
                     self.kyoto_status.headers = start.known_to;
-                    self.kyoto_status.scanned = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned).map(|(h, _)| h);
+                    self.kyoto_status.scanned = self.kyoto_applied();
+                    self.kyoto_status.checked = self.kyoto_meta(KYOTO_SCANNED).as_deref().and_then(parse_scanned).map(|(h, _)| h);
                     self.kyoto = Some(c);
                 }
                 Err(e) => {
@@ -1193,7 +1238,7 @@ impl Loop {
                 Feed::Dial { peer, outcome } if !self.kyoto_own.contains(&peer) => self.peer_reports.dial(&peer, outcome),
                 Feed::Dial { .. } => {}
                 Feed::Gossip { from, addrs } => self.peer_reports.gossip(self.ctx.net, &from, &addrs, route.route == Route::Direct, now),
-                Feed::Update { update, scanned, checked, synced } => match self.take_kyoto_update(*update, scanned, checked, synced) {
+                Feed::Update { update, checked, pending, synced } => match self.take_kyoto_update(*update, checked, pending, synced) {
                     Ok((c, f)) => {
                         change = merge(change, c);
                         found.extend(f);
@@ -1273,7 +1318,7 @@ impl Loop {
 
     /// Mirrors Kyoto's chain since its start into the authority's, then hands over what its
     /// filters matched. Below the wallet's checkpoint, Kyoto's chain must reach that checkpoint.
-    fn take_kyoto_update(&mut self, u: bdk_wallet::Update, scanned: Option<u32>, checked: Option<u32>, synced: bool) -> Result<(Change, Vec<Found>), String> {
+    fn take_kyoto_update(&mut self, u: bdk_wallet::Update, checked: Option<u32>, pending: Vec<(u32, BlockHash)>, synced: bool) -> Result<(Change, Vec<Found>), String> {
         let (requester, start) = match &self.kyoto {
             Some(c) => (c.requester.clone(), c.start),
             None => return Ok((Change::default(), vec![])),
@@ -1321,8 +1366,9 @@ impl Loop {
                 (Change::default(), false)
             }
         };
-        // Filters checked through `scanned`: the tip, or a checkpoint on the way there.
-        let tip = match scanned {
+        // Filters checked through `checked`: the tip, or a checkpoint on the way there. Blocks still
+        // being fetched are stored apart, so where a restart resumes doesn't depend on what matched.
+        let tip = match checked {
             Some(h) => self.authority.hash_at(h).map(|hash| (h, hash)),
             None => ids.last().copied().or_else(|| self.authority.hash_at(start.known_to).map(|h| (start.known_to, h))),
         }
@@ -1344,6 +1390,8 @@ impl Loop {
                 self.kyoto_scanning = true;
                 self.kyoto_mark = Some(h);
             }
+            // Blocks fetched again can land before the filters start: their transactions count.
+            found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: None, pending: None, at_tip: false });
         } else {
             // Kyoto's blocks below the wallet's checkpoint are named by Kyoto itself.
             for (a, _) in &u.tx_update.anchors {
@@ -1362,13 +1410,13 @@ impl Loop {
                 self.kyoto_status.last_warning = Some(why);
                 let _ = requester.rescan_from(m);
                 self.kyoto_scanning = true;
-                found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: None, at_tip: false });
+                found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: None, pending: None, at_tip: false });
                 return Ok((change, found));
             }
             if at_tip {
                 self.kyoto_scanning = false;
             }
-            found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: tip.map(|t| (KYOTO_SCANNED, t)), at_tip });
+            found.push(Found { source: KYOTO, tx_update: u.tx_update, last_active: u.last_active_indices, evicted: vec![], scanned: tip.map(|t| (KYOTO_SCANNED, t)), pending: Some(pending), at_tip });
         }
         Ok((change, found))
     }
@@ -1430,7 +1478,7 @@ impl Loop {
                 self.note_gap(&f.missing, f.unscanned, st.prune_height.unwrap_or(0));
             }
             let hit = !f.tx_update.txs.is_empty();
-            found.push(Found { source: if self.remote_source.is_some() { RPC_NODE } else { LOCAL_NODE }, tx_update: f.tx_update, last_active: f.last_active, evicted: f.evicted, scanned: f.scanned.map(|s| (NODE_SCANNED, s)), at_tip: f.at_tip });
+            found.push(Found { source: if self.remote_source.is_some() { RPC_NODE } else { LOCAL_NODE }, tx_update: f.tx_update, last_active: f.last_active, evicted: f.evicted, scanned: f.scanned.map(|s| (NODE_SCANNED, s)), pending: None, at_tip: f.at_tip });
             if done || self.stopped() {
                 break;
             }
@@ -1461,6 +1509,9 @@ impl Loop {
         let from = missing.iter().copied().min().into_iter().chain(unscanned.map(|(f, _)| f)).min().unwrap_or(below);
         let g = self.node_gap.get_or_insert_with(|| PrunedGap { from, below, ..Default::default() });
         g.from = g.from.min(from);
+        if let Some((f, _)) = unscanned {
+            g.unscanned_from = Some(g.unscanned_from.map_or(f, |u| u.min(f)));
+        }
         g.below = g.below.max(below).max(unscanned.map_or(0, |(_, b)| b));
         g.heights.extend_from_slice(missing);
         g.heights.sort_unstable();
@@ -1522,6 +1573,7 @@ impl Loop {
     /// Returns whether the scan starts over.
     fn apply_found(&mut self, f: Found) -> Result<bool, String> {
         let now = self.now();
+        let applied = f.applied();
         let mut update = f.tx_update;
         let pending: Vec<Txid> = update.seen_ats.iter().map(|(t, _)| *t).collect();
         let mut guard = self.ctx.cell.lock();
@@ -1547,9 +1599,14 @@ impl Loop {
         }
         cell.settle_sends()?;
         if let Some((key, (h, hash))) = f.scanned {
+            // First: a stop between the two leaves the older height with these, fetched again.
+            if let Some(p) = &f.pending {
+                let text: Vec<String> = p.iter().map(|(h, hash)| format!("{h}:{hash}")).collect();
+                meta_set(&cell.conn, KYOTO_PENDING, &text.join(",")).map_err(|e| e.to_string())?;
+            }
             meta_set(&cell.conn, key, &format!("{h}:{hash}")).map_err(|e| e.to_string())?;
             if key == KYOTO_SCANNED {
-                self.kyoto_status.scanned = Some(h);
+                (self.kyoto_status.scanned, self.kyoto_status.checked) = (applied, Some(h));
             }
         }
         cell.persist()?;
@@ -1567,12 +1624,12 @@ impl Loop {
         p.last_history_sync = Some(now);
         p.history_server = Some(f.source.to_string());
         p.last_error = None;
-        if !again && f.scanned.is_some_and(|(_, (h, _))| Some(h) >= self.authority.tip_height()) {
+        if !again && applied.is_some_and(|h| Some(h) >= self.authority.tip_height()) {
             p.rescan_from = None;
         }
         drop(p);
         if f.source == KYOTO {
-            self.resolve_gap(KYOTO, f.scanned.map(|(_, (h, _))| h));
+            self.resolve_gap(KYOTO, applied);
         }
         Ok(again)
     }
@@ -2215,7 +2272,7 @@ fn merge(mut a: Change, b: Change) -> Change {
 /// A stored `height:hash`.
 /// Forgets how far Kyoto and the node scanned: their next scan starts from the birthday.
 pub fn forget_scans(conn: &rusqlite::Connection) -> Result<(), String> {
-    for key in [KYOTO_SCANNED, NODE_SCANNED, NODE_GAP, KYOTO_WINDOW, NODE_WINDOW] {
+    for key in [KYOTO_SCANNED, KYOTO_PENDING, NODE_SCANNED, NODE_GAP, KYOTO_WINDOW, NODE_WINDOW] {
         meta_set(conn, key, "").map_err(|e| e.to_string())?;
     }
     Ok(())

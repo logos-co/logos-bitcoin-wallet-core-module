@@ -13,7 +13,8 @@ patches=$(cd "${3:-$(dirname "$0")/../../patches/bdk_kyoto}" && pwd)
 allowed=(
   src/lib.rs      # 1: matched blocks oldest first; 2: updates before the tip, and the height scanned;
                   # 3: widening in place; 4: a matched block reorganized away is skipped;
-                  # 5: the bounded warning receiver of bip157 0.8.0; 6: background fetch
+                  # 5: the bounded warning receiver of bip157 0.8.0; 6: background fetch;
+                  # 7: the blocks still pending, fetched again
   src/builder.rs  # 3: a node built from a given chain state
   Cargo.toml      # 5: bip157 0.8.0, as cargo reads the requirement
   Cargo.toml.orig # 5: and as written

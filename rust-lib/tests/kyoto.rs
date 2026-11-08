@@ -3,7 +3,8 @@
 //! NoReachablePeers; a rebuild past the lookahead; and a peer forging filter headers. Then a
 //! matched block reorganized away before its fetch, an update stream that ends, and a scan whose
 //! rescan never reached the node. Last, `identifying`'s split behind a test SOCKS5 server: matched
-//! blocks and the send over Tor errands, a scan that holds while Tor is down, and `none`.
+//! blocks and the send over Tor errands, a scan that holds while Tor is down, a restart then, and
+//! `none`.
 //! Needs `--features test-hooks`; the run command is in the README.
 
 mod common;
@@ -745,6 +746,49 @@ fn kyoto_identifying_waits_for_tor() {
     assert!(k["tor"]["waiting"] == false && k["tor"]["pending"] == 0 && k["tor"]["retries"].as_u64() >= Some(1), "{k}");
     assert_eq!(sent(&direct, "getdata-block"), 0);
     println!("KYOTO held at {} while Tor was down, {} retries; the payment came once it was back", h - 1, k["tor"]["retries"]);
+    t.engine.shutdown();
+}
+
+/// A restart while a matched block waits for Tor: filters resume 8 below the last one checked, not
+/// below that block, so the direct peers can't place it; it comes over Tor once Tor is back. Run alone.
+#[test]
+#[ignore]
+fn kyoto_identifying_restart_resumes_past_a_pending_block() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+    if common::chain_env().is_none() {
+        eprintln!("skipped: REGTEST_RPC is not set (see tools/regtest/chain.sh)");
+        return;
+    }
+    let (t, direct, _tor, socks, _root) = kyoto_split("identifying", true);
+    let group = t.engine.status()["group"].as_str().unwrap().to_string();
+    socks.set_up(false);
+    let paid = t.fund(&t.engine.next_address()["address"].as_str().unwrap().to_string(), 0.24).to_string();
+    t.mine(1);
+    let h = t.tip();
+    t.mine(20);
+    let tip = t.tip();
+    t.wait("filters checked to the tip, the paying block waiting for Tor", 90, || {
+        let k = kyoto(&t);
+        k["checked"].as_u64() >= Some(tip) && k["tor"]["pending"].as_u64() >= Some(1)
+    });
+    // Below it, or below an older block a wider pass fetches again on a chain earlier tests used.
+    assert!(kyoto(&t)["scanned"].as_u64() < Some(h), "{}", kyoto(&t));
+
+    t.job("close_wallet", json!({}));
+    t.wait("the sync thread to end", 10, || SYNC_THREADS.load(Ordering::SeqCst) == 0);
+    let before: Vec<usize> = direct.iter().map(|p| p.filter_starts().len()).collect();
+    t.job("open_wallet", json!({"network": "regtest", "group": group}));
+    t.wait("filters asked for again", 90, || direct.iter().zip(&before).any(|(p, n)| p.filter_starts().len() > *n));
+    std::thread::sleep(Duration::from_secs(5));
+    let asked: Vec<u32> = direct.iter().zip(&before).flat_map(|(p, n)| p.filter_starts()[*n..].to_vec()).collect();
+    assert!(asked.iter().all(|s| u64::from(*s) > h), "direct peers asked for filters from {asked:?}; the paying block is {h}");
+    assert_eq!(t.row(&paid), Value::Null, "the payment came some other way");
+
+    socks.set_up(true);
+    t.wait("the payment over Tor once it is back", 120, || t.row(&paid)["state"] == "confirmed");
+    t.wait("the scan at the tip", 30, || kyoto(&t)["scanned"].as_u64() >= Some(tip));
+    assert_eq!(sent(&direct, "getdata-block"), 0, "a block was asked for directly");
+    println!("KYOTO restarted with block {h} pending: filters asked again from {:?}, none at or below it; it came over Tor", asked.iter().min());
     t.engine.shutdown();
 }
 
