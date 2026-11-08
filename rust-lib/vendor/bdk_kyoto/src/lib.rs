@@ -289,6 +289,8 @@ pub struct UpdateSubscriber<W: Wallets> {
     fetched: BTreeMap<(u32, BlockHash), Option<Option<Block>>>,
     fetching: tokio::task::JoinSet<((u32, BlockHash), Option<Block>)>,
     at_tip: bool,
+    // matched blocks to fetch again, as a stopped client left them: queued at the next sync
+    again: Vec<(u32, BlockHash)>,
     // processes events for the wallet.
     single_update_builder: Option<UpdateBuilder>,
     // process events for multiple wallets.
@@ -323,6 +325,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
             fetched: BTreeMap::new(),
             fetching: tokio::task::JoinSet::new(),
             at_tip: false,
+            again: Vec::new(),
             _marker: core::marker::PhantomData,
         }
     }
@@ -363,11 +366,15 @@ impl<W: Wallets> UpdateSubscriber<W> {
             fetched: BTreeMap::new(),
             fetching: tokio::task::JoinSet::new(),
             at_tip: false,
+            again: Vec::new(),
             _marker: core::marker::PhantomData,
         }
     }
 
     async fn sync(&mut self) -> Result<(), UpdateError> {
+        for (height, hash) in std::mem::take(&mut self.again) {
+            self.queue_block(height, hash);
+        }
         loop {
             let message = if self.fetching.is_empty() {
                 self.receiver.recv().await
@@ -443,7 +450,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
     }
 
     /// The height of the last filter checked against the wallet's scripts, as of the last update;
-    /// with a fetcher, below the first block still being fetched, so a restart checks it again.
+    /// with a fetcher, below the first block still being fetched: what the update holds in full.
     pub fn scanned(&self) -> Option<u32> {
         match self.fetched.keys().next() {
             Some((height, _)) => self.scanned.map(|s| s.min(height.saturating_sub(1))),
@@ -455,6 +462,19 @@ impl<W: Wallets> UpdateSubscriber<W> {
     /// before it is still being fetched.
     pub fn checked(&self) -> Option<u32> {
         self.scanned
+    }
+
+    /// The matched blocks not applied yet, as of the last update, oldest first: being fetched, or
+    /// fetched and waiting for an older one. Stored with [`Self::checked`], a restart can resume
+    /// filters from there and fetch these again ([`Self::fetch_also`]), whatever they are.
+    pub fn pending(&self) -> Vec<(u32, BlockHash)> {
+        self.fetched.keys().copied().collect()
+    }
+
+    /// Fetches these matched blocks as if their filters matched, from the next update on: those a
+    /// stopped client hadn't applied. Each must be in the node's chain by then, or it is skipped.
+    pub fn fetch_also(&mut self, blocks: impl IntoIterator<Item = (u32, BlockHash)>) {
+        self.again.extend(blocks);
     }
 
     /// Fetches matched blocks with `fetch` in the background instead of from the node's peers,

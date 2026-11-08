@@ -173,6 +173,17 @@ pub struct PrunedGap {
     /// Who scanned them instead: a history server, `kyoto`, or nobody yet.
     pub via: Option<String>,
     pub resolved: bool,
+    /// Where the blocks the node had no filters for start, when there are such blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unscanned_from: Option<u32>,
+}
+
+impl PrunedGap {
+    /// Where filters must be checked from to cover the blocks nobody checked: never a matched height.
+    pub fn unscanned_start(&self) -> Option<u32> {
+        // Stored before `unscanned_from`: a `from` below every matched height came from such blocks.
+        self.unscanned_from.or_else(|| self.heights.first().is_none_or(|h| self.from < *h).then_some(self.from))
+    }
 }
 
 /// Whether the node runs `net` and is synced: past initial sync, its blocks at its headers.
