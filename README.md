@@ -494,7 +494,9 @@ here, and has BDK finalize. Before anything leaves, the signed transaction and i
 are stored (state `broadcasting`), retried while the wallet is busy. Then it broadcasts through the
 `broadcast` role and acknowledges. Once a broadcast may have happened the job never fails: it
 answers the txid with `broadcast: seen|requested|unknown`, and a refusal after a source that may
-have taken it is `unknown` too. A sent transaction's inputs stay locked until it confirms or
+have taken it is `unknown` too. Through your node it is `seen` only once the node's mempool has it
+(`getmempoolentry`), else `requested`: a node that sends privately keeps it out of its mempool
+until the network relays it back. A sent transaction's inputs stay locked until it confirms or
 `abandon_send` gives it up; a reopen releases only the locks of previews that never reached
 `broadcasting`.
 
@@ -563,7 +565,10 @@ authority, a `kyoto` entry Kyoto, with `peers` as its peers (`{ peer, source, ok
 `host:port`, which keeps the core's own rules; `services` a decimal string); `local` and `kyoto` in `broadcast` put
 them ahead of the servers there. A `local` or `rpc` entry in `chain` is your node, asked alone:
 every server and Kyoto in the table are left out of every role, whatever an older node module
-lists, so no Electrum server is asked for fees, tips, headers or history. `torUse` is `all`,
+lists, so no Electrum server is asked for fees, tips, headers or history. The one exception is
+`localSends: "servers"` (your node on, payments through public servers over Tor): the Electrum
+servers in `broadcast` stay, your node leaves `broadcast`, and the proxy stays for them even in
+`none`. An older node module sends no `localSends`, and your node sends. `torUse` is `all`,
 `identifying` or `none`; `none` drops the proxy whatever the table says, unless the `rpc` entry is
 routed `tor` or `onion` (your node's own Tor switch). In `identifying`, `kyotoSplit: { chain: { route: direct, peers },
 tor: { route: onion, peers } }` replaces Kyoto's route and peers with `chain`'s, and its errands go

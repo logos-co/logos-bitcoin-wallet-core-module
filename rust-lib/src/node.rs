@@ -22,6 +22,7 @@ use crate::authority::{Authority, Change, ChainAuthority};
 use crate::checks::ChainView;
 use crate::fees::{self, SourceEstimate};
 use crate::network::BNetwork;
+use crate::send::Outcome;
 
 /// One call into the node's RPC table, as `bitcoind_module.rpc` makes it: `params` is a JSON
 /// array, and the reply is Core's, `{"result": .., "error": null | {code, message}}`.
@@ -566,11 +567,12 @@ impl Follower {
 }
 
 /// sendrawtransaction: `Ok` once the node holds it; its refusal names why.
-pub fn broadcast(c: &NodeClient, tx: &Transaction) -> Result<(), String> {
-    match c.raw("sendrawtransaction", &[json!(serialize_hex(tx))]) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+/// Seen once the node's mempool has it. Private broadcast keeps it out until the network relays it
+/// back, so until then it is only requested.
+pub fn broadcast(c: &NodeClient, tx: &Transaction) -> Result<Outcome, String> {
+    c.raw("sendrawtransaction", &[json!(serialize_hex(tx))]).map_err(|e| e.to_string())?;
+    let seen = c.raw("getmempoolentry", &[json!(tx.compute_txid().to_string())]).is_ok();
+    Ok(if seen { Outcome::Seen } else { Outcome::Requested })
 }
 
 /// estimatesmartfee for the targets, and the node's relay floor, in sat/vB.
@@ -635,6 +637,19 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(log.calls.lock().unwrap().iter().any(|l| l == "getmempoolentry [\"x\"]"), "params go as a JSON array");
+    }
+
+    #[test]
+    fn a_send_is_seen_only_once_the_node_mempool_has_it() {
+        use bitcoin::{absolute::LockTime, transaction::Version};
+        let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: vec![], output: vec![] };
+        let (_, c) = canned(vec![("sendrawtransaction", json!(tx.compute_txid().to_string()))]);
+        assert_eq!(broadcast(&c, &tx), Ok(Outcome::Requested), "sent privately: not in its mempool yet");
+        let (log, c) = canned(vec![("sendrawtransaction", json!(tx.compute_txid().to_string())), ("getmempoolentry", json!({"vsize": 60}))]);
+        assert_eq!(broadcast(&c, &tx), Ok(Outcome::Seen));
+        assert!(log.calls.lock().unwrap().iter().any(|l| l == &format!("getmempoolentry [\"{}\"]", tx.compute_txid())));
+        let (_, c) = canned(vec![]);
+        assert!(broadcast(&c, &tx).unwrap_err().contains("boom"), "a refusal is an error, not an outcome");
     }
 
     #[test]
