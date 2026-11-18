@@ -1,5 +1,5 @@
 //! Who may call the core's backend-only paths: the wallet backend by default; a `callers.json`
-//! in the instance's persistence directory can widen that for tests.
+//! in the instance's persistence directory replaces that list.
 
 use serde::Deserialize;
 

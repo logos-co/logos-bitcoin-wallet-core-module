@@ -65,6 +65,14 @@ pub fn live(state: &str) -> bool {
     matches!(state, "broadcasting" | "sent")
 }
 
+/// Signed and stored, kept back for a later broadcast: nothing has left.
+pub const HELD: &str = "held";
+
+/// Its inputs stay locked: it may have left, or it is held to be sent.
+pub fn keeps_inputs(state: &str) -> bool {
+    live(state) || state == HELD
+}
+
 /// An anchor above the authority's tip, waiting for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
@@ -348,13 +356,13 @@ impl Cell {
             .flat_map(|t| t.tx_node.tx.input.iter().map(|i| i.previous_output).collect::<Vec<_>>())
             .collect();
         for s in self.sends()? {
-            if !live(&s.state) && s.state != "replaced" {
+            if !keeps_inputs(&s.state) && s.state != "replaced" {
                 continue;
             }
             // A replaced send stays replaced unless it is the one that confirmed.
             let next = match (canonical.get(&s.txid), s.state.as_str()) {
                 (Some(true), _) => Some("confirmed"),
-                (None, st) if live(st) && s.inputs.iter().any(|o| spent_by_confirmed.contains(o)) => Some("conflicted"),
+                (None, st) if keeps_inputs(st) && s.inputs.iter().any(|o| spent_by_confirmed.contains(o)) => Some("conflicted"),
                 _ => None,
             };
             if let Some(state) = next {
@@ -911,6 +919,53 @@ mod tests {
         assert_eq!((s["sendState"].as_str(), s["broadcast"].as_str(), s["via"].as_str()), (Some("sent"), Some("unknown"), Some("kyoto")), "{s}");
         let r = row(&funding);
         assert!(r["broadcast"].is_null() && r["via"].is_null() && r["sendState"].is_null(), "a receive has no record: {r}");
+    }
+
+    #[test]
+    fn a_held_send_settles_by_what_the_chain_says() {
+        use bdk_wallet::chain::{CheckPoint, TxUpdate};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, TxIn, TxOut};
+        crate::network::configure_regtest(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::storage::open_encrypted(&dir.path().join("w.db"), &[6; 32]).unwrap();
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let (ext, int) = (format!("wpkh([73c5da0a/84'/1'/0']{x}/0/*)"), format!("wpkh([73c5da0a/84'/1'/0']{x}/1/*)"));
+        let (mut w, _) = load_or_create(&mut conn, &ext, &int, BNetwork::Regtest).unwrap();
+        let to_us = w.reveal_next_address(KeychainKind::External).script_pubkey();
+        let funding = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([9; 32]), vout: 0 }, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(100_000), script_pubkey: to_us }],
+        };
+        let coin = OutPoint { txid: funding.compute_txid(), vout: 0 };
+        let spend = |sat: u64| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: coin, ..Default::default() }],
+            output: vec![TxOut { value: Amount::from_sat(sat), script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])) }],
+        };
+        let (mined, lost) = (spend(99_000), spend(98_000));
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let b1 = BlockId { height: 1, hash: BlockHash::from_byte_array([1; 32]) };
+        let mut u = TxUpdate::default();
+        for tx in [&funding, &mined] {
+            u.txs.push(std::sync::Arc::new(tx.clone()));
+            u.anchors.insert((ConfirmationBlockTime { block_id: b1, confirmation_time: 1 }, tx.compute_txid()));
+        }
+        let cp = CheckPoint::from_block_ids([BlockId { height: 0, hash: genesis }, b1]).unwrap();
+        w.apply_update(bdk_wallet::Update { tx_update: u, chain: Some(cp), ..Default::default() }).unwrap();
+        w.lock_outpoint(coin);
+        let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
+        for tx in [&mined, &lost] {
+            let record = SendRecord { txid: tx.compute_txid(), tx: tx.clone(), inputs: vec![coin], state: HELD.into(), created: 2, replaces: None, via: None, broadcast: None };
+            cell.store_send(&record).unwrap();
+        }
+        cell.settle_sends().unwrap();
+        let state = |t: &Transaction| cell.sends().unwrap().into_iter().find(|s| s.txid == t.compute_txid()).unwrap().state;
+        assert_eq!((state(&mined).as_str(), state(&lost).as_str()), ("confirmed", "conflicted"));
+        assert!(!cell.wallet.is_outpoint_locked(coin));
     }
 
     /// Payments to 0..=10 and 70..=72, found by a scan that watched past them, one more pending

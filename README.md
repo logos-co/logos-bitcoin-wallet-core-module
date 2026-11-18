@@ -500,6 +500,12 @@ until the network relays it back. A sent transaction's inputs stay locked until 
 `abandon_send` gives it up; a reopen releases only the locks of previews that never reached
 `broadcasting`.
 
+`sign_held` (backend only) signs the same way and stops before the broadcast. The signed transaction
+and its record are stored in state `held`, its inputs stay locked across a reopen, and the job answers
+`{ txid, hex, state: "held" }`. Nothing has left: `broadcast_held` sends it later, `abandon_send` gives
+it up and unlocks its inputs, and `rebroadcast` refuses it. A held transaction that confirms some other
+way settles as `confirmed`, and one that loses its inputs to a confirmed conflict as `conflicted`.
+
 ## API
 
 Every structured value is a JSON string: `{ "ok": true, ... }` or `{ "ok": false, "error" }`.
@@ -530,9 +536,11 @@ Amounts are decimal strings of satoshis.
 | `build_send` | `{ recipients: [{ address, amountSat }], feeRate? \| target?, sendMax?, smallChangeToFee? }` → `{ previewId, kind, inputs, outputs: [{ address, amountSat, change }], feeSat, feeRate, vsize, txid, warnings, replaces, approvalHandle, state }` |
 | `bump_fee` | `{ txid, feeRate }` → a preview of kind `fee_bump`, built by `build_fee_bump` |
 | `sign_and_broadcast` | Backend only. `{ previewId }` → `{ txid, broadcast: seen\|requested\|unknown, via }` |
+| `sign_held` | Backend only. `{ previewId }` → `{ txid, hex, state: "held" }`: signed and stored, not broadcast |
+| `broadcast_held` | Backend only. `{ txid }` → as `sign_and_broadcast`. Asking again sends the same transaction again |
 | `cancel_send` | Backend only. `{ previewId }` → cancels a pending approval and unlocks the inputs |
 | `rebroadcast` | `{ txid }` → as `sign_and_broadcast` |
-| `abandon_send` | Backend only. `{ txid }` → unlocks a sent transaction's inputs |
+| `abandon_send` | Backend only. `{ txid }` → unlocks a sent or held transaction's inputs |
 | `set_birthday` | Backend only. `{ date }` or `{ height }` → `{ birthday: { height, source: "set" }, rescanFrom }`; a birthday after the first transaction or a day still to come fails with code `invalid` |
 | `set_gap_limit` | Backend only. `{ gapLimit }` (20 to 1000) → `{ gapLimit, rescanFrom }`, `rescanFrom` the birthday when raised, else null; out of range fails with `invalid`, a wallet busy with `busy` |
 
@@ -553,8 +561,9 @@ estimate when nothing else gives one: `estimated` true, `basis: "floor"`, `sourc
 
 The core never takes a password, phrase or key; a unit test reads the contract and fails on a
 parameter named like one. Callers other than `bitcoin_wallet_backend` are refused on the
-backend-only paths; for tests, a `callers.json` in the instance's persistence directory can admit
-more: `{ "modules": [...], "allowHost": true }`.
+backend-only paths. A `callers.json` in the instance's persistence directory replaces that list:
+`{ "modules": [...] }` names every module admitted, the backend included if it is to stay. Its
+`allowHost: true` admits `logosctl call` and is for tests only.
 
 ## Routes
 
@@ -946,7 +955,27 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
   follower behind a `p2p_proxy` front that gossips four peers on loopback, the core reports them and
   the book keeps them, learned. With no own peer Kyoto dials the book, two a start (one gossiper),
   and each start is cut once it syncs, so it dials its second peer: the reports turn the good peer
-  `ok` and first, and the book skips a failing one after three failures in a row.
+  `ok` and first, and the book skips a failing one after three failures in a row.;
+- `unattended.sh`: a headless service's boot and signing, on `bitcoind_module`. See below.
+
+### Signing with nobody present
+
+A service that funds transactions on its own runs the same modules with no app. At every start, in
+this order: configure the keystore and manager roles, start the node, load the core, unlock the
+seed (`evm_signer_cli unlock_wallet`), `open_wallet` with the approver's consent
+(`evm_signer_cli approve_open`), and last grant the unlock (`evm_keystore_cli unlock`):
+
+```json
+{ "account": "<group>", "password": "…", "apps": ["bitcoin_wallet_core_module"], "confirm": false,
+  "maxSpendSat": 200000000, "totalSpendSat": 500000000 }
+```
+
+Nothing stays unlocked across a restart, so the service keeps the password in its own secret store
+and passes it as a file. The caps belong to the signer manager: a request over one is refused at
+once, and each signature is recorded before it is made (`evm_signer_cli unattended`). The service
+calls the core from a module named in `callers.json`. `unattended.sh` runs this end to end: signing
+with no approver loaded, both caps, a restart with transactions held, `broadcast_held` afterwards,
+a lock, and the caller list.
 
 Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of 20 unloads within
 2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians

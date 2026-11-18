@@ -55,7 +55,7 @@ const APPROVAL_LIMIT: Duration = Duration::from_secs(6 * 3600);
 
 /// Job kinds only the wallet backend may start.
 pub fn backend_only(kind: &str) -> bool {
-    matches!(kind, "sign_and_broadcast" | "cancel_send" | "abandon_send" | "set_birthday" | "set_gap_limit")
+    matches!(kind, "sign_and_broadcast" | "sign_held" | "broadcast_held" | "cancel_send" | "abandon_send" | "set_birthday" | "set_gap_limit")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +173,8 @@ enum Task {
     BuildSend(Value),
     BumpFee { txid: Txid, fee_rate: f64 },
     SignAndBroadcast { preview: String },
+    SignHeld { preview: String },
+    BroadcastHeld { txid: Txid },
     CancelSend { preview: String },
     Rebroadcast { txid: Txid },
     Abandon { txid: Txid },
@@ -225,8 +227,8 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
         "close_wallet" => &[],
         "build_send" => &["recipients", "feeRate", "target", "sendMax", "smallChangeToFee"],
         "bump_fee" => &["txid", "feeRate"],
-        "sign_and_broadcast" | "cancel_send" => &["previewId"],
-        "rebroadcast" | "abandon_send" => &["txid"],
+        "sign_and_broadcast" | "sign_held" | "cancel_send" => &["previewId"],
+        "rebroadcast" | "broadcast_held" | "abandon_send" => &["txid"],
         "set_birthday" => &["date", "height"],
         "set_gap_limit" => &["gapLimit"],
         other => return Err(format!("unknown job kind {other}")),
@@ -266,6 +268,8 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
             fee_rate: v["feeRate"].as_f64().filter(|r| r.is_finite() && *r > 0.0).ok_or("feeRate is required, in sat/vB")?,
         },
         "sign_and_broadcast" => Task::SignAndBroadcast { preview: preview()? },
+        "sign_held" => Task::SignHeld { preview: preview()? },
+        "broadcast_held" => Task::BroadcastHeld { txid: txid()? },
         "cancel_send" => Task::CancelSend { preview: preview()? },
         "rebroadcast" => Task::Rebroadcast { txid: txid()? },
         "abandon_send" => Task::Abandon { txid: txid()? },
@@ -367,7 +371,7 @@ impl Engine {
         let (id, receipt, cancel) = self.jobs.lock().unwrap().add(kind);
         match task {
             // These wait on a person, so they don't hold up the worker.
-            Task::Open { .. } | Task::SignAndBroadcast { .. } => {
+            Task::Open { .. } | Task::SignAndBroadcast { .. } | Task::SignHeld { .. } => {
                 let me = self.clone();
                 let (jid, flag) = (id.clone(), cancel.clone());
                 let spawned = std::thread::Builder::new().name("bitcoin-person".into()).spawn(move || me.run(jid, task, flag));
@@ -392,7 +396,9 @@ impl Engine {
             Task::Close => Ok(json!({"closed": self.close(true)})),
             Task::BuildSend(v) => self.build_send(&v),
             Task::BumpFee { txid, fee_rate } => self.bump_fee(txid, fee_rate),
-            Task::SignAndBroadcast { preview } => self.sign_and_broadcast(&preview, cancel),
+            Task::SignAndBroadcast { preview } => self.sign_and_broadcast(&preview, cancel, false),
+            Task::SignHeld { preview } => self.sign_and_broadcast(&preview, cancel, true),
+            Task::BroadcastHeld { txid } => self.broadcast_held(txid),
             Task::CancelSend { preview } => self.cancel_send(&preview),
             Task::Rebroadcast { txid } => self.rebroadcast(txid),
             Task::Abandon { txid } => self.abandon(txid),
@@ -960,7 +966,7 @@ impl Engine {
         }
     }
 
-    fn sign_and_broadcast(self: &Arc<Self>, id: &str, cancel: Arc<AtomicBool>) -> Result<Value, String> {
+    fn sign_and_broadcast(self: &Arc<Self>, id: &str, cancel: Arc<AtomicBool>, hold: bool) -> Result<Value, String> {
         let (group, network, family) = self.with_open(|w| Ok((w.group.clone(), w.network, w.family)))?;
         let (psbt, kind, replaces, inputs) = {
             let mut previews = self.previews.lock();
@@ -972,7 +978,7 @@ impl Engine {
             p.cancel = cancel.clone();
             (p.psbt.clone(), p.kind, p.replaces, p.inputs.clone())
         };
-        let r = self.sign_inner(id, &group, network, family, psbt, kind, replaces, inputs, &cancel);
+        let r = self.sign_inner(id, &group, network, family, psbt, kind, replaces, inputs, &cancel, hold);
         self.set_light(|l| l.approval_handle = None);
         match &r {
             Ok(_) => {
@@ -999,6 +1005,7 @@ impl Engine {
         replaces: Option<Txid>,
         inputs: Vec<OutPoint>,
         cancel: &AtomicBool,
+        hold: bool,
     ) -> Result<Value, String> {
         let purpose = if kind == "fee_bump" { "Raise the fee of a Bitcoin send" } else { "Bitcoin send" };
         let xpub = self.with_open(|w| if w.group == group { Ok(w.xpub.clone()) } else { Err("the wallet closed".into()) })?;
@@ -1037,11 +1044,14 @@ impl Engine {
         let txid = tx.compute_txid();
         // Write-ahead: the signed transaction and its record are stored before it can leave, so a
         // busy wallet afterwards can't lose it, and a reopen keeps its inputs locked.
-        let record = SendRecord { txid, tx: tx.clone(), inputs: inputs.clone(), state: "broadcasting".into(), created: now_secs(), replaces, via: None, broadcast: None };
+        let record = SendRecord { txid, tx: tx.clone(), inputs: inputs.clone(), state: if hold { wallet::HELD } else { "broadcasting" }.into(), created: now_secs(), replaces, via: None, broadcast: None };
         self.store_retry(|cell| {
             cell.store_send(&record)?;
             cell.persist()
         })?;
+        if hold {
+            return Ok(json!({"txid": txid.to_string(), "hex": bitcoin::consensus::encode::serialize_hex(&tx), "state": wallet::HELD}));
+        }
         self.update_preview(id, |p| p.state = "broadcasting".into());
         let (out, via) = match self.broadcast(&tx) {
             Ok(x) => x,
@@ -1051,13 +1061,18 @@ impl Engine {
                 return Err(e);
             }
         };
-        // From here the transaction may be out: whatever happens, the answer is its txid.
+        Ok(self.record_broadcast(&tx, replaces, out, &via))
+    }
+
+    /// From here the transaction may be out: whatever happens, the answer is its txid.
+    fn record_broadcast(&self, tx: &Transaction, replaces: Option<Txid>, out: Outcome, via: &str) -> Value {
+        let txid = tx.compute_txid();
         let stored = self.store_retry(|cell| {
             #[cfg(any(test, feature = "test-hooks"))]
             if hooks::BUSY_AFTER_BROADCAST.load(Ordering::SeqCst) {
                 return Err("the wallet is busy; try again (injected)".into());
             }
-            cell.set_send_broadcast(&txid, "sent", &via, out.as_str())?;
+            cell.set_send_broadcast(&txid, "sent", via, out.as_str())?;
             if let Some(old) = replaces {
                 cell.set_send_state(&old, "replaced")?;
             }
@@ -1069,7 +1084,30 @@ impl Engine {
         }
         self.wake();
         tracing::info!(target: "bitcoin", "broadcast: {} via {via}", out.as_str());
-        Ok(json!({"txid": txid.to_string(), "broadcast": out.as_str(), "via": via}))
+        json!({"txid": txid.to_string(), "broadcast": out.as_str(), "via": via})
+    }
+
+    /// Sends a held transaction. After a lost answer, asking again sends it again.
+    fn broadcast_held(&self, txid: Txid) -> Result<Value, String> {
+        let (tx, held) = self.cell_job(Duration::from_secs(30), |cell| {
+            let s = cell.sends()?.into_iter().find(|s| s.txid == txid && wallet::keeps_inputs(&s.state)).ok_or("no held transaction with that txid")?;
+            let held = s.state == wallet::HELD;
+            Ok((s.tx, held))
+        })?;
+        if held {
+            self.store_retry(|cell| cell.set_send_state(&txid, "broadcasting"))?;
+        }
+        let (out, via) = match self.broadcast(&tx) {
+            Ok(x) => x,
+            // Refused, or nowhere to send it: still held, to try again or abandon.
+            Err(e) => {
+                if held {
+                    let _ = self.store_retry(|cell| cell.set_send_state(&txid, wallet::HELD));
+                }
+                return Err(e);
+            }
+        };
+        Ok(self.record_broadcast(&tx, None, out, &via))
     }
 
     /// A store that waits out a busy wallet: up to five tries of a minute each.
@@ -1197,7 +1235,7 @@ impl Engine {
             let _ = self.manager.cancel_approval(&t.handle, &t.receipt);
         }
         let unlocked = self.cell_job(Duration::from_secs(60), |cell| {
-            let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| wallet::live(&s.state)).flat_map(|s| s.inputs.clone()).collect();
+            let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| wallet::keeps_inputs(&s.state)).flat_map(|s| s.inputs.clone()).collect();
             let mut out = vec![];
             for op in &p.inputs {
                 if !live.contains(op) {
@@ -1219,6 +1257,9 @@ impl Engine {
     fn rebroadcast(&self, txid: Txid) -> Result<Value, String> {
         let tx = self.cell_job(Duration::from_secs(30), |cell| {
             if let Some(s) = cell.sends()?.into_iter().find(|s| s.txid == txid) {
+                if s.state == wallet::HELD {
+                    return Err("this transaction is held: broadcast_held sends it".to_string());
+                }
                 return Ok(s.tx);
             }
             cell.wallet.tx_graph().get_tx(txid).map(|t| (*t).clone()).ok_or_else(|| "unknown transaction".to_string())
@@ -1229,7 +1270,7 @@ impl Engine {
 
     fn abandon(&self, txid: Txid) -> Result<Value, String> {
         self.cell_job(Duration::from_secs(60), |cell| {
-            let s = cell.sends()?.into_iter().find(|s| s.txid == txid && wallet::live(&s.state)).ok_or("no unconfirmed send with that txid")?;
+            let s = cell.sends()?.into_iter().find(|s| s.txid == txid && wallet::keeps_inputs(&s.state)).ok_or("no unconfirmed send with that txid")?;
             for op in &s.inputs {
                 cell.wallet.unlock_outpoint(*op);
             }
@@ -1611,7 +1652,7 @@ pub mod hooks {
 }
 
 fn release_stale_locks(cell: &mut Cell) -> Result<(), String> {
-    let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| wallet::live(&s.state)).flat_map(|s| s.inputs.clone()).collect();
+    let live: std::collections::HashSet<OutPoint> = cell.sends()?.iter().filter(|s| wallet::keeps_inputs(&s.state)).flat_map(|s| s.inputs.clone()).collect();
     let stale: Vec<OutPoint> = cell.wallet.list_locked_outpoints().filter(|o| !live.contains(o)).collect();
     for o in stale {
         cell.wallet.unlock_outpoint(o);
@@ -1643,6 +1684,9 @@ mod tests {
         assert!(parse_task("open_wallet", r#"{"network":"regtest","family":"bitcoin","birthday":"soon"}"#).is_err());
         assert!(parse_task("sign_and_broadcast", r#"{"previewId":"p1"}"#).is_ok());
         assert!(parse_task("sign_and_broadcast", r#"{"previewId":"p1","psbt":"x"}"#).is_err());
+        assert!(parse_task("sign_held", r#"{"previewId":"p1"}"#).is_ok() && parse_task("sign_held", "{}").is_err());
+        assert!(parse_task("broadcast_held", r#"{"txid":"nope"}"#).is_err());
+        assert!(backend_only("sign_held") && backend_only("broadcast_held"));
         assert!(parse_task("bump_fee", r#"{"txid":"nope","feeRate":5}"#).is_err());
         assert!(parse_task("teleport", "{}").is_err());
         assert!(backend_only("sign_and_broadcast") && backend_only("cancel_send") && !backend_only("build_send"));
@@ -2095,13 +2139,14 @@ mod tests {
         let mut cell = Cell { wallet: w, conn, network: BNetwork::Regtest, family: Family::Bitcoin, shared: None };
         let op = |n: u8| OutPoint { txid: Txid::from_byte_array([n; 32]), vout: 0 };
         let tx = bitcoin::Transaction { version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO, input: vec![], output: vec![] };
-        for (n, state) in [(1u8, "broadcasting"), (2, "sent"), (3, "failed")] {
+        for (n, state) in [(1u8, "broadcasting"), (2, "sent"), (3, "failed"), (5, wallet::HELD)] {
             cell.store_send(&SendRecord { txid: Txid::from_byte_array([100 + n; 32]), tx: tx.clone(), inputs: vec![op(n)], state: state.into(), created: 0, replaces: None, via: None, broadcast: None }).unwrap();
         }
-        for n in 1..=4 {
+        for n in 1..=5 {
             cell.wallet.lock_outpoint(op(n));
         }
         release_stale_locks(&mut cell).unwrap();
+        assert!(cell.wallet.is_outpoint_locked(op(5)), "held to be sent later");
         assert!(cell.wallet.is_outpoint_locked(op(1)), "it may have gone out before the store after it");
         assert!(cell.wallet.is_outpoint_locked(op(2)));
         assert!(!cell.wallet.is_outpoint_locked(op(3)), "refused: nothing left");

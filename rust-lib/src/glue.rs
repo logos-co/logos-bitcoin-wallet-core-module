@@ -19,7 +19,8 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, version, crates }`.
     fn version(&self) -> String;
     /// `{ ok, jobId, receipt }` for open_wallet, close_wallet, build_send, bump_fee, rebroadcast, and
-    /// for the backend sign_and_broadcast, cancel_send, abandon_send, set_birthday and set_gap_limit
+    /// for the backend sign_and_broadcast, sign_held, broadcast_held, cancel_send, abandon_send,
+    /// set_birthday and set_gap_limit
     /// (README, Job kinds). open_wallet's params and result carry `gapLimit`, 20 to 1000.
     fn start_job(&self, kind: String, params: String) -> String;
     /// `{ ok, jobId, kind, state: queued|running|done|failed|cancelled, error }`.
