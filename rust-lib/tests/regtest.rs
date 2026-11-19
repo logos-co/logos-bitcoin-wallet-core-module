@@ -185,6 +185,32 @@ fn bitcoin_wallet_on_regtest() {
     }
     assert_eq!(t.sats("confirmed"), balance_before, "nothing left the wallet");
 
+    // Signed and held: nothing leaves, the coins stay locked, and abandoning gives them back.
+    let locked = |t: &T| t.engine.utxos()["utxos"].as_array().unwrap().iter().any(|u| u["locked"] == true);
+    let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "1000000"}], "feeRate": 2.0}));
+    let held = t.job("sign_held", json!({"previewId": p["previewId"]}));
+    let held_id = held["txid"].as_str().unwrap().to_string();
+    assert_eq!((&held["txid"], held["state"].as_str()), (&p["txid"], Some("held")), "{held}");
+    assert!(held["hex"].as_str().is_some_and(|h| !h.is_empty()), "{held}");
+    assert!(!t.in_mempool(&held_id) && locked(&t));
+    assert!(t.job_err("rebroadcast", json!({"txid": held_id})).contains("held"), "only broadcast_held sends it");
+    let a = t.job("abandon_send", json!({"txid": held_id}));
+    assert!(!a["unlocked"].as_array().unwrap().is_empty() && !locked(&t), "{a}");
+    assert!(t.job_err("broadcast_held", json!({"txid": held_id})).contains("no held transaction"));
+
+    // Held, then broadcast; asking again after a lost answer sends the same transaction.
+    let p = t.job("build_send", json!({"recipients": [{"address": theirs, "amountSat": "1000000"}], "feeRate": 2.0}));
+    let held = t.job("sign_held", json!({"previewId": p["previewId"]}));
+    let held_id = held["txid"].as_str().unwrap().to_string();
+    let sent = t.job("broadcast_held", json!({"txid": held_id}));
+    assert_eq!(sent["txid"], held["txid"], "{sent}");
+    t.wait("the held send in the mempool", 30, || t.in_mempool(&held_id));
+    assert_eq!(t.job("broadcast_held", json!({"txid": held_id}))["txid"], held["txid"]);
+    t.mine(1);
+    t.synced();
+    t.wait("the held send confirmed", 60, || t.row(&held_id)["state"] == "confirmed");
+    assert!(!locked(&t), "its inputs are spent");
+
     // Bump a low-fee send through build_fee_bump; the replacement confirms, the original doesn't.
     let (_, slow) = t.send(&theirs, 5_000_000, Some(1.0));
     let slow_id = slow["txid"].as_str().unwrap().to_string();
