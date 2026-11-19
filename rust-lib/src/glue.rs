@@ -69,7 +69,8 @@ pub trait BitcoinWalletCoreModule: Send + Sync + 'static {
     fn exposure(&self) -> String;
     /// The wallet's public descriptors, as the keystore gave them. Backend only.
     fn descriptors(&self) -> String;
-    /// A send's preview with its state and `approvalHandle`.
+    /// A send's preview with its state and `approvalHandle`. While it waits, `needsPerson` says a
+    /// person must decide and `why` what an allowance didn't cover.
     fn preview(&self, preview_id: String) -> String;
     /// `{ ok, wallets: [{ group, family, network, createdAt }] }`.
     fn list_wallets(&self, network: String) -> String;
@@ -148,7 +149,11 @@ impl BitcoinWalletCoreModule for BitcoinWalletCoreModuleImpl {
         if crate::engine::backend_only(&kind) && !self.backend() {
             return refused();
         }
-        self.with(|e| e.start_job(&kind, &params))
+        let asker = match logos_rust_sdk::current_caller() {
+            LogosCaller::Module { name, .. } => Some(name),
+            _ => None,
+        };
+        self.with(|e| e.start_job_for(&kind, &params, asker))
     }
 
     fn job_status(&self, job_id: String, receipt: String) -> String {

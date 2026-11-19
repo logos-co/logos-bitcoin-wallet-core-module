@@ -129,8 +129,18 @@ pub fn database_scope(family: Family, network: BNetwork, descriptor: &str) -> Re
 
 /// A Bitcoin intent: the group, its xpub and exactly one psbt leg. A signer that keeps the xpub
 /// sealed lists none, so the open wallet brings it; the manager checks it is the group's.
-pub fn approval_intent(group: &str, xpub: &str, purpose: &str, network: BNetwork, psbt_base64: &str) -> String {
-    json!({"group": group, "xpub": xpub, "purpose": purpose, "legs": [{"kind": "psbt", "network": network.name(), "psbt": psbt_base64}]}).to_string()
+pub fn approval_intent(group: &str, xpub: &str, purpose: &str, network: BNetwork, psbt_base64: &str, asker: Option<&str>) -> String {
+    let mut intent = json!({"group": group, "xpub": xpub, "purpose": purpose, "legs": [{"kind": "psbt", "network": network.name(), "psbt": psbt_base64}]});
+    if let Some(asker) = asker {
+        intent["for"] = json!(asker);
+    }
+    intent.to_string()
+}
+
+/// Whether the request waits for a person, and why an allowance didn't cover it.
+pub fn needs_person(reply: &str) -> (bool, Option<String>) {
+    let v: Value = serde_json::from_str(reply).unwrap_or_default();
+    (v["person"] == true, v["why"].as_str().map(str::to_string))
 }
 
 /// The account xpub in a descriptor such as `wpkh([73c5da0a/84'/1'/0']tpub…/0/*)#…`.
@@ -276,10 +286,11 @@ mod tests {
         assert_eq!((p["group"].clone(), p["network"].clone()), (json!("g_1"), json!("signet")));
         let p: Value = serde_json::from_str(&open_params(BNetwork::Mainnet, None, Some(Family::BitcoinTaproot)).unwrap()).unwrap();
         assert_eq!((p["family"].clone(), p.get("group")), (json!("bitcoin_taproot"), None));
-        let i: Value = serde_json::from_str(&approval_intent("g_1", "tpubD6", "Send", BNetwork::Signet, "cHNidP8=")).unwrap();
+        let i: Value = serde_json::from_str(&approval_intent("g_1", "tpubD6", "Send", BNetwork::Signet, "cHNidP8=", Some("maker"))).unwrap();
         assert_eq!(i["legs"].as_array().unwrap().len(), 1);
         assert_eq!(i["legs"][0]["kind"], "psbt");
         assert_eq!(i["xpub"], "tpubD6");
+        assert_eq!(i["for"], "maker");
         assert_eq!(signed_psbts(&json!({"ok": true, "signed": ["cHNidP8="]}).to_string()).unwrap(), vec!["cHNidP8="]);
         assert!(require_approved("approved").is_ok());
         assert!(require_approved("expired_no_ack").unwrap_err().starts_with("expired_no_ack"));

@@ -172,8 +172,8 @@ enum Task {
     Close,
     BuildSend(Value),
     BumpFee { txid: Txid, fee_rate: f64 },
-    SignAndBroadcast { preview: String },
-    SignHeld { preview: String },
+    SignAndBroadcast { preview: String, asker: Option<String> },
+    SignHeld { preview: String, asker: Option<String> },
     BroadcastHeld { txid: Txid },
     CancelSend { preview: String },
     Rebroadcast { txid: Txid },
@@ -267,8 +267,8 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
             txid: txid()?,
             fee_rate: v["feeRate"].as_f64().filter(|r| r.is_finite() && *r > 0.0).ok_or("feeRate is required, in sat/vB")?,
         },
-        "sign_and_broadcast" => Task::SignAndBroadcast { preview: preview()? },
-        "sign_held" => Task::SignHeld { preview: preview()? },
+        "sign_and_broadcast" => Task::SignAndBroadcast { preview: preview()?, asker: None },
+        "sign_held" => Task::SignHeld { preview: preview()?, asker: None },
         "broadcast_held" => Task::BroadcastHeld { txid: txid()? },
         "cancel_send" => Task::CancelSend { preview: preview()? },
         "rebroadcast" => Task::Rebroadcast { txid: txid()? },
@@ -361,10 +361,17 @@ impl Engine {
     }
 
     pub fn start_job(self: &Arc<Self>, kind: &str, params: &str) -> Value {
+        self.start_job_for(kind, params, None)
+    }
+
+    /// `asker` is the module that called: the signer manager's allowances can name it.
+    pub fn start_job_for(self: &Arc<Self>, kind: &str, params: &str, asker: Option<String>) -> Value {
         if self.closed.load(Ordering::SeqCst) {
             return json!({"ok": false, "error": "unloading"});
         }
         let task = match parse_task(kind, params) {
+            Ok(Task::SignAndBroadcast { preview, .. }) => Task::SignAndBroadcast { preview, asker },
+            Ok(Task::SignHeld { preview, .. }) => Task::SignHeld { preview, asker },
             Ok(t) => t,
             Err(e) => return json!({"ok": false, "error": e, "code": crate::jobs::code_of(&e)}),
         };
@@ -396,8 +403,8 @@ impl Engine {
             Task::Close => Ok(json!({"closed": self.close(true)})),
             Task::BuildSend(v) => self.build_send(&v),
             Task::BumpFee { txid, fee_rate } => self.bump_fee(txid, fee_rate),
-            Task::SignAndBroadcast { preview } => self.sign_and_broadcast(&preview, cancel, false),
-            Task::SignHeld { preview } => self.sign_and_broadcast(&preview, cancel, true),
+            Task::SignAndBroadcast { preview, asker } => self.sign_and_broadcast(&preview, cancel, false, asker.as_deref()),
+            Task::SignHeld { preview, asker } => self.sign_and_broadcast(&preview, cancel, true, asker.as_deref()),
             Task::BroadcastHeld { txid } => self.broadcast_held(txid),
             Task::CancelSend { preview } => self.cancel_send(&preview),
             Task::Rebroadcast { txid } => self.rebroadcast(txid),
@@ -966,7 +973,7 @@ impl Engine {
         }
     }
 
-    fn sign_and_broadcast(self: &Arc<Self>, id: &str, cancel: Arc<AtomicBool>, hold: bool) -> Result<Value, String> {
+    fn sign_and_broadcast(self: &Arc<Self>, id: &str, cancel: Arc<AtomicBool>, hold: bool, asker: Option<&str>) -> Result<Value, String> {
         let (group, network, family) = self.with_open(|w| Ok((w.group.clone(), w.network, w.family)))?;
         let (psbt, kind, replaces, inputs) = {
             let mut previews = self.previews.lock();
@@ -978,7 +985,7 @@ impl Engine {
             p.cancel = cancel.clone();
             (p.psbt.clone(), p.kind, p.replaces, p.inputs.clone())
         };
-        let r = self.sign_inner(id, &group, network, family, psbt, kind, replaces, inputs, &cancel, hold);
+        let r = self.sign_inner(id, &group, network, family, psbt, kind, replaces, inputs, &cancel, hold, asker);
         self.set_light(|l| l.approval_handle = None);
         match &r {
             Ok(_) => {
@@ -1006,20 +1013,24 @@ impl Engine {
         inputs: Vec<OutPoint>,
         cancel: &AtomicBool,
         hold: bool,
+        asker: Option<&str>,
     ) -> Result<Value, String> {
         let purpose = if kind == "fee_bump" { "Raise the fee of a Bitcoin send" } else { "Bitcoin send" };
         let xpub = self.with_open(|w| if w.group == group { Ok(w.xpub.clone()) } else { Err("the wallet closed".into()) })?;
-        let intent = Zeroizing::new(manager::approval_intent(group, &xpub, purpose, network, &psbt.to_string()));
+        let intent = Zeroizing::new(manager::approval_intent(group, &xpub, purpose, network, &psbt.to_string(), asker));
         if intent.len() > send::MAX_INTENT_BYTES {
             return Err("the transaction is too large to ask for approval".into());
         }
         let reply = self.manager.request_approval(&intent).map_err(|e| format!("signer_manager_module: {e}"))?;
         let ticket = manager::ticket(&reply)?;
         let handle = ticket.handle.clone();
+        let (needs_person, why) = manager::needs_person(&reply);
         tracing::info!(target: "bitcoin", "approval requested: {handle}");
         self.update_preview(id, |p| {
             p.state = "awaiting_approval".into();
             p.ticket = Some(Ticket { handle: ticket.handle.clone(), receipt: ticket.receipt.clone() });
+            p.json["needsPerson"] = json!(needs_person);
+            p.json["why"] = json!(why);
         });
         self.set_light(|l| l.approval_handle = Some(handle.clone()));
         let reason = manager::wait_settled(&*self.manager, &ticket, &self.settled, cancel, APPROVAL_LIMIT, |state| {

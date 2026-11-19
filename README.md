@@ -524,7 +524,7 @@ Amounts are decimal strings of satoshis.
 | `fee_rates()` | `{ fast, normal, slow, minimum, sources, estimated }` sat/vB: the median of the fee sources, never below the highest minimum relay fee; `sources` are those whose estimates went in. Only an estimate for every level answers: until then `{ ok: false, error: "no fee estimate yet" }`, and `build_send` without `feeRate` is refused. Electrum's -1 and Kyoto's relay floor are no estimate, except on signet, where the floor stands in when nothing estimates (`basis: "floor"`); a round with none keeps the last one |
 | `address_valid(text, network)` | An address or BIP21 URI: `{ valid, address, type, dustSat, amountSat?, label?, message? }`; `dustSat` is the address's dust limit, the least it can receive (294 native segwit, 330 taproot and P2WSH, 540 P2SH, 546 legacy) |
 | `sources_status()`, `exposure()` | `{ chainBy, local, kyoto: { id, route, peers, down }, sources }`: who feeds the chain and per server health (`state` `stale` while the tip watch finds it lagging), with `encrypted` false for plain text outside Tor (the app marks those servers); the servers that learned the addresses |
-| `preview(previewId)` | The preview, its state and `approvalHandle` |
+| `preview(previewId)` | The preview, its state and `approvalHandle`. While it waits, `needsPerson` says a person must decide, and `why` what an allowance didn't cover |
 | `list_wallets(network)` | The wallets on disk: `{ group, family, network, createdAt }` |
 | `descriptors()` | Backend only: the public descriptors, as the keystore gave them |
 | `clear_suspect(source)`, `reload_routes()` | Backend only |
@@ -962,20 +962,26 @@ HOME and a fresh chain (`common.sh` holds the pins and the shared steps):
 
 A service that funds transactions on its own runs the same modules with no app. At every start, in
 this order: configure the keystore and manager roles, start the node, load the core, unlock the
-seed (`evm_signer_cli unlock_wallet`), `open_wallet` with the approver's consent
-(`evm_signer_cli approve_open`), and last grant the unlock (`evm_keystore_cli unlock`):
+seed (`evm_signer_cli unlock_wallet`), and `open_wallet` with the approver's consent
+(`evm_signer_cli approve_open`). The first start also grants an allowance once
+(`evm_signer_cli grant_allowance`):
 
 ```json
-{ "account": "<group>", "password": "…", "apps": ["bitcoin_wallet_core_module"], "confirm": false,
-  "maxSpendSat": 200000000, "totalSpendSat": 500000000 }
+{ "account": "<group>", "password": "…", "callers": [{ "module": "bitcoin_wallet_core_module", "for": "<your module>" }],
+  "scope": { "kind": "spend", "network": "regtest" },
+  "limits": { "perRequest": "200000000", "total": "500000000" } }
 ```
 
-Nothing stays unlocked across a restart, so the service keeps the password in its own secret store
-and passes it as a file. The caps belong to the signer manager: a request over one is refused at
-once, and each signature is recorded before it is made (`evm_signer_cli unattended`). The service
-calls the core from a module named in `callers.json`. `unattended.sh` runs this end to end: signing
-with no approver loaded, both caps, a restart with transactions held, `broadcast_held` afterwards,
-a lock, and the caller list.
+`for` names the module that called the core. Leave it out to cover every caller the core admits.
+
+An allowance and what it has spent survive a restart, but it waits until the password is given
+again (`evm_signer_cli resume_allowances`), so the service keeps the password in its own secret
+store and passes it as a file. The limits belong to the signer manager. A request outside them isn't
+refused: it waits for a person, `preview` says so with `needsPerson` and `why`, and it expires if
+nobody decides. Each signature is recorded before it is made (`evm_signer_cli unattended`). The
+service calls the core from a module named in `callers.json`. `unattended.sh` runs this end to end:
+signing with no approver loaded, both limits, a restart with transactions held, `broadcast_held`
+afterwards, removing the allowance, and the caller list.
 
 Measured on 2026-10-11, macOS 27 (aarch64) and Linux (x86_64): spike 3 had 20 of 20 unloads within
 2 s in each state on both, every reopen intact. logosctl's unload took 0.20–0.47 s on macOS (medians

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Signing with nobody present, as a headless service runs it: bitcoind_module as the authority, an
-# unlock granted at boot with spending caps, sign_held now and broadcast_held after a restart.
+# allowance with spending limits, sign_held now and broadcast_held after a restart.
 #   WORK=<dir> BITCOIND_MODULE=<logos-bitcoind-module checkout> tools/e2e/unattended.sh
 # Env: WORK, SKIP_BUILD (as for logosctl.sh), BITCOIND_MODULE, PINS (a file overriding common.sh's pins).
 set -uo pipefail
@@ -34,13 +34,18 @@ node_up() {
   call bitcoind_module start regtest > /dev/null
   until_true 'v.get("state") == "running"' bitcoind_module status > /dev/null
 }
-# The custodian's grant. The password comes from a file, which a service takes from its secret store.
+# The approver's grant. The password comes from a file, which a service takes from its secret store.
 grant() {
-  printf '%s' "{\"account\":\"$GROUP\",\"password\":\"btc-pw\",\"apps\":[\"$CORE\"],\"confirm\":false,\"maxSpendSat\":$MAX_EACH,\"totalSpendSat\":$MAX_TOTAL}" > unlock.json
-  chmod 600 unlock.json
-  call evm_keystore_cli unlock @unlock.json > granted.json
+  printf '%s' "{\"account\":\"$GROUP\",\"password\":\"btc-pw\",\"callers\":[{\"module\":\"$CORE\"}],\"scope\":{\"kind\":\"spend\",\"network\":\"regtest\"},\"limits\":{\"perRequest\":\"$MAX_EACH\",\"total\":\"$MAX_TOTAL\"}}" > grant.json
+  chmod 600 grant.json
+  call evm_signer_cli grant_allowance @grant.json > granted.json
 }
-spent() { call evm_keystore_cli unlocked | js 'v["unlocked"][0]["spentSat"]'; }
+resume() {
+  printf '%s' "{\"account\":\"$GROUP\",\"password\":\"btc-pw\"}" > resume.json
+  chmod 600 resume.json
+  call evm_signer_cli resume_allowances @resume.json > resumed.json
+}
+spent() { call evm_signer_cli allowances | js 'v["allowances"][0]["used"]["spent"]'; }
 # attempt <kind> <params> <file>: the job's end in <file>.status, its result in <file>.
 attempt() {
   local r id rc
@@ -54,11 +59,19 @@ hold() {
   job build_send "{\"recipients\":[{\"address\":\"$PAYEE\",\"amountSat\":\"$1\"}],\"feeRate\":2}" > "$2.preview"
   attempt sign_held "{\"previewId\":\"$(js 'v["result"]["previewId"]' < "$2.preview")\"}" "$2"
 }
+# outside <sats> <file>: a send no allowance covers waits for a person; <file> is its preview then.
+outside() {
+  job build_send "{\"recipients\":[{\"address\":\"$PAYEE\",\"amountSat\":\"$1\"}],\"feeRate\":2}" > "$2.preview"
+  local pid; pid="$(js 'v["result"]["previewId"]' < "$2.preview")"
+  call "$CORE" start_job sign_held "{\"previewId\":\"$pid\"}" > /dev/null
+  until_for 20 'v.get("needsPerson") is True' "$CORE" preview "$pid" > "$2"
+  drop_preview "$2"; sleep 1
+}
+says() { holds "$1" "'$2' in (v.get('why') or '')"; }
 drop_preview() { job cancel_send "{\"previewId\":\"$(js 'v["result"]["previewId"]' < "$1.preview")\"}" > /dev/null; }
 txid_of() { js 'v["result"]["txid"]' < "$1"; }
-refused_for() { holds "$1.status" "v['state'] == 'failed' and '$2' in (v.get('error') or '')"; }
 
-# What every start after the first does: nothing stays unlocked across a restart.
+# What every start after the first does: the allowance waits for the password.
 boot() {
   keystore_side bare
   node_up
@@ -78,7 +91,8 @@ print(json.dumps({"seed": w["seed"], "way": w["ways"][0]["id"], "holder": w["hol
   call evm_signer_cli approve_open "$handle" "$(js 'v["bundle_id"]' < shown.json)" str: > /dev/null
   until_for 60 'v["state"] in ("done","failed","cancelled")' "$CORE" job_status "$oid" "$orc" > /dev/null
   until_true 'v["synced"] is True' "$CORE" status > /dev/null
-  grant
+  call evm_signer_cli allowances > waiting.json
+  resume
 }
 
 step "First start: the wallet imported, the node on regtest, the core funded"
@@ -115,16 +129,14 @@ keystore_roles
 AFTER_ONE="$(spent)"
 check spend_counts_the_fee_not_the_change "$([ "$AFTER_ONE" -gt "$BTC" ] && [ "$AFTER_ONE" -lt $(( BTC + 100000 )) ] && echo 1 || echo 0)" "$AFTER_ONE sats"
 
-step "The caps refuse at once, and refused spends count for nothing"
-hold $(( 3 * BTC )) over-each
-check over_the_cap_per_signature "$(refused_for over-each 'per signature')" "$(js 'v.get("error")' < over-each.status | cut -c1-160)"
-drop_preview over-each
-check a_refusal_spends_nothing "$([ "$(spent)" = "$AFTER_ONE" ] && echo 1 || echo 0)"
+step "Outside the limits a person decides, and what waits counts for nothing"
+outside $(( 3 * BTC )) over-each
+check over_the_limit_per_signature "$(says over-each 'per signature')" "$(js 'v.get("why")' < over-each | cut -c1-160)"
+check waiting_spends_nothing "$([ "$(spent)" = "$AFTER_ONE" ] && echo 1 || echo 0)"
 hold $(( 19 * BTC / 10 )) h2; H2="$(txid_of h2)"
 hold $(( 19 * BTC / 10 )) h3; H3="$(txid_of h3)"
-hold "$BTC" over-total
-check over_the_cap_in_all "$(refused_for over-total 'already spent')" "$(js 'v.get("error")' < over-total.status | cut -c1-160)"
-drop_preview over-total
+outside "$BTC" over-total
+check over_the_limit_in_all "$(says over-total 'left of its allowance')" "$(js 'v.get("why")' < over-total | cut -c1-160)"
 
 step "Abandoning a held send gives back its coins, not its budget"
 BEFORE="$(spent)"
@@ -132,22 +144,23 @@ attempt abandon_send "{\"txid\":\"$H3\"}" ab
 check abandon_unlocks_the_coins "$(holds ab 'len(v["result"]["unlocked"]) >= 1')"
 check abandon_keeps_the_budget_spent "$([ "$(spent)" = "$BEFORE" ] && echo 1 || echo 0)"
 
-step "No record, no signature"
+step "No record, no unattended signature"
 AUDIT="$(find session home -name unattended.jsonl | head -1)"
 check record_is_sealed "$(grep -q "$H1" "$AUDIT" && echo 0 || echo 1)"
 mv "$AUDIT" "$AUDIT.aside"; mkdir "$AUDIT"
-hold 1000000 unrecorded
-check unwritable_record_refuses "$(refused_for unrecorded 'record of it')" "$(js 'v.get("error")' < unrecorded.status | cut -c1-160)"
-drop_preview unrecorded
+outside 1000000 unrecorded
+check unwritable_record_goes_to_a_person "$(says unrecorded 'record of it')" "$(js 'v.get("why")' < unrecorded | cut -c1-160)"
 rmdir "$AUDIT"; mv "$AUDIT.aside" "$AUDIT"
 
 step "Restart everything with two transactions held"
 call evm_signer_cli unattended > audit-before.json
+BEFORE_RESTART="$(spent)"
 job close_wallet '{}' > /dev/null
 ctl daemon stop; sleep 4
 T0=$(ms); boot; T1=$(ms)
-check boot_is_scripted "$(holds granted.json 'v.get("ok") is True')" "$(( T1 - T0 )) ms from daemon start to the grant"
-check a_new_unlock_is_a_new_budget "$([ "$(spent)" = 0 ] && echo 1 || echo 0)"
+check waits_for_the_password_after_a_restart "$(holds waiting.json 'v["allowances"][0]["state"] == "waiting"')"
+check boot_is_scripted "$(holds resumed.json 'v.get("ok") is True')" "$(( T1 - T0 )) ms from daemon start to the allowance starting again"
+check spending_survives_the_restart "$([ "$(spent)" = "$BEFORE_RESTART" ] && echo 1 || echo 0)" "$BEFORE_RESTART sats"
 call evm_signer_cli unattended > audit-after.json
 check record_survives_the_restart "$(holds audit-after.json "{'$H1', '$H2', '$H3'} <= {r['txid'] for r in v['signed']} and all(r['spendSat'] > 0 and r['atMs'] > 0 for r in v['signed'])")" "$(js 'len(v["signed"])' < audit-after.json) signatures listed"
 
@@ -160,12 +173,12 @@ until_for 40 'any(r["txid"] == "'"$H1"'" and r["state"] == "confirmed" for r in 
   && check held_confirms 1 || check held_confirms 0
 attempt abandon_send "{\"txid\":\"$H2\"}" ab2
 
-step "A lock ends it: the next request waits for a person"
-call evm_keystore_cli lock '{}' > /dev/null
+step "Removing the allowance ends it: the next request waits for a person"
+call evm_signer_cli revoke_allowance "$(call evm_signer_cli allowances | js 'v["allowances"][0]["id"]')" > /dev/null
 job build_send "{\"recipients\":[{\"address\":\"$PAYEE\",\"amountSat\":\"$BTC\"}],\"feeRate\":2}" > locked.preview
 R="$(call "$CORE" start_job sign_held "{\"previewId\":\"$(js 'v["result"]["previewId"]' < locked.preview)\"}")"
 sleep 5
-check lock_stops_unattended_signing "$(call "$CORE" status | js '1 if v.get("approvalHandle") else 0')"
+check removing_stops_unattended_signing "$(call "$CORE" status | js '1 if v.get("approvalHandle") else 0')"
 drop_preview locked
 
 step "A caller list without the host: logosctl is refused"
