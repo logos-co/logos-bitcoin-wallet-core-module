@@ -38,22 +38,50 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Multiple wallets are synced by one node with [`BuilderExt::wallets`], each following its own
+//! [`SyncConfig`].
+//!
+//! ```no_run
+//! # const RECEIVE: &str = "tr([7d94197e/86'/1'/0']tpubDCyQVJj8KzjiQsFjmb3KwECVXPvMwvAxxZGCP9XmWSopmjW3bCV3wD7TgxrUhiGSueDS1MU5X1Vb1YjYcp8jitXc5fXfdC1z68hDDEyKRNr/0/*)";
+//! # const CHANGE: &str = "tr([7d94197e/86'/1'/0']tpubDCyQVJj8KzjiQsFjmb3KwECVXPvMwvAxxZGCP9XmWSopmjW3bCV3wD7TgxrUhiGSueDS1MU5X1Vb1YjYcp8jitXc5fXfdC1z68hDDEyKRNr/1/*)";
+//! # const RECEIVE_TWO: &str = "wpkh([9122d9e0/84'/1'/0']tpubDCYVtmaSaDzTxcgvoP5AHZNbZKZzrvoNH9KARep88vESc6MxRqAp4LmePc2eeGX6XUxBcdhAmkthWTDqygPz2wLAyHWisD299Lkdrj5egY6/0/*)";
+//! # const CHANGE_TWO: &str = "wpkh([9122d9e0/84'/1'/0']tpubDCYVtmaSaDzTxcgvoP5AHZNbZKZzrvoNH9KARep88vESc6MxRqAp4LmePc2eeGX6XUxBcdhAmkthWTDqygPz2wLAyHWisD299Lkdrj5egY6/1/*)";
+//! use bdk_wallet::Wallet;
+//! use bdk_kyoto::bip157::Network;
+//! use bdk_kyoto::builder::{Builder, BuilderExt};
+//! use bdk_kyoto::SyncConfig;
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! let existing = Wallet::create(RECEIVE, CHANGE)
+//!     .network(Network::Signet)
+//!     .create_wallet_no_persist()?;
+//! let new = Wallet::create(RECEIVE_TWO, CHANGE_TWO)
+//!     .network(Network::Signet)
+//!     .create_wallet_no_persist()?;
+//!
+//! let client = Builder::new(Network::Signet)
+//!     .wallets()
+//!     .add(&existing, SyncConfig::sync_from_last_checkpoint().build())
+//!     .add(&new, SyncConfig::new_wallet_sync().build())
+//!     .build()?;
+//! # Ok(())
+//! # }
+//! ```
 
+use std::collections::HashSet;
 use std::fmt::Display;
 
 use bdk_wallet::{
-    chain::{
-        keychain_txout::KeychainTxOutIndex, CheckPoint, ConfirmationBlockTime, DescriptorExt,
-        DescriptorId, IndexedTxGraph,
-    },
+    chain::{CheckPoint, DescriptorExt, DescriptorId, IndexedTxGraph},
     KeychainKind, Wallet,
 };
 pub use bip157::Builder;
 use bip157::{chain::ChainState, HashCheckpoint, Network};
 
 use crate::{
-    state::Idle, sync_policy::SyncFromLastCheckpoint, LightClient, LoggingSubscribers, SyncConfig,
-    SyncPolicy, SyncPolicyType, UpdateSubscriber,
+    state::Idle, LightClient, LoggingSubscribers, SyncConfig, SyncPolicy, SyncPolicyType,
+    UpdateSubscriber,
 };
 
 const IMPOSSIBLE_REORG_DEPTH: usize = 7;
@@ -67,24 +95,17 @@ pub trait BuilderExt {
         sync_config: SyncConfig<P>,
     ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError>;
 
-    /// As [`build_with_wallet`](BuilderExt::build_with_wallet), but the node starts from
-    /// `chain_state`, such as a snapshot of headers the caller already holds and checked, instead
-    /// of the policy's checkpoint, so it downloads none of them again.
-    fn build_with_wallet_from<P: SyncPolicyType>(
+    /// Sync a [`Wallet`] following a [`SyncConfig`], with further options set on the
+    /// [`WalletBuilder`].
+    fn wallet<P: SyncPolicyType>(
         self,
         wallet: &Wallet,
         sync_config: SyncConfig<P>,
-        chain_state: ChainState,
-    ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError>;
+    ) -> WalletBuilder<'_, P>;
 
-    /// Attempt to build the node with scripts from multiple [`Wallet`]s and following a [`SyncConfig`].
-    ///
-    /// Only [`SyncFromLastCheckpoint`] configs are permitted. New and recovering wallets
-    /// must be synced individually.
-    fn build_with_wallets(
-        self,
-        wallets: Vec<(&Wallet, SyncConfig<SyncFromLastCheckpoint>)>,
-    ) -> Result<LightClient<Idle, crate::wallets::Multiple>, BuilderError>;
+    /// Sync multiple [`Wallet`]s with one node. Each wallet is added with its own
+    /// [`SyncConfig`] by [`WalletsBuilder::add`].
+    fn wallets<'a>(self) -> WalletsBuilder<'a>;
 }
 
 impl BuilderExt for Builder {
@@ -96,73 +117,26 @@ impl BuilderExt for Builder {
         build_single(self, wallet, sync_config, None)
     }
 
-    fn build_with_wallet_from<P: SyncPolicyType>(
+    fn wallet<P: SyncPolicyType>(
         self,
         wallet: &Wallet,
         sync_config: SyncConfig<P>,
-        chain_state: ChainState,
-    ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
-        build_single(self, wallet, sync_config, Some(chain_state))
+    ) -> WalletBuilder<'_, P> {
+        WalletBuilder {
+            builder: self,
+            wallet,
+            sync_config,
+            emit_every: None,
+            chain_state: None,
+        }
     }
 
-    fn build_with_wallets(
-        mut self,
-        wallets: Vec<(&Wallet, SyncConfig<SyncFromLastCheckpoint>)>,
-    ) -> Result<LightClient<Idle, crate::wallets::Multiple>, BuilderError> {
-        let network = wallets
-            .first()
-            .ok_or(BuilderError::EmptyIterator)?
-            .0
-            .network();
-        if self.network().ne(&network) {
-            return Err(BuilderError::NetworkMismatch);
+    fn wallets<'a>(self) -> WalletsBuilder<'a> {
+        WalletsBuilder {
+            builder: self,
+            wallets: Vec::new(),
+            emit_every: None,
         }
-        let cp_min = wallets
-            .iter()
-            .map(|(wallet, _)| walk_back_max_reorg(wallet.latest_checkpoint()))
-            .min()
-            .ok_or(BuilderError::EmptyIterator)?;
-        self = self.chain_state(ChainState::Checkpoint(cp_min));
-        let (node, client) = self.build();
-        let bip157::Client {
-            requester,
-            info_rx,
-            warn_rx,
-            event_rx,
-        } = client;
-        let wallet_iter = wallets
-            .into_iter()
-            .map(|(wallet, sync_config)| {
-                (
-                    wallet
-                        .public_descriptor(KeychainKind::External)
-                        .descriptor_id(),
-                    sync_config.0,
-                    wallet.latest_checkpoint(),
-                    IndexedTxGraph::new(wallet.spk_index().clone()),
-                )
-            })
-            .collect::<Vec<(
-                DescriptorId,
-                SyncPolicy,
-                CheckPoint,
-                IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
-            )>>();
-        let update_subscriber = UpdateSubscriber::<crate::wallets::Multiple>::new_multiple(
-            requester.clone(),
-            event_rx,
-            wallet_iter.into_iter(),
-        );
-        let client = LightClient::new(
-            requester,
-            LoggingSubscribers {
-                info_subscriber: info_rx,
-                warning_subscriber: warn_rx,
-            },
-            update_subscriber,
-            node,
-        );
-        Ok(client)
     }
 }
 
@@ -185,11 +159,11 @@ fn build_single<P: SyncPolicyType>(
                 .chain_state(ChainState::Checkpoint(new_wallet_anchor(network)))
                 .headers_only_sync();
         }
-        (SyncPolicy::SyncFromLast { lookahead: _ }, None) => {
+        (SyncPolicy::SyncFromLast, None) => {
             let sync_start = walk_back_max_reorg(wallet.latest_checkpoint());
             builder = builder.chain_state(ChainState::Checkpoint(sync_start));
         }
-        (SyncPolicy::Recovery { cp, .. }, None) => {
+        (SyncPolicy::Recovery { cp }, None) => {
             builder = builder.chain_state(ChainState::Checkpoint(cp));
         }
     }
@@ -203,7 +177,6 @@ fn build_single<P: SyncPolicyType>(
     let indexed_graph = IndexedTxGraph::new(wallet.spk_index().clone());
     let update_subscriber = UpdateSubscriber::<crate::wallets::Single>::new(
         requester.clone(),
-        sync_config.0,
         event_rx,
         wallet.latest_checkpoint(),
         indexed_graph,
@@ -218,6 +191,151 @@ fn build_single<P: SyncPolicyType>(
         node,
     );
     Ok(client)
+}
+
+/// Build a [`LightClient`] that syncs a [`Wallet`] following a [`SyncConfig`].
+pub struct WalletBuilder<'a, P: SyncPolicyType> {
+    builder: Builder,
+    wallet: &'a Wallet,
+    sync_config: SyncConfig<P>,
+    emit_every: Option<u32>,
+    chain_state: Option<ChainState>,
+}
+
+impl<P: SyncPolicyType> WalletBuilder<'_, P> {
+    /// Emit an [`Update`](crate::Update) each time `blocks` blocks are scanned before the tip,
+    /// ending at the last block scanned. A block is scanned once its filter is checked and, if it
+    /// matched, the block is applied. `blocks` is clamped to at least one.
+    pub fn emit_update_every_n_blocks(mut self, blocks: u32) -> Self {
+        self.emit_every = Some(blocks.max(1));
+        self
+    }
+
+    /// Start the node from `chain_state`, such as a snapshot of headers the caller already holds
+    /// and checked, instead of the [`SyncConfig`]'s checkpoint, so it downloads none of them again.
+    pub fn chain_state(mut self, chain_state: ChainState) -> Self {
+        self.chain_state = Some(chain_state);
+        self
+    }
+
+    /// Attempt to build the node with scripts from the [`Wallet`].
+    pub fn build(self) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
+        let mut client = build_single(
+            self.builder,
+            self.wallet,
+            self.sync_config,
+            self.chain_state,
+        )?;
+        if let Some(update_subscriber) = client.update_subscriber.as_mut() {
+            update_subscriber.emit_every = self.emit_every;
+        }
+        Ok(client)
+    }
+}
+
+/// Build a [`LightClient`] that syncs multiple [`Wallet`]s, each following its own
+/// [`SyncConfig`].
+///
+/// The node starts from the earliest point required by the wallets synced from their last
+/// checkpoint or recovered. New wallets do not move the starting point, but blocks paying their
+/// scripts after it are still found. If every wallet is new, only block headers are synced up to
+/// the current tip, as for a single new wallet.
+pub struct WalletsBuilder<'a> {
+    builder: Builder,
+    wallets: Vec<(&'a Wallet, SyncPolicy)>,
+    emit_every: Option<u32>,
+}
+
+impl<'a> WalletsBuilder<'a> {
+    /// Add a [`Wallet`] to sync, following a [`SyncConfig`].
+    pub fn add<P: SyncPolicyType>(
+        mut self,
+        wallet: &'a Wallet,
+        sync_config: SyncConfig<P>,
+    ) -> Self {
+        self.wallets.push((wallet, sync_config.0));
+        self
+    }
+
+    /// Emit updates each time `blocks` blocks are scanned before the tip, ending at the last
+    /// block scanned. A block is scanned once its filter is checked and, if it matched, the block
+    /// is applied. `blocks` is clamped to at least one.
+    pub fn emit_update_every_n_blocks(mut self, blocks: u32) -> Self {
+        self.emit_every = Some(blocks.max(1));
+        self
+    }
+
+    /// Attempt to build the node with scripts from every added [`Wallet`].
+    pub fn build(self) -> Result<LightClient<Idle, crate::wallets::Multiple>, BuilderError> {
+        let WalletsBuilder {
+            mut builder,
+            wallets,
+            emit_every,
+        } = self;
+        if wallets.is_empty() {
+            return Err(BuilderError::EmptyIterator);
+        }
+        let network = builder.network();
+        let mut ids = HashSet::new();
+        for (wallet, _) in &wallets {
+            if wallet.network().ne(&network) {
+                return Err(BuilderError::NetworkMismatch);
+            }
+            if !ids.insert(external_descriptor_id(wallet)) {
+                return Err(BuilderError::DuplicateWallet);
+            }
+        }
+        let sync_start = wallets
+            .iter()
+            .filter_map(|(wallet, policy)| match policy {
+                SyncPolicy::NewWallet => None,
+                SyncPolicy::SyncFromLast => Some(walk_back_max_reorg(wallet.latest_checkpoint())),
+                SyncPolicy::Recovery { cp } => Some(*cp),
+            })
+            .min();
+        builder = match sync_start {
+            Some(cp) => builder.chain_state(ChainState::Checkpoint(cp)),
+            None => builder
+                .chain_state(ChainState::Checkpoint(new_wallet_anchor(network)))
+                .headers_only_sync(),
+        };
+        let (node, client) = builder.build();
+        let bip157::Client {
+            requester,
+            info_rx,
+            warn_rx,
+            event_rx,
+        } = client;
+        let wallet_iter = wallets.into_iter().map(|(wallet, _)| {
+            (
+                external_descriptor_id(wallet),
+                wallet.latest_checkpoint(),
+                IndexedTxGraph::new(wallet.spk_index().clone()),
+            )
+        });
+        let mut update_subscriber = UpdateSubscriber::<crate::wallets::Multiple>::new_multiple(
+            requester.clone(),
+            event_rx,
+            wallet_iter,
+        );
+        update_subscriber.emit_every = emit_every;
+        let client = LightClient::new(
+            requester,
+            LoggingSubscribers {
+                info_subscriber: info_rx,
+                warning_subscriber: warn_rx,
+            },
+            update_subscriber,
+            node,
+        );
+        Ok(client)
+    }
+}
+
+fn external_descriptor_id(wallet: &Wallet) -> DescriptorId {
+    wallet
+        .public_descriptor(KeychainKind::External)
+        .descriptor_id()
 }
 
 fn new_wallet_anchor(network: Network) -> HashCheckpoint {
@@ -245,8 +363,10 @@ fn walk_back_max_reorg(checkpoint: CheckPoint) -> HashCheckpoint {
 pub enum BuilderError {
     /// The wallet network and node network do not match.
     NetworkMismatch,
-    /// The wallet iterator is empty.
+    /// No wallets were added.
     EmptyIterator,
+    /// The same wallet was added more than once.
+    DuplicateWallet,
 }
 
 impl Display for BuilderError {
@@ -255,7 +375,8 @@ impl Display for BuilderError {
             BuilderError::NetworkMismatch => {
                 write!(f, "wallet network and node network do not match")
             }
-            BuilderError::EmptyIterator => write!(f, "empty wallet iterator."),
+            BuilderError::EmptyIterator => write!(f, "no wallets were added"),
+            BuilderError::DuplicateWallet => write!(f, "the same wallet was added more than once"),
         }
     }
 }

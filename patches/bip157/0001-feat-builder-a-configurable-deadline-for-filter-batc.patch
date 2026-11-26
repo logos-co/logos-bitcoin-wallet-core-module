@@ -1,7 +1,7 @@
-From 0b25ebdb586b7179ee7903c3698ff828cae3b34b Mon Sep 17 00:00:00 2001
+From ecb2a241ace069da55867ff869f2ca87e68ff494 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sat, 10 Oct 2026 22:32:57 -0300
-Subject: [PATCH 2/5] feat(builder): a configurable deadline for filter batches
+Subject: [PATCH 1/5] feat(builder): a configurable deadline for filter batches
 
 A peer had 20 seconds, hard-coded, to send a whole batch of up to 999
 filters, about 20 MB on mainnet, which rarely arrives in time over Tor.
@@ -33,7 +33,7 @@ index f1dc654..631893b 100644
      /// believed to be at the current chain tip, filters will be downloaded for newly mined
      /// blocks. This feature is intended for new wallets that have never received a payment.
 diff --git a/src/network/mod.rs b/src/network/mod.rs
-index 30c930a..03b9e83 100644
+index 150bfef..949d42c 100644
 --- a/src/network/mod.rs
 +++ b/src/network/mod.rs
 @@ -52,7 +52,7 @@ const TWO_HOUR: Duration = Duration::from_secs(60 * 60 * 2);
@@ -62,7 +62,7 @@ index 30c930a..03b9e83 100644
          }
      }
  }
-@@ -419,10 +422,10 @@ impl FilterRate {
+@@ -424,10 +427,10 @@ impl FilterRate {
          }
      }
  
@@ -75,7 +75,7 @@ index 30c930a..03b9e83 100644
                  return true;
              }
          }
-@@ -626,7 +629,7 @@ mod tests {
+@@ -631,7 +634,7 @@ mod tests {
  
      use crate::network::{LastBlockMonitor, MessageState, PingState};
  
@@ -84,7 +84,7 @@ index 30c930a..03b9e83 100644
  
      #[tokio::test(start_paused = true)]
      async fn test_version_message_state() {
-@@ -727,10 +730,14 @@ mod tests {
+@@ -732,10 +735,14 @@ mod tests {
          let block_hash_bytes = [1; 32];
          let block_hash = BlockHash::from_byte_array(block_hash_bytes);
          filter_rate.batch_requested(block_hash);

@@ -34,7 +34,7 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 const DEADLINE: Duration = Duration::from_secs(180);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Kyoto's own version message, so an onion peer can't tell an errand from a Kyoto client.
-const USER_AGENT: &str = "/Rust BIP-157:0.8.1/rust-bitcoin:0.32.8/";
+const USER_AGENT: &str = "/Rust BIP-157:0.9.0/rust-bitcoin:0.32.102/";
 const PROTOCOL: u32 = 70016;
 /// A block with its witnesses fits in 4 MB.
 const MAX_MESSAGE: usize = 8 << 20;

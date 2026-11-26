@@ -19,15 +19,15 @@
       forAllSystems = f: nixpkgs.lib.genAttrs targets f;
       # x86_64-windows is built on x86_64-linux; checks run on the build machine.
       buildSystem = system: if system == "x86_64-windows" then "x86_64-linux" else system;
-      # bip157 0.8.1 as published plus patches/bip157, held to the allowlist in
+      # bip157 0.9.0 as published plus patches/bip157, held to the allowlist in
       # tools/kyoto/patch-bip157.sh, must equal rust-lib/vendor/bip157 byte for byte. The Rust
       # build depends on this check, so a patch outside the allowlist fails the module build.
       bip157Check = system:
         let pkgs = nixpkgs.legacyPackages.${system}; in
-        pkgs.runCommand "bip157-0.8.1-patches-check" {
+        pkgs.runCommand "bip157-0.9.0-patches-check" {
           crate = pkgs.fetchurl {
-            url = "https://static.crates.io/crates/bip157/bip157-0.8.1.crate";
-            sha256 = "467c3414d72f1393576c2c86f13ae04dd55da722f1c364bbede5dc9805995421";
+            url = "https://static.crates.io/crates/bip157/bip157-0.9.0.crate";
+            sha256 = "228f1ddc455518aee2bcc1c8195ba45efa079b4ad14679ef00d5177a51bf468e";
           };
           nativeBuildInputs = [ pkgs.git pkgs.gnutar pkgs.gzip pkgs.diffutils ];
         } ''
@@ -36,15 +36,15 @@
           tar xzf $crate -C pristine --strip-components=1
           bash ${./tools/kyoto/patch-bip157.sh} pristine patched ${./patches/bip157}
           diff -r patched ${./rust-lib/vendor/bip157}
-          echo "bip157 0.8.1 + $(ls ${./patches/bip157} | wc -l) patches" > $out
+          echo "bip157 0.9.0 + $(ls ${./patches/bip157} | wc -l) patches" > $out
         '';
-      # The same for bdk_kyoto 0.18.1, patches/bdk_kyoto and tools/kyoto/patch-bdk_kyoto.sh.
+      # The same for bdk_kyoto 0.19.0, patches/bdk_kyoto and tools/kyoto/patch-bdk_kyoto.sh.
       bdkKyotoCheck = system:
         let pkgs = nixpkgs.legacyPackages.${system}; in
-        pkgs.runCommand "bdk_kyoto-0.18.1-patches-check" {
+        pkgs.runCommand "bdk_kyoto-0.19.0-patches-check" {
           crate = pkgs.fetchurl {
-            url = "https://static.crates.io/crates/bdk_kyoto/bdk_kyoto-0.18.1.crate";
-            sha256 = "dc48e8d5e9301e29f3d60a25f897e3d6d4a3a7eada671a55239e8f22bf81eab4";
+            url = "https://static.crates.io/crates/bdk_kyoto/bdk_kyoto-0.19.0.crate";
+            sha256 = "f51399b3cb0bfb4448e3f7caf3ec58b1be3f8a240adaf5664c0b54f5e62d0651";
           };
           nativeBuildInputs = [ pkgs.git pkgs.gnutar pkgs.gzip pkgs.diffutils ];
         } ''
@@ -53,7 +53,7 @@
           tar xzf $crate -C pristine --strip-components=1
           bash ${./tools/kyoto/patch-bdk_kyoto.sh} pristine patched ${./patches/bdk_kyoto}
           diff -r patched ${./rust-lib/vendor/bdk_kyoto}
-          echo "bdk_kyoto 0.18.1 + $(ls ${./patches/bdk_kyoto} | wc -l) patches" > $out
+          echo "bdk_kyoto 0.19.0 + $(ls ${./patches/bdk_kyoto} | wc -l) patches" > $out
         '';
       # tools/regtest/chain.sh with bitcoind and electrs, for harnesses outside this repository.
       regtestChain = system:

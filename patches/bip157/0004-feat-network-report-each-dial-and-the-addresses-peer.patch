@@ -1,7 +1,7 @@
-From be76924819463e1f243339baacd8232bb44e1005 Mon Sep 17 00:00:00 2001
+From 61f61c1c74685223ac0f2d681845a2a5e0d9bc2c Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Mon, 12 Oct 2026 17:06:27 -0300
-Subject: [PATCH 5/5] feat(network): report each dial and the addresses peers
+Subject: [PATCH 4/5] feat(network): report each dial and the addresses peers
  gossip
 
 A client that picks its own peers could not tell which of them answered:
@@ -48,12 +48,12 @@ index 631893b..9263971 100644
      /// must be reachable by IP address.
      pub fn socks5_proxy(mut self, proxy: impl Into<Socks5Proxy>) -> Self {
 diff --git a/src/lib.rs b/src/lib.rs
-index a89fb76..352fc1e 100644
+index e3dd35a..b2d2b67 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -86,14 +86,15 @@ pub use {
+@@ -90,14 +90,15 @@ pub use {
      crate::chain::ChainState,
-     crate::client::{Client, Requester},
+     crate::client::{Client, EventReceiver, Requester},
      crate::error::{ClientError, NodeError},
 -    crate::messages::{Event, Info, RejectPayload, SyncUpdate, Warning},
 +    crate::messages::{DialOutcome, Event, Info, RejectPayload, SyncUpdate, Warning},
@@ -70,7 +70,7 @@ index a89fb76..352fc1e 100644
  };
  
  pub extern crate tokio;
-@@ -385,6 +386,7 @@ struct Config {
+@@ -389,6 +390,7 @@ struct Config {
      filter_type: FilterType,
      block_type: BlockType,
      headers_only_sync: bool,
@@ -78,7 +78,7 @@ index a89fb76..352fc1e 100644
  }
  
  impl Default for Config {
-@@ -399,6 +401,7 @@ impl Default for Config {
+@@ -403,6 +405,7 @@ impl Default for Config {
              filter_type: FilterType::default(),
              block_type: BlockType::default(),
              headers_only_sync: Default::default(),
@@ -219,7 +219,7 @@ index f8ac2bc..0b4e02d 100644
          }
      }
 diff --git a/src/network/mod.rs b/src/network/mod.rs
-index 03b9e83..9f39b73 100644
+index 949d42c..a1ce7d7 100644
 --- a/src/network/mod.rs
 +++ b/src/network/mod.rs
 @@ -27,9 +27,11 @@ use bitcoin::{
@@ -319,7 +319,7 @@ index 03b9e83..9f39b73 100644
  #[derive(Debug, Clone)]
  pub(crate) enum RelayPolicy {
      BlocksOnly,
-@@ -740,4 +764,104 @@ mod tests {
+@@ -745,4 +769,104 @@ mod tests {
          tokio::time::sleep(Duration::from_secs(90)).await;
          assert!(filter_rate.slow_peer(Duration::from_secs(120)));
      }
@@ -747,7 +747,7 @@ index 7ad6fd1..04cab2e 100644
 +    }
 +}
 diff --git a/src/network/peer_map.rs b/src/network/peer_map.rs
-index d97e215..53c2b0d 100644
+index abb6b57..e30ccb7 100644
 --- a/src/network/peer_map.rs
 +++ b/src/network/peer_map.rs
 @@ -30,7 +30,7 @@ use crate::{
@@ -759,7 +759,7 @@ index d97e215..53c2b0d 100644
  };
  
  use super::{AddressBook, ConnectionType, MainThreadMessage, PeerThreadMessage};
-@@ -62,6 +62,8 @@ pub(crate) struct ManagedPeer {
+@@ -64,6 +64,8 @@ pub(crate) struct ManagedPeer {
      broadcast_min: FeeRate,
      ptx: Sender<MainThreadMessage>,
      handle: JoinHandle<Result<(), PeerError>>,
@@ -768,7 +768,7 @@ index d97e215..53c2b0d 100644
  }
  
  /// A peer that is used solely for watching incoming transaction gossip.
-@@ -87,6 +89,8 @@ enum GossipSubscriptionStatus {
+@@ -89,6 +91,8 @@ enum GossipSubscriptionStatus {
  pub(crate) struct PeerMap {
      pub(crate) tx_queue: Arc<Mutex<BroadcastQueue>>,
      pub(crate) whitelist_only: bool,
@@ -777,7 +777,7 @@ index d97e215..53c2b0d 100644
      current_id: PeerId,
      network: Network,
      block_type: BlockType,
-@@ -115,6 +119,7 @@ impl PeerMap {
+@@ -117,6 +121,7 @@ impl PeerMap {
          Self {
              tx_queue: Arc::new(Mutex::new(BroadcastQueue::new())),
              whitelist_only,
@@ -785,7 +785,7 @@ index d97e215..53c2b0d 100644
              current_id: PeerId(0),
              network,
              block_type,
-@@ -208,17 +213,25 @@ impl PeerMap {
+@@ -210,17 +215,25 @@ impl PeerMap {
              Arc::clone(&self.db),
              self.timeout_config,
              Arc::clone(&self.tx_queue),
@@ -814,7 +814,7 @@ index d97e215..53c2b0d 100644
              }
          };
          let is_proxy = self.connector.is_proxy();
-@@ -230,6 +243,7 @@ impl PeerMap {
+@@ -232,6 +245,7 @@ impl PeerMap {
                  broadcast_min: FeeRate::BROADCAST_MIN,
                  ptx,
                  handle,
@@ -822,7 +822,7 @@ index d97e215..53c2b0d 100644
              },
          ))
      }
-@@ -241,13 +255,21 @@ impl PeerMap {
+@@ -243,13 +257,21 @@ impl PeerMap {
          }
      }
  
@@ -845,7 +845,7 @@ index d97e215..53c2b0d 100644
      // The minimum fee rate to successfully broadcast a transaction to all peers
      pub fn broadcast_min(&self) -> FeeRate {
          self.map
-@@ -469,3 +491,74 @@ impl PeerMap {
+@@ -485,3 +507,74 @@ impl PeerMap {
          }
      }
  }
@@ -943,10 +943,10 @@ index 34a5ebc..035bef5 100644
      // Read off the destination of our request
      match buf[3] {
 diff --git a/src/node.rs b/src/node.rs
-index 245ec49..25a89ae 100644
+index b5f195c..cef3463 100644
 --- a/src/node.rs
 +++ b/src/node.rs
-@@ -74,6 +74,7 @@ impl Node {
+@@ -82,6 +82,7 @@ impl Node {
              filter_type,
              block_type,
              headers_only_sync,
@@ -954,7 +954,7 @@ index 245ec49..25a89ae 100644
          } = config;
          // Set up a communication channel between the node and client
          let (info_tx, info_rx) = mpsc::channel::<Info>(32);
-@@ -87,7 +88,7 @@ impl Node {
+@@ -96,7 +97,7 @@ impl Node {
          let state = NodeState::Behind;
          // Configure the peer manager
          let (mtx, mrx) = mpsc::channel::<PeerThreadMessage>(32);
@@ -963,7 +963,7 @@ index 245ec49..25a89ae 100644
              mtx,
              network,
              block_type,
-@@ -97,6 +98,7 @@ impl Node {
+@@ -106,6 +107,7 @@ impl Node {
              connection_type,
              peer_timeout_config,
          );
@@ -971,7 +971,7 @@ index 245ec49..25a89ae 100644
          // Build the chain
          let chain_state = chain_state.unwrap_or(ChainState::Checkpoint(
              HashCheckpoint::from_genesis(network),
-@@ -319,11 +321,12 @@ impl Node {
+@@ -329,11 +331,12 @@ impl Node {
                  connected: live,
                  required,
              });
@@ -989,7 +989,7 @@ index 245ec49..25a89ae 100644
              if self.peer_map.dispatch(address).await.is_err() {
                  self.dialog.send_warning(Warning::CouldNotConnect);
              }
-@@ -465,8 +468,8 @@ impl Node {
+@@ -488,8 +491,8 @@ impl Node {
          self.peer_map.send_message(nonce, MainThreadMessage::Verack);
          self.peer_map
              .send_message(nonce, MainThreadMessage::SendHeaders);

@@ -1,0 +1,111 @@
+From 34eda0d435e72bb4cd76085774c55b7ccb41c30a Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Thu, 26 Nov 2026 18:05:27 -0300
+Subject: [PATCH 5/5] feat(sync): the matched blocks still pending, and
+ fetching them again
+
+UpdateSubscriber::pending() names the matched blocks not applied yet as
+of the last update: those being fetched, and those fetched and waiting
+for an older one. fetch_also(blocks) queues blocks with the fetcher as
+if their filters had matched, from the next update on.
+
+Stored with checked(), they let a restart resume filters from the last
+filter checked and fetch these blocks again, instead of resuming below
+the first block still being fetched, which tells the peers serving
+filters where that block is.
+---
+ src/lib.rs | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 6e4e59e..3e20947 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -287,6 +287,8 @@ pub struct UpdateSubscriber<W: Wallets> {
+     fetched: BTreeMap<(u32, BlockHash), Option<Option<Block>>>,
+     fetching: tokio::task::JoinSet<((u32, BlockHash), Option<Block>)>,
+     at_tip: bool,
++    // matched blocks to fetch again, as a stopped client left them: queued at the next sync
++    again: Vec<(u32, BlockHash)>,
+     // scripts to check filters against, grown as blocks reveal new indices
+     spk_cache: HashSet<ScriptBuf>,
+     // processes events for the wallet.
+@@ -320,6 +322,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             fetched: BTreeMap::new(),
+             fetching: tokio::task::JoinSet::new(),
+             at_tip: false,
++            again: Vec::new(),
+             spk_cache,
+             _marker: core::marker::PhantomData,
+         }
+@@ -358,12 +361,18 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             fetched: BTreeMap::new(),
+             fetching: tokio::task::JoinSet::new(),
+             at_tip: false,
++            again: Vec::new(),
+             spk_cache,
+             _marker: core::marker::PhantomData,
+         }
+     }
+ 
+     async fn sync(&mut self) -> Result<Option<u32>, UpdateError> {
++        if self.fetch.is_some() {
++            for (height, hash) in std::mem::take(&mut self.again) {
++                self.queue_block(height, hash);
++            }
++        }
+         // A previous call was cancelled while fetching a block. Apply it before checking the
+         // next filter, so that filter is checked against the right scripts.
+         if let Some(BlockId { height, hash }) = self.pending_block {
+@@ -411,6 +420,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
+                     }
+                     if self.scanned() {
+                         self.apply_fetched();
++                        self.fetch_again().await?;
+                         return Ok(self.checked_to(filter.height()));
+                     }
+                 }
+@@ -430,6 +440,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
+                 }) => {
+                     self.blocks_since_update = 0;
+                     self.apply_fetched();
++                    self.fetch_again().await?;
+                     self.checked = Some(tip.height);
+                     self.synced = true;
+                     self.at_tip = true;
+@@ -518,6 +529,32 @@ impl<W: Wallets> UpdateSubscriber<W> {
+         self.synced && self.fetched.is_empty()
+     }
+ 
++    /// The matched blocks not applied yet, as of the last update, oldest first: being fetched, or
++    /// fetched and waiting for an older one. Stored with [`Self::checked`], a restart can resume
++    /// filters from there and fetch these again ([`Self::fetch_also`]), whatever they are.
++    pub fn pending(&self) -> Vec<(u32, BlockHash)> {
++        self.fetched.keys().copied().collect()
++    }
++
++    /// Fetches these matched blocks as if their filters matched: those a stopped client hadn't
++    /// applied. With a fetcher they are fetched from the next update on; without one, from the
++    /// node's peers before the next update. Each must be in the node's chain by then, or it is
++    /// skipped.
++    pub fn fetch_also(&mut self, blocks: impl IntoIterator<Item = (u32, BlockHash)>) {
++        self.again.extend(blocks);
++    }
++
++    // Without a fetcher, the blocks to fetch again come from the node's peers before the next
++    // update, once its chain holds them.
++    async fn fetch_again(&mut self) -> Result<(), UpdateError> {
++        let mut again = std::mem::take(&mut self.again);
++        again.sort();
++        for (_, hash) in again {
++            self.fetch_and_apply(hash).await?;
++        }
++        Ok(())
++    }
++
+     /// Fetches matched blocks with `fetch` in the background instead of from the node's peers,
+     /// each as its filter matches, while the scan goes on. They are applied oldest first, up to
+     /// the first still being fetched; at the tip, each one applied makes an update.
+-- 
+2.54.0 (Apple Git-157)
+
