@@ -887,12 +887,30 @@ mod tests {
             output: vec![TxOut { value: Amount::from_sat(100_000), script_pubkey: to_us }],
         };
         let coin = OutPoint { txid: funding.compute_txid(), vout: 0 };
-        let spend = Transaction {
+        let mut spend = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn { previous_output: coin, ..Default::default() }],
             output: vec![TxOut { value: Amount::from_sat(99_000), script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])) }],
         };
+        // bdk_wallet 3.2.1+ drops an unconfirmed spend of our coins unless its signature verifies.
+        {
+            use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+            use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            // The seed of `x`: BIP-39's "abandon ... about".
+            let seed = hex::decode("5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4").unwrap();
+            let account = Xpriv::new_master(bitcoin::Network::Testnet, &seed).unwrap().derive_priv(&secp, &DerivationPath::from_str("m/84'/1'/0'").unwrap()).unwrap();
+            assert_eq!(Xpub::from_priv(&secp, &account).to_string(), x);
+            let key = account.derive_priv(&secp, &DerivationPath::from_str("m/0/0").unwrap()).unwrap().to_priv();
+            let pk = key.public_key(&secp);
+            let script = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash().unwrap());
+            assert_eq!(script, funding.output[0].script_pubkey);
+            let hash = SighashCache::new(&spend).p2wpkh_signature_hash(0, &script, Amount::from_sat(100_000), EcdsaSighashType::All).unwrap();
+            let msg = bitcoin::secp256k1::Message::from_digest(hash.to_byte_array());
+            let sig = bitcoin::ecdsa::Signature::sighash_all(secp.sign_ecdsa(&msg, &key.inner));
+            spend.input[0].witness = bitcoin::Witness::p2wpkh(&sig, &pk.inner);
+        }
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
         let b1 = BlockId { height: 1, hash: BlockHash::from_byte_array([1; 32]) };
         let mut u = TxUpdate::default();

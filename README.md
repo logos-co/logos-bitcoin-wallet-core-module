@@ -1,7 +1,7 @@
 # logos-bitcoin-wallet-core-module
 
 `bitcoin_wallet_core_module`: the Bitcoin wallet engine for Logos. A watch-only wallet built on
-bitcoindevkit (`bdk_wallet` 3.2.0, `bdk_electrum` 0.24.1, `bdk_kyoto` 0.18.1 with seven patches and
+bitcoindevkit (`bdk_wallet` 3.2.1, `bdk_electrum` 0.24.1, `bdk_kyoto` 0.18.1 with seven patches and
 `bip157` 0.8.1 with six, `bdk_bitcoind_rpc` 0.22.1), running as a Rust module inside
 its own `logos_host`. It holds no keys. The person opens a wallet for it in the keys
 app, and signs its sends in the signer app, both through `signer_manager_module`.

@@ -14,8 +14,8 @@ exclude = ["vendor"]
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-# The BDK cohort: bdk_wallet 3.2.0 on bdk_chain 0.23.4, whose store pins rusqlite 0.31.
-bdk_wallet = { version = "=3.2.0", features = ["rusqlite"] }
+# The BDK cohort: bdk_wallet 3.2.1 on bdk_chain 0.23.4, whose store pins rusqlite 0.31.
+bdk_wallet = { version = "=3.2.1", features = ["rusqlite"] }
 bdk_electrum = { version = "=0.24.1", default-features = false, features = ["use-rustls-ring"] }
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 # Kyoto, the light client: bdk_kyoto 0.18.1 on bip157 0.8.1 with our patches (see [patch] below).
