@@ -5,10 +5,10 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHAIN="$REPO/tools/regtest/chain.sh"; export CHAIN_DIR="$WORK/chain"
 # The keystore side as the keys CLI's headless doctest pins it (2026-11-01).
 CLI=github:logos-co/logos-logoscore-cli/ca70bcdd9fc20434d423669652966e7fdd6148f0
-KEYSTORE=github:logos-co/logos-evm-keystore-module/6ab1d08dfc45d0a472d156cf255bd47d79763a5b
-MANAGER=github:logos-co/logos-signer-manager-module/48c106c702446a99c529b1febfcdedf1261e7407
-KCLI=github:logos-co/logos-evm-keystore-cli/74bcbc526cea65a673202886a4c2475c2c3dbd27
-SCLI=github:logos-co/logos-evm-signer-cli/34bf8d6f4291b5ef3c6ab3d9958b0e5bfb7922b0
+KEYSTORE=github:logos-co/logos-evm-keystore-module/eb27b23efe84664bcd66b3a8eb5a0eb12095fd50
+MANAGER=github:logos-co/logos-signer-manager-module/471fb75e7f4fab96e798c5945998af1f68f2863d
+KCLI=github:logos-co/logos-evm-keystore-cli/ab615c0600600552caec30670df4520a085d570d
+SCLI=github:logos-co/logos-evm-signer-cli/bc0a849e0cc4733700733569fbb708f6bcaf070f
 # The tor_module bitcoin_node_module's manifest requires, as node-module 46d8209's flake.lock locks it.
 TOR=github:logos-co/logos-tor-module/6fba1edd753758930ce0cbc9a854be7863fd35e0
 CORE=bitcoin_wallet_core_module
