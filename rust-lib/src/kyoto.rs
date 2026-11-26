@@ -1,4 +1,4 @@
-//! Kyoto, the BIP157/158 light client, as a chain authority: bdk_kyoto 0.18.1 on bip157 0.7.0
+//! Kyoto, the BIP157/158 light client, as a chain authority: bdk_kyoto 0.19.0 on bip157 0.9.0
 //! with our patches. Each start dials 8 of the node module's peers, whitelist only, chosen as
 //! `peers::choose` says, and reports back how each did; on `regtest.json`'s peers, a random 8,
 //! and a peer that fails 3 starts is skipped for a day. README, "Kyoto", has the rules and why.
@@ -413,14 +413,12 @@ impl Client {
         }
         let cp = HashCheckpoint::new(start.from.0, start.from.1);
         let lookahead = lookahead.max(LOOKAHEAD);
-        let config = SyncConfig::wallet_recovery_sync(cp, lookahead).build();
-        let client = if snapshot.len() > 1 {
+        let mut wb = b.wallet(wallet, SyncConfig::wallet_recovery_sync(cp).build()).emit_update_every_n_blocks(CHECKPOINT_FILTERS);
+        if snapshot.len() > 1 {
             let headers = snapshot.into_iter().enumerate().map(|(i, header)| IndexedHeader { height: start.from.0 + i as u32, header }).collect();
-            b.build_with_wallet_from(wallet, config, ChainState::Snapshot(headers))
-        } else {
-            b.build_with_wallet(wallet, config)
+            wb = wb.chain_state(ChainState::Snapshot(headers));
         }
-        .map_err(|e| e.to_string())?;
+        let client = wb.build().map_err(|e| e.to_string())?;
         let revealed = KEYCHAINS.map(|k| wallet.derivation_index(k));
         let window = revealed.map(|r| r.unwrap_or(0) + lookahead - 1);
         let (client, logging, mut updates) = client.subscribe();
@@ -434,13 +432,14 @@ impl Client {
             let _ = stopped.send(node.run().await.err().map(|e| e.to_string()));
         });
         let (updated, woken) = (tx.clone(), wake.clone());
-        updates.checkpoint_every(CHECKPOINT_FILTERS);
         if let Some(e) = errands {
             let r = requester.clone();
             updates.fetch_blocks_with(Arc::new(move |height, hash| -> Fetch { Box::pin(e.clone().block(r.clone(), height, hash)) }));
         }
         updates.fetch_also(again);
         let widen = updates.widen_handle();
+        // bdk_kyoto watches the wallet's own lookahead; past it, the window is widened before the first filter.
+        *widen.lock().map_err(|e| e.to_string())? = KEYCHAINS.into_iter().zip(window).collect();
         // Why the stream ended, or none once the sync thread is gone.
         let stream = rt.spawn(async move {
             loop {

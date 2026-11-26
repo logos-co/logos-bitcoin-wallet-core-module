@@ -368,10 +368,10 @@ async fn two_wallets_can_update() -> anyhow::Result<()> {
     let client = Builder::new(Network::Regtest)
         .add_peer(peer)
         .required_peers(1)
-        .build_with_wallets(vec![
-            (&wallet, SyncConfig::sync_from_last_checkpoint().build()),
-            (&wallet_two, SyncConfig::sync_from_last_checkpoint().build()),
-        ])?;
+        .wallets()
+        .add(&wallet, SyncConfig::sync_from_last_checkpoint().build())
+        .add(&wallet_two, SyncConfig::new_wallet_sync().build())
+        .build()?;
     let (client, _, mut update_subscriber) = client.subscribe();
     let client = client.start();
     let requester = client.requester();
@@ -399,6 +399,106 @@ async fn two_wallets_can_update() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn new_wallet_does_not_move_sync_start() -> anyhow::Result<()> {
+    let env = testenv()?;
+
+    let mut wallet = CreateParams::new(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+        .network(Network::Regtest)
+        .create_wallet_no_persist()?;
+    let client = init_node(&env, &wallet)?;
+    let (client, _, mut update_subscriber) = client.subscribe();
+    let client = client.start();
+    let requester = client.requester();
+
+    let miner = env
+        .rpc_client()
+        .get_new_address(None, None)?
+        .assume_checked();
+    env.mine_blocks(100, Some(miner.clone()))?;
+    wait_for_height(&env, 101).await?;
+    let res = update_subscriber.update().await?;
+    wallet.apply_update(res)?;
+    requester.shutdown()?;
+
+    let mut wallet_two = CreateParams::new(RECV_TWO, CHANGE_TWO)
+        .network(Network::Regtest)
+        .create_wallet_no_persist()?;
+    let addr = wallet_two.peek_address(KeychainKind::External, 0).address;
+    let amt = Amount::from_btc(0.21)?;
+    env.send(&addr, amt)?;
+    env.mine_blocks(1, Some(miner))?;
+    wait_for_height(&env, 102).await?;
+
+    let peer = env.bitcoind.params.p2p_socket.unwrap();
+    let ip: IpAddr = (*peer.ip()).into();
+    let peer: TrustedPeer = (ip, Some(peer.port())).into();
+    let client = Builder::new(Network::Regtest)
+        .add_peer(peer)
+        .required_peers(1)
+        .wallets()
+        .add(&wallet, SyncConfig::sync_from_last_checkpoint().build())
+        .add(&wallet_two, SyncConfig::new_wallet_sync().build())
+        .build()?;
+    let (client, _, mut update_subscriber) = client.subscribe();
+    let client = client.start();
+    let requester = client.requester();
+
+    let mut updates = update_subscriber
+        .updates()
+        .await?
+        .collect::<BTreeMap<DescriptorId, Update>>();
+    let res = updates
+        .remove(
+            &wallet_two
+                .public_descriptor(KeychainKind::External)
+                .descriptor_id(),
+        )
+        .unwrap();
+    let synced_from = res
+        .chain
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|cp| cp.height())
+        .filter(|&height| height > 0)
+        .min()
+        .unwrap();
+    assert!(synced_from > 90);
+    wallet_two.apply_update(res)?;
+    assert_eq!(wallet_two.balance().total(), amt);
+
+    requester.shutdown()?;
+
+    Ok(())
+}
+
+#[test]
+fn wallets_builder_rejects_invalid_wallets() -> anyhow::Result<()> {
+    use bdk_kyoto::builder::BuilderError;
+    let wallet = CreateParams::new(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+        .network(Network::Regtest)
+        .create_wallet_no_persist()?;
+
+    let res = Builder::new(Network::Regtest).wallets().build();
+    assert!(matches!(res, Err(BuilderError::EmptyIterator)));
+
+    let res = Builder::new(Network::Signet)
+        .wallets()
+        .add(&wallet, SyncConfig::sync_from_last_checkpoint().build())
+        .build();
+    assert!(matches!(res, Err(BuilderError::NetworkMismatch)));
+
+    let res = Builder::new(Network::Regtest)
+        .wallets()
+        .add(&wallet, SyncConfig::sync_from_last_checkpoint().build())
+        .add(&wallet, SyncConfig::new_wallet_sync().build())
+        .build();
+    assert!(matches!(res, Err(BuilderError::DuplicateWallet)));
+
+    Ok(())
+}
+
 fn init_node_with_config<P: SyncPolicyType>(
     env: &TestEnv,
     wallet: &bdk_wallet::Wallet,
@@ -413,9 +513,11 @@ fn init_node_with_config<P: SyncPolicyType>(
         .build_with_wallet(wallet, sync_config)?)
 }
 
-// Pay `index` on the external keychain, sync with `sync_config` and check the payment is found.
+// Pay `index` on the external keychain of a wallet with `wallet_lookahead`, sync with
+// `sync_config` and check the payment is found.
 async fn assert_finds_payment_to_index<P: SyncPolicyType>(
     env: &TestEnv,
+    wallet_lookahead: u32,
     index: u32,
     sync_config: impl FnOnce(&TestEnv) -> anyhow::Result<SyncConfig<P>>,
 ) -> anyhow::Result<()> {
@@ -425,8 +527,8 @@ async fn assert_finds_payment_to_index<P: SyncPolicyType>(
         .assume_checked();
     let mut wallet = CreateParams::new(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
         .network(Network::Regtest)
+        .lookahead(wallet_lookahead)
         .create_wallet_no_persist()?;
-    assert!(index > wallet.spk_index().lookahead());
 
     env.mine_blocks(100, Some(miner.clone()))?;
     let addr = wallet.peek_address(KeychainKind::External, index).address;
@@ -452,22 +554,169 @@ async fn assert_finds_payment_to_index<P: SyncPolicyType>(
 }
 
 #[tokio::test]
-async fn recovery_finds_scripts_beyond_wallet_lookahead() -> anyhow::Result<()> {
+async fn sync_checks_scripts_within_wallet_lookahead() -> anyhow::Result<()> {
     let env = testenv()?;
-    assert_finds_payment_to_index(&env, 100, |env| {
-        let genesis = env.rpc_client().get_block_hash(0)?;
-        Ok(SyncConfig::wallet_recovery_sync(HashCheckpoint::new(0, genesis), 200).build())
+    // Index 100 is beyond the default lookahead, but within this wallet's.
+    assert_finds_payment_to_index(&env, 200, 100, |_| {
+        Ok(SyncConfig::sync_from_last_checkpoint().build())
     })
     .await
 }
 
-#[tokio::test]
-async fn sync_lookahead_finds_scripts_beyond_wallet_lookahead() -> anyhow::Result<()> {
+// The amount paid to `index`, distinct per index so a balance shows which payments were found.
+fn amount_for_index(index: u32) -> Amount {
+    Amount::from_sat(1_000_000 + index as u64)
+}
+
+// Send one transaction paying `indices` on the external keychain, with outputs in that order.
+fn send_ordered(env: &TestEnv, wallet: &bdk_wallet::Wallet, indices: &[u32]) -> anyhow::Result<()> {
+    use bdk_testenv::bitcoincore_rpc::jsonrpc::serde_json::{json, Map, Value};
+    let outputs = indices
+        .iter()
+        .map(|&index| {
+            let addr = wallet.peek_address(KeychainKind::External, index).address;
+            let mut output = Map::new();
+            output.insert(addr.to_string(), json!(amount_for_index(index).to_btc()));
+            Value::Object(output)
+        })
+        .collect::<Vec<Value>>();
+    let rpc = env.rpc_client();
+    let raw: String = rpc.call("createrawtransaction", &[json!([]), json!(outputs)])?;
+    // Keep the change after our outputs so their order is preserved.
+    let funded: Value = rpc.call(
+        "fundrawtransaction",
+        &[json!(raw), json!({ "changePosition": indices.len() })],
+    )?;
+    let signed: Value = rpc.call("signrawtransactionwithwallet", &[funded["hex"].clone()])?;
+    let _: Value = rpc.call("sendrawtransaction", &[signed["hex"].clone()])?;
+    Ok(())
+}
+
+// Mine one block per entry of `blocks`, each with one transaction paying those external indices
+// in order, then recover a wallet with `wallet_lookahead` from genesis. Returns the last used
+// indices and balance of the recovered wallet.
+async fn recover_after_payments(
+    wallet_lookahead: u32,
+    blocks: &[&[u32]],
+) -> anyhow::Result<(BTreeMap<KeychainKind, u32>, Amount)> {
     let env = testenv()?;
-    assert_finds_payment_to_index(&env, 100, |_| {
-        Ok(SyncConfig::sync_from_last_checkpoint()
-            .lookahead(200)
-            .build())
-    })
-    .await
+    let miner = env
+        .rpc_client()
+        .get_new_address(None, None)?
+        .assume_checked();
+    let mut wallet = CreateParams::new(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+        .network(Network::Regtest)
+        .lookahead(wallet_lookahead)
+        .create_wallet_no_persist()?;
+
+    env.mine_blocks(100, Some(miner.clone()))?;
+    for indices in blocks {
+        send_ordered(&env, &wallet, indices)?;
+        env.mine_blocks(1, Some(miner.clone()))?;
+    }
+    wait_for_height(&env, 101 + blocks.len() as u32).await?;
+
+    let genesis = env.rpc_client().get_block_hash(0)?;
+    let sync_config = SyncConfig::wallet_recovery_sync(HashCheckpoint::new(0, genesis)).build();
+    let client = init_node_with_config(&env, &wallet, sync_config)?;
+    let (client, _, mut update_subscriber) = client.subscribe();
+    let client = client.start();
+
+    let update = update_subscriber.update().await?;
+    let last_active_indices = update.last_active_indices.clone();
+    wallet.apply_update(update)?;
+
+    client.requester().shutdown()?;
+    Ok((last_active_indices, wallet.balance().total()))
+}
+
+#[tokio::test]
+async fn recovery_follows_payments_beyond_wallet_lookahead() -> anyhow::Result<()> {
+    // Each index is only within the lookahead once the block before it has been applied.
+    let (last_active, balance) = recover_after_payments(25, &[&[20], &[40], &[60]]).await?;
+    assert_eq!(last_active, [(KeychainKind::External, 60)].into());
+    assert_eq!(
+        balance,
+        amount_for_index(20) + amount_for_index(40) + amount_for_index(60)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_finds_payments_revealed_later_in_same_block() -> anyhow::Result<()> {
+    // Index 40 comes first in the transaction, but is only within the lookahead once the output
+    // to index 20 is found.
+    let (last_active, balance) = recover_after_payments(25, &[&[40, 20]]).await?;
+    assert_eq!(last_active, [(KeychainKind::External, 40)].into());
+    assert_eq!(balance, amount_for_index(20) + amount_for_index(40));
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_gap_limit_is_the_wallet_lookahead() -> anyhow::Result<()> {
+    // Index 30 is paid before index 10 reveals it, so it is beyond the lookahead when its block
+    // is checked, and that block is never downloaded.
+    let (last_active, balance) = recover_after_payments(25, &[&[30], &[10]]).await?;
+    assert_eq!(last_active, [(KeychainKind::External, 10)].into());
+    assert_eq!(balance, amount_for_index(10));
+
+    // A larger lookahead covers it.
+    let (last_active, balance) = recover_after_payments(50, &[&[30], &[10]]).await?;
+    assert_eq!(last_active, [(KeychainKind::External, 30)].into());
+    assert_eq!(balance, amount_for_index(10) + amount_for_index(30));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_is_emitted_every_n_blocks() -> anyhow::Result<()> {
+    let env = testenv()?;
+    let miner = env
+        .rpc_client()
+        .get_new_address(None, None)?
+        .assume_checked();
+    let mut wallet = CreateParams::new(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+        .network(Network::Regtest)
+        .create_wallet_no_persist()?;
+
+    env.mine_blocks(100, Some(miner.clone()))?;
+    let addr = wallet.peek_address(KeychainKind::External, 0).address;
+    let amt = Amount::from_btc(0.21)?;
+    let txid = env.send(&addr, amt)?;
+    env.mine_blocks(1, Some(miner.clone()))?;
+    env.mine_blocks(30, Some(miner))?;
+    wait_for_height(&env, 132).await?;
+
+    let peer = env.bitcoind.params.p2p_socket.unwrap();
+    let ip: IpAddr = (*peer.ip()).into();
+    let peer: TrustedPeer = (ip, Some(peer.port())).into();
+    let genesis = env.rpc_client().get_block_hash(0)?;
+    let client = Builder::new(Network::Regtest)
+        .add_peer(peer)
+        .required_peers(1)
+        .wallet(
+            &wallet,
+            SyncConfig::wallet_recovery_sync(HashCheckpoint::new(0, genesis)).build(),
+        )
+        .emit_update_every_n_blocks(25)
+        .build()?;
+    let (client, _, mut update_subscriber) = client.subscribe();
+    let client = client.start();
+
+    let mut tips = Vec::new();
+    while tips.last() != Some(&132) {
+        let update = update_subscriber.update().await?;
+        let tip = update.chain.as_ref().unwrap().height();
+        for (anchor, anchor_txid) in &update.tx_update.anchors {
+            assert_eq!(*anchor_txid, txid);
+            assert!(anchor.block_id.height <= tip);
+        }
+        wallet.apply_update(update)?;
+        assert_eq!(wallet.latest_checkpoint().height(), tip);
+        tips.push(tip);
+    }
+    assert_eq!(tips, vec![25, 50, 75, 100, 125, 132]);
+    assert_eq!(wallet.balance().total(), amt);
+
+    client.requester().shutdown()?;
+    Ok(())
 }

@@ -1,7 +1,7 @@
-From 272dfb1ad35a8d2ca615c59803204917456106da Mon Sep 17 00:00:00 2001
+From 08538ead5200ec49a0f8c7a853b8865f4002be1f Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <dario@status.im>
 Date: Sun, 1 Nov 2026 11:53:30 -0300
-Subject: [PATCH 6/6] fix(node): a rescan is taken in every state
+Subject: [PATCH 5/5] fix(node): a rescan is taken in every state
 
 Requester::rescan and rescan_from were dropped, with nothing said, while
 the node was Behind or HeadersSynced. After a headers-only sync every
@@ -14,14 +14,14 @@ The rescan now resets the filter checks in every state. While headers
 are still syncing it sends nothing: when the header sync ends, it asks
 for the filter headers from the rescan height.
 ---
- src/node.rs | 128 +++++++++++++++++++++++++++++++++++++++++++---------
- 1 file changed, 106 insertions(+), 22 deletions(-)
+ src/node.rs | 124 +++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 104 insertions(+), 20 deletions(-)
 
 diff --git a/src/node.rs b/src/node.rs
-index 25a89ae..abe0149 100644
+index cef3463..0d0ac27 100644
 --- a/src/node.rs
 +++ b/src/node.rs
-@@ -669,29 +669,113 @@ impl Node {
+@@ -691,27 +691,111 @@ impl Node {
          Some(MainThreadMessage::GetHeaders(next_headers))
      }
  
@@ -45,9 +45,7 @@ index 25a89ae..abe0149 100644
 -                    ))
 -                } else {
 -                    self.state = NodeState::FilterHeadersSynced;
--                    Some(MainThreadMessage::GetFilters(
--                        self.chain.next_filter_message(),
--                    ))
+-                    self.next_filter_request()
 -                }
 -            }
 +        self.headers_only_sync = false;
@@ -66,9 +64,7 @@ index 25a89ae..abe0149 100644
 +            ))
 +        } else {
 +            self.state = NodeState::FilterHeadersSynced;
-+            Some(MainThreadMessage::GetFilters(
-+                self.chain.next_filter_message(),
-+            ))
++            self.next_filter_request()
 +        }
 +    }
 +}

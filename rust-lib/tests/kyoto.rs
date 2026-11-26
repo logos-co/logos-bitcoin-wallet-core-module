@@ -186,7 +186,7 @@ fn kyoto_is_the_authority_on_regtest() {
     assert!(k["lastStop"].as_str().unwrap_or("").contains("exhausted"), "{k}");
 
     // A peer forging filter headers: it answers first, five times over, enough for a quorum of
-    // three without patch 1; the honest peers answer later. Patch 1 counts it once: no update
+    // three on bip157 0.7.0; the honest peers answer later. Since 0.8.0 it counts once: no update
     // hides the payment.
     let addr4 = t.engine.next_address()["address"].as_str().unwrap().to_string();
     let raw = t.wallet_rpc("createrawtransaction", json!([[], {addr4.clone(): 0.05}]));
@@ -465,7 +465,7 @@ impl Logs {
 }
 
 /// A matched block reorganized away while the proxies hold its fetch: the node drops the request,
-/// bdk_kyoto patch 4 skips the block, and the payment comes in its replacement from the same
+/// bdk_kyoto skips the block (bdk-kyoto#180), and the payment comes in its replacement from the same
 /// client. Then one replaced before its fetch, fetched from the old branch as bip157 keeps stale
 /// headers. Run alone.
 #[test]

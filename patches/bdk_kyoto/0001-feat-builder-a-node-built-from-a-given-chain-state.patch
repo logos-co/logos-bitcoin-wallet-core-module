@@ -1,0 +1,175 @@
+From 1881165d03913b746c50b6769e5e627c08a201f5 Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Thu, 26 Nov 2026 18:03:36 -0300
+Subject: [PATCH 1/5] feat(builder): a node built from a given chain state
+
+WalletBuilder::chain_state() starts the node from a given chain state,
+such as a snapshot of headers the caller already holds and checked,
+instead of the sync policy's checkpoint, so it downloads none of them
+again.
+---
+ src/builder.rs | 116 +++++++++++++++++++++++++++++--------------------
+ 1 file changed, 70 insertions(+), 46 deletions(-)
+
+diff --git a/src/builder.rs b/src/builder.rs
+index 836954f..09fc30a 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -110,52 +110,11 @@ pub trait BuilderExt {
+ 
+ impl BuilderExt for Builder {
+     fn build_with_wallet<P: SyncPolicyType>(
+-        mut self,
++        self,
+         wallet: &Wallet,
+         sync_config: SyncConfig<P>,
+     ) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
+-        let network = wallet.network();
+-        if self.network().ne(&network) {
+-            return Err(BuilderError::NetworkMismatch);
+-        }
+-        match sync_config.0 {
+-            SyncPolicy::NewWallet => {
+-                self = self
+-                    .chain_state(ChainState::Checkpoint(new_wallet_anchor(network)))
+-                    .headers_only_sync();
+-            }
+-            SyncPolicy::SyncFromLast => {
+-                let sync_start = walk_back_max_reorg(wallet.latest_checkpoint());
+-                self = self.chain_state(ChainState::Checkpoint(sync_start));
+-            }
+-            SyncPolicy::Recovery { cp } => {
+-                self = self.chain_state(ChainState::Checkpoint(cp));
+-            }
+-        }
+-        let (node, client) = self.build();
+-        let bip157::Client {
+-            requester,
+-            info_rx,
+-            warn_rx,
+-            event_rx,
+-        } = client;
+-        let indexed_graph = IndexedTxGraph::new(wallet.spk_index().clone());
+-        let update_subscriber = UpdateSubscriber::<crate::wallets::Single>::new(
+-            requester.clone(),
+-            event_rx,
+-            wallet.latest_checkpoint(),
+-            indexed_graph,
+-        );
+-        let client = LightClient::new(
+-            requester,
+-            LoggingSubscribers {
+-                info_subscriber: info_rx,
+-                warning_subscriber: warn_rx,
+-            },
+-            update_subscriber,
+-            node,
+-        );
+-        Ok(client)
++        build_single(self, wallet, sync_config, None)
+     }
+ 
+     fn wallet<P: SyncPolicyType>(
+@@ -168,6 +127,7 @@ impl BuilderExt for Builder {
+             wallet,
+             sync_config,
+             emit_every: None,
++            chain_state: None,
+         }
+     }
+ 
+@@ -180,12 +140,66 @@ impl BuilderExt for Builder {
+     }
+ }
+ 
++fn build_single<P: SyncPolicyType>(
++    mut builder: Builder,
++    wallet: &Wallet,
++    sync_config: SyncConfig<P>,
++    chain_state: Option<ChainState>,
++) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
++    let network = wallet.network();
++    if builder.network().ne(&network) {
++        return Err(BuilderError::NetworkMismatch);
++    }
++    match (sync_config.0, chain_state) {
++        (_, Some(state)) => {
++            builder = builder.chain_state(state);
++        }
++        (SyncPolicy::NewWallet, None) => {
++            builder = builder
++                .chain_state(ChainState::Checkpoint(new_wallet_anchor(network)))
++                .headers_only_sync();
++        }
++        (SyncPolicy::SyncFromLast, None) => {
++            let sync_start = walk_back_max_reorg(wallet.latest_checkpoint());
++            builder = builder.chain_state(ChainState::Checkpoint(sync_start));
++        }
++        (SyncPolicy::Recovery { cp }, None) => {
++            builder = builder.chain_state(ChainState::Checkpoint(cp));
++        }
++    }
++    let (node, client) = builder.build();
++    let bip157::Client {
++        requester,
++        info_rx,
++        warn_rx,
++        event_rx,
++    } = client;
++    let indexed_graph = IndexedTxGraph::new(wallet.spk_index().clone());
++    let update_subscriber = UpdateSubscriber::<crate::wallets::Single>::new(
++        requester.clone(),
++        event_rx,
++        wallet.latest_checkpoint(),
++        indexed_graph,
++    );
++    let client = LightClient::new(
++        requester,
++        LoggingSubscribers {
++            info_subscriber: info_rx,
++            warning_subscriber: warn_rx,
++        },
++        update_subscriber,
++        node,
++    );
++    Ok(client)
++}
++
+ /// Build a [`LightClient`] that syncs a [`Wallet`] following a [`SyncConfig`].
+ pub struct WalletBuilder<'a, P: SyncPolicyType> {
+     builder: Builder,
+     wallet: &'a Wallet,
+     sync_config: SyncConfig<P>,
+     emit_every: Option<u32>,
++    chain_state: Option<ChainState>,
+ }
+ 
+ impl<P: SyncPolicyType> WalletBuilder<'_, P> {
+@@ -197,11 +211,21 @@ impl<P: SyncPolicyType> WalletBuilder<'_, P> {
+         self
+     }
+ 
++    /// Start the node from `chain_state`, such as a snapshot of headers the caller already holds
++    /// and checked, instead of the [`SyncConfig`]'s checkpoint, so it downloads none of them again.
++    pub fn chain_state(mut self, chain_state: ChainState) -> Self {
++        self.chain_state = Some(chain_state);
++        self
++    }
++
+     /// Attempt to build the node with scripts from the [`Wallet`].
+     pub fn build(self) -> Result<LightClient<Idle, crate::wallets::Single>, BuilderError> {
+-        let mut client = self
+-            .builder
+-            .build_with_wallet(self.wallet, self.sync_config)?;
++        let mut client = build_single(
++            self.builder,
++            self.wallet,
++            self.sync_config,
++            self.chain_state,
++        )?;
+         if let Some(update_subscriber) = client.update_subscriber.as_mut() {
+             update_subscriber.emit_every = self.emit_every;
+         }
+-- 
+2.54.0 (Apple Git-157)
+

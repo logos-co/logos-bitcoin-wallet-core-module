@@ -17,7 +17,7 @@ use crate::{chain::BlockHeaderChanges, messages::Event, Dialog, Info};
 use crate::{FilterType, IndexedFilter};
 
 const CF_HEADER_BATCH_SIZE: u32 = 1_999;
-const FILTER_BATCH_SIZE: u32 = 999;
+pub(crate) const FILTER_BATCH_SIZE: u32 = 999;
 
 #[derive(Debug)]
 pub(crate) struct Chain {
@@ -212,8 +212,6 @@ impl Chain {
         }
 
         let mut agreeing_peers = match self.request_state.pending_batch.take() {
-            // The pending batch answered an earlier request, before the tip moved: start over.
-            Some((_, pending)) if pending.stop_hash().ne(&batch.stop_hash()) => Vec::new(),
             Some((agreeing_peers, pending)) => {
                 if agreeing_peers.contains(&peer_id) {
                     self.request_state.pending_batch = Some((agreeing_peers, pending));
@@ -280,12 +278,16 @@ impl Chain {
             .header_chain
             .block_hash_at_height(start_height + CF_HEADER_BATCH_SIZE)
             .unwrap_or(self.header_chain.tip_hash());
-        self.request_state.push_stop_hash(stop_hash);
-        self.request_state.last_filter_header_request = Some(FilterHeaderRequest {
+        let request = Some(FilterHeaderRequest {
             expected_prev_filter_header: prev_header,
             start_height,
             stop_hash,
         });
+        if self.request_state.last_filter_header_request.ne(&request) {
+            self.request_state.pending_batch = None;
+        }
+        self.request_state.push_stop_hash(stop_hash);
+        self.request_state.last_filter_header_request = request;
         GetCFHeaders {
             filter_type: self.filter_type.into(),
             start_height,
@@ -552,6 +554,44 @@ mod tests {
     fn load_scenario() -> ChainScenario {
         let file = File::open("./tests/data/chain_scenario_one.json").unwrap();
         serde_json::from_reader(&file).unwrap()
+    }
+
+    #[test]
+    fn changing_cfheader_range_discards_votes_for_the_old_request() {
+        let scenario = load_scenario();
+        let mut chain = new_regtest(base_block(), 2);
+        chain.sync_chain(scenario.n_most_work_headers(4)).unwrap();
+        let old_request = chain.next_cf_header_message();
+        let old_response = CFHeaders {
+            filter_type: 0,
+            stop_hash: old_request.stop_hash,
+            previous_filter_header: scenario.prev_header(),
+            filter_hashes: scenario.n_most_work_filter_hashes(4),
+        };
+        assert_eq!(
+            chain.sync_cf_headers(1.into(), old_response).unwrap(),
+            CFHeaderChanges::AddedToQueue
+        );
+        chain
+            .sync_chain(vec![scenario.last_block_header()])
+            .unwrap();
+        let request = chain.next_cf_header_message();
+        assert_ne!(request.stop_hash, old_request.stop_hash);
+        let response = CFHeaders {
+            filter_type: 0,
+            stop_hash: request.stop_hash,
+            previous_filter_header: scenario.prev_header(),
+            filter_hashes: scenario.n_most_work_filter_hashes(5),
+        };
+        assert_eq!(
+            chain.sync_cf_headers(1.into(), response.clone()).unwrap(),
+            CFHeaderChanges::AddedToQueue
+        );
+        assert_eq!(
+            chain.sync_cf_headers(2.into(), response).unwrap(),
+            CFHeaderChanges::Extended
+        );
+        assert!(chain.is_cf_headers_synced());
     }
 
     #[test]
@@ -1280,40 +1320,6 @@ mod tests {
         assert!(!chain.is_cf_headers_synced());
     }
 
-    fn cf_headers(scenario: &ChainScenario, filter_hashes: Vec<FilterHash>) -> CFHeaders {
-        CFHeaders {
-            filter_type: 0x00,
-            stop_hash: scenario.last_block_hash(),
-            previous_filter_header: scenario.prev_header(),
-            filter_hashes,
-        }
-    }
-
-    #[tokio::test]
-    async fn a_block_between_two_answers_is_no_conflict() {
-        let mut chain = new_regtest(base_block(), 2);
-        let scenario = load_scenario();
-        let headers = scenario.most_work_headers();
-        assert!(chain.sync_chain(headers[..4].to_vec()).is_ok());
-        chain.next_cf_header_message();
-        let first = CFHeaders {
-            filter_type: 0x00,
-            stop_hash: headers[3].block_hash(),
-            previous_filter_header: scenario.prev_header(),
-            filter_hashes: scenario.n_most_work_filter_hashes(4),
-        };
-        let changes = chain.sync_cf_headers(0.into(), first).unwrap();
-        assert_eq!(changes, CFHeaderChanges::AddedToQueue);
-        // A block arrives, and the request moves to the new tip.
-        assert!(chain.sync_chain(vec![headers[4]]).is_ok());
-        chain.next_cf_header_message();
-        let second = cf_headers(&scenario, scenario.n_most_work_filter_hashes(5));
-        let changes = chain.sync_cf_headers(1.into(), second.clone()).unwrap();
-        assert_eq!(changes, CFHeaderChanges::AddedToQueue);
-        let changes = chain.sync_cf_headers(0.into(), second).unwrap();
-        assert_eq!(changes, CFHeaderChanges::Extended);
-        assert!(chain.is_cf_headers_synced());
-    }
 
     #[tokio::test]
     async fn a_lower_rescan_after_assumed_filter_headers_asks_from_its_start() {

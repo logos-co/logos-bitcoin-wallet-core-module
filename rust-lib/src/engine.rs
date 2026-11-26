@@ -1606,7 +1606,7 @@ pub mod hooks {
     /// The running Kyoto client's update stream ends after its next update, its node running on.
     pub static END_KYOTO_UPDATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     /// The next scan a headers-only phase hands over is never asked of the node, as bip157 dropped
-    /// one before patch 6.
+    /// one before our patch 5.
     pub static DROP_KYOTO_RESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 }
 

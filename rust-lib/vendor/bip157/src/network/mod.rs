@@ -44,8 +44,8 @@ pub(crate) mod reader;
 pub(crate) mod socks;
 
 pub const PROTOCOL_VERSION: u32 = 70016;
-pub const KYOTO_VERSION: &str = "0.8.1";
-pub const RUST_BITCOIN_VERSION: &str = "0.32.8";
+pub const KYOTO_VERSION: &str = "0.9.0";
+pub const RUST_BITCOIN_VERSION: &str = "0.32.102";
 
 const THIRTY_MINS: Duration = Duration::from_secs(60 * 30);
 const MESSAGE_TIMEOUT_SECS: Duration = Duration::from_secs(5);
@@ -435,6 +435,11 @@ struct FilterRate {
 
 impl FilterRate {
     fn batch_requested(&mut self, stop_hash: BlockHash) {
+        if let Some((hash, _)) = self.waiting_for {
+            if hash.eq(&stop_hash) {
+                return;
+            }
+        }
         self.waiting_for = Some((stop_hash, Instant::now()))
     }
 
@@ -458,27 +463,27 @@ impl FilterRate {
 }
 
 #[derive(Debug, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
-struct TimeSensitiveId([u8; 32]);
+enum TimeSensitiveId {
+    Headers,
+    FilterHeaders([u8; 32]),
+    Filters,
+    Ping,
+    Block([u8; 32]),
+}
 
 impl TimeSensitiveId {
-    const HEADER_MSG: Self = Self([1; 32]);
+    const HEADER_MSG: Self = Self::Headers;
 
-    const CF_HEADER_MSG: Self = Self([2; 32]);
+    const C_FILTER_MSG: Self = Self::Filters;
 
-    const C_FILTER_MSG: Self = Self([3; 32]);
-
-    const PING: Self = Self([4; 32]);
+    const PING: Self = Self::Ping;
 
     fn from_slice(slice: [u8; 32]) -> Self {
-        Self(slice)
+        Self::Block(slice)
     }
 
     fn from_cf_headers_stop_hash(stop_hash: BlockHash) -> Self {
-        let mut id = stop_hash.to_byte_array();
-        for (byte, tag) in id.iter_mut().zip(Self::CF_HEADER_MSG.0) {
-            *byte ^= tag;
-        }
-        Self(id)
+        Self::FilterHeaders(stop_hash.to_byte_array())
     }
 }
 

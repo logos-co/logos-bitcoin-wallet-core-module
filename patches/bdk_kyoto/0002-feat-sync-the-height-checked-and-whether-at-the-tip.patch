@@ -1,0 +1,117 @@
+From ae6d5bbc83005446ce6d5d82b31b90c92a113148 Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <dario@status.im>
+Date: Thu, 26 Nov 2026 18:04:03 -0300
+Subject: [PATCH 2/5] feat(sync): the height checked, and whether at the tip
+
+UpdateSubscriber::checked() names the height of the last filter checked
+as of the last update, and synced() whether that update came at the tip
+rather than every n blocks. A long first sync that loses its peers can
+go on from there instead of starting over.
+
+An update every n blocks ends at the checkpoint at or below the height
+scanned: headers a node starts from (a snapshot) are no chain events, so
+the block at that height may not be in the update's chain.
+---
+ src/lib.rs | 34 ++++++++++++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 545fbdc..fac215b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -258,6 +258,9 @@ pub struct UpdateSubscriber<W: Wallets> {
+     pending_block: Option<BlockId>,
+     emit_every: Option<u32>,
+     blocks_since_update: u32,
++    // the height of the last filter checked as of the last update, and whether at the tip
++    checked: Option<u32>,
++    synced: bool,
+     // scripts to check filters against, grown as blocks reveal new indices
+     spk_cache: HashSet<ScriptBuf>,
+     // processes events for the wallet.
+@@ -284,6 +287,8 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             pending_block: None,
+             emit_every: None,
+             blocks_since_update: 0,
++            checked: None,
++            synced: false,
+             spk_cache,
+             _marker: core::marker::PhantomData,
+         }
+@@ -315,6 +320,8 @@ impl<W: Wallets> UpdateSubscriber<W> {
+             pending_block: None,
+             emit_every: None,
+             blocks_since_update: 0,
++            checked: None,
++            synced: false,
+             spk_cache,
+             _marker: core::marker::PhantomData,
+         }
+@@ -326,7 +333,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
+         if let Some(BlockId { height, hash }) = self.pending_block {
+             self.fetch_and_apply(hash).await?;
+             if self.scanned() {
+-                return Ok(Some(height));
++                return Ok(self.checked_to(height));
+             }
+         }
+         while let Some(message) = self.receiver.recv().await {
+@@ -343,7 +350,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
+                         self.fetch_and_apply(hash).await?;
+                     }
+                     if self.scanned() {
+-                        return Ok(Some(filter.height()));
++                        return Ok(self.checked_to(filter.height()));
+                     }
+                 }
+                 Event::ChainUpdate(changeset) => {
+@@ -357,10 +364,12 @@ impl<W: Wallets> UpdateSubscriber<W> {
+                     }
+                 }
+                 Event::FiltersSynced(SyncUpdate {
+-                    tip: _,
++                    tip,
+                     recent_history: _,
+                 }) => {
+                     self.blocks_since_update = 0;
++                    self.checked = Some(tip.height);
++                    self.synced = true;
+                     return Ok(None);
+                 }
+             }
+@@ -401,6 +410,22 @@ impl<W: Wallets> UpdateSubscriber<W> {
+         Ok(())
+     }
+ 
++    fn checked_to(&mut self, height: u32) -> Option<u32> {
++        self.checked = Some(height);
++        self.synced = false;
++        Some(height)
++    }
++
++    /// The height of the last filter checked against the wallet's scripts, as of the last update.
++    pub fn checked(&self) -> Option<u32> {
++        self.checked
++    }
++
++    /// Whether the last update came with filters synced to the tip, not every `n` blocks.
++    pub fn synced(&self) -> bool {
++        self.synced
++    }
++
+     fn scanned(&mut self) -> bool {
+         self.blocks_since_update += 1;
+         if self
+@@ -516,7 +541,8 @@ impl UpdateBuilder {
+         Update {
+             tx_update,
+             last_active_indices,
+-            chain: height.map_or(Some(self.cp.clone()), |height| self.cp.get(height)),
++            // A snapshot's headers are not chain events: end at the checkpoint below, if need be.
++            chain: height.map_or(Some(self.cp.clone()), |height| self.cp.floor_at(height)),
+         }
+     }
+ }
+-- 
+2.54.0 (Apple Git-157)
+
